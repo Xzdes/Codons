@@ -1,0 +1,35 @@
+Codons 0.2.0 — быстрый запуск в Windows x64
+
+Откройте PowerShell в папке распакованной программы.
+Компилятор C, Python и установка не нужны.
+
+1. Создайте первую программу:
+   .\codons.exe new hello.dna
+
+2. Передайте ей два числа:
+   .\codons.exe run hello.dna 10 20
+   Результат: 30
+
+3. Попробуйте готовые примеры:
+   .\codons.exe run examples\price.dna 3 250
+   Результат: 750
+   .\codons.exe run examples\threshold.dna 75 60
+   Результат: 1 (порог пройден)
+   .\codons.exe run examples\clamp.dna 150 100
+   Результат: 100
+
+Проверка файла: .\codons.exe check hello.dna
+Ответ для скрипта или AI-агента: .\codons.exe run hello.dna 10 20 --json
+Справка: .\codons.exe --help
+
+Горячее обновление:
+   .\codons.exe live examples\main.dna
+Затем введите:
+   run
+   reload examples/updated.dna
+   run
+   quit
+Результат меняется с 30 на 42 в том же процессе.
+
+В исходном проекте бинарник находится в build\codons.exe.
+Подробнее о языке и ограничениях — в README.md.

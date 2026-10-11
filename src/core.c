@@ -1,14 +1,25 @@
 #include "internal.h"
 #include <stdarg.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
 void bio_error(BioError *e, const char *format, ...) {
     va_list ap;
+    int length;
     if (!e) return;
     va_start(ap, format);
-    vsnprintf(e->message, sizeof(e->message), format, ap);
+    length = vsnprintf(e->message, sizeof(e->message), format, ap);
     va_end(ap);
+    if (length >= (int)sizeof(e->message)) {
+        size_t end = strlen(e->message), start = end - 1;
+        unsigned char lead;
+        size_t needed;
+        while (start && ((unsigned char)e->message[start] & 0xc0u) == 0x80u) --start;
+        lead = (unsigned char)e->message[start];
+        needed = lead < 0x80u ? 1u : lead < 0xe0u ? 2u : lead < 0xf0u ? 3u : 4u;
+        if (end - start < needed) e->message[start] = '\0';
+    }
 }
 
 void bio_node_error(const BioProgram *p, const CodonNode *n, BioError *e, const char *format, ...) {
@@ -50,16 +61,33 @@ void bio_program_release(BioProgram *p) {
     free(p);
 }
 
-BioProgram *bio_compile(const char *path, int repair, BioError *e) {
+int bio_wide_path(const char *path, wchar_t *out, size_t capacity) {
+    return path && capacity <= INT_MAX &&
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, out, (int)capacity) > 0;
+}
+
+FILE *bio_fopen(const char *path, const wchar_t *mode) {
+    wchar_t wide[BIO_PATH_SIZE];
+    if (!bio_wide_path(path, wide, BIO_PATH_SIZE)) return NULL;
+    return _wfopen(wide, mode);
+}
+
+BioProgram *bio_load(const char *path, int repair, BioError *e) {
     BioProgram *p = calloc(1, sizeof(*p));
     if (e) e->message[0] = '\0';
     if (!p) { bio_error(e, "out of memory allocating program"); return NULL; }
     p->references = 1;
-    if (!path || !bio_parse(p, path, repair, e) || !bio_analyze(p, e) || !bio_jit(p, e)) {
+    if (!path || !bio_parse(p, path, repair, e) || !bio_analyze(p, e)) {
         if (!path) bio_error(e, "source path is required");
         bio_program_release(p);
         return NULL;
     }
+    return p;
+}
+
+BioProgram *bio_compile(const char *path, int repair, BioError *e) {
+    BioProgram *p = bio_load(path, repair, e);
+    if (p && !bio_jit(p, e)) { bio_program_release(p); return NULL; }
     return p;
 }
 
@@ -72,13 +100,36 @@ int bio_find_gene(const BioProgram *p, const char *name) {
     return -1;
 }
 
-int32_t bio_program_run(const BioProgram *p) {
-    typedef int32_t (*Entry)(void);
+static int validate_arguments(const BioProgram *p, const int32_t *args, size_t argc,
+                              int32_t *result, BioError *e) {
+    if (e) e->message[0] = '\0';
+    if (!p || !result || (argc && !args)) {
+        bio_error(e, "program, result and supplied arguments are required"); return 0;
+    }
+    if (argc != p->stats.arity) {
+        bio_error(e, "main expects %u arguments, got %zu", p->stats.arity, argc); return 0;
+    }
+    return 1;
+}
+
+int bio_program_run(const BioProgram *p, const int32_t *args, size_t argc,
+                    int32_t *result, BioError *e) {
+    typedef int32_t (*Entry)(int32_t, int32_t);
     Entry fn;
-    unsigned char *address = p->code + p->genes[p->main_gene].code_offset;
+    unsigned char *address;
+    if (!validate_arguments(p, args, argc, result, e)) return 0;
+    if (!p->code) { bio_error(e, "program has no native code; use bio_compile"); return 0; }
+    address = p->code + p->genes[p->main_gene].code_offset;
     _Static_assert(sizeof(fn) == sizeof(address), "Windows x64 function pointer size");
     memcpy(&fn, &address, sizeof(fn));
-    return fn();
+    *result = fn(argc > 0 ? args[0] : 0, argc > 1 ? args[1] : 0);
+    return 1;
+}
+
+static int32_t signed_value(uint32_t bits) {
+    int32_t value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, uint32_t b) {
@@ -92,6 +143,14 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, u
         case OP_ADD: r[n->arg1] += r[n->arg2]; break;
         case OP_SUB: r[n->arg1] -= r[n->arg2]; break;
         case OP_MUL: r[n->arg1] *= r[n->arg2]; break;
+        case OP_EQ: r[n->arg1] = r[n->arg1] == r[n->arg2]; break;
+        case OP_LT: r[n->arg1] = signed_value(r[n->arg1]) < signed_value(r[n->arg2]); break;
+        case OP_MIN:
+            if (signed_value(r[n->arg1]) > signed_value(r[n->arg2])) r[n->arg1] = r[n->arg2];
+            break;
+        case OP_MAX:
+            if (signed_value(r[n->arg1]) < signed_value(r[n->arg2])) r[n->arg1] = r[n->arg2];
+            break;
         case OP_CALL: {
             unsigned argc = n->arg2 >> 16;
             uint32_t x = argc > 0 ? r[n->arg2 & 255u] : 0;
@@ -106,32 +165,49 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, u
     return 0; /* Validation ensures every gene has RET. */
 }
 
-int32_t bio_program_interpret(const BioProgram *p) {
-    uint32_t bits = interpret_gene(p, p->main_gene, 0, 0);
-    int32_t result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
+int bio_program_interpret(const BioProgram *p, const int32_t *args, size_t argc,
+                          int32_t *result, BioError *e) {
+    uint32_t bits;
+    if (!validate_arguments(p, args, argc, result, e)) return 0;
+    bits = interpret_gene(p, p->main_gene, argc > 0 ? (uint32_t)args[0] : 0,
+                          argc > 1 ? (uint32_t)args[1] : 0);
+    *result = signed_value(bits);
+    return 1;
 }
 
 void bio_program_dump(const BioProgram *p, FILE *out) {
-    static const char *names[] = {"GENE", "LOAD", "MOV", "ADD", "SUB", "MUL", "CALL", "RET"};
+    static const char *names[] = {
+        "GENE", "LOAD", "MOV", "ADD", "SUB", "MUL", "CALL", "RET", "EQ", "LT", "MIN", "MAX"
+    };
     unsigned i;
     for (i = 0; i < p->gene_count; ++i) {
         const BioGene *g = &p->genes[i];
         const CodonNode *n;
-        fprintf(out, "GENE %s i32/%u [%s] offset=%u\n", g->name, g->arity,
-                g->live ? "live" : "pruned", g->code_offset);
+        fprintf(out, "GENE %s i32/%u # %s\n", g->name, g->arity, g->live ? "live" : "pruned");
         for (n = g->head->next; n; n = n->next) {
-            fprintf(out, "  %s %u %u", names[n->op_code], n->arg1, n->arg2);
-            if (n->bond) fprintf(out, " -> %s", p->genes[n->arg1].name);
-            fprintf(out, " (line %u)\n", n->line);
+            if (n->op_code == OP_CALL) {
+                unsigned argc = n->arg2 >> 16;
+                fprintf(out, "CALL %s ", p->genes[n->arg1].name);
+                if (!argc) fputc('_', out);
+                else {
+                    fprintf(out, "r%u", n->arg2 & 255u);
+                    if (argc == 2) fprintf(out, ",r%u", (n->arg2 >> 8) & 255u);
+                }
+            } else if (n->op_code == OP_LOAD)
+                fprintf(out, "LOAD r%u %ld", n->arg1, (long)signed_value(n->arg2));
+            else if (n->op_code == OP_RET) fprintf(out, "RET r%u _", n->arg1);
+            else fprintf(out, "%s r%u r%u", names[n->op_code], n->arg1, n->arg2);
+            fprintf(out, " # line %u\n", n->line);
         }
+        fputs("END _ _\n\n", out);
     }
 }
 
 int bio_program_write_code(const BioProgram *p, const char *path, BioError *e) {
-    FILE *f = fopen(path, "wb");
+    FILE *f;
     int ok;
+    if (!p || !p->code) { bio_error(e, "program has no native code"); return 0; }
+    f = bio_fopen(path, L"wb");
     if (!f) { bio_error(e, "cannot write %s", path); return 0; }
     ok = fwrite(p->code, 1, p->stats.code_bytes, f) == p->stats.code_bytes;
     if (fclose(f) != 0) ok = 0;

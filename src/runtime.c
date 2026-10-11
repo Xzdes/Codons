@@ -8,7 +8,7 @@ struct BioRuntime {
 
 BioRuntime *bio_runtime_create(BioProgram *initial, BioError *e) {
     BioRuntime *runtime;
-    if (!initial) { bio_error(e, "initial program is required"); return NULL; }
+    if (!initial || !initial->code) { bio_error(e, "initial program with native code is required"); return NULL; }
     runtime = calloc(1, sizeof(*runtime));
     if (!runtime) { bio_error(e, "out of memory allocating runtime"); return NULL; }
     InitializeSRWLock(&runtime->lock);
@@ -17,23 +17,27 @@ BioRuntime *bio_runtime_create(BioProgram *initial, BioError *e) {
     return runtime;
 }
 
-int32_t bio_runtime_run(BioRuntime *runtime) {
+int bio_runtime_run(BioRuntime *runtime, const int32_t *arguments, size_t argument_count,
+                    int32_t *result, BioError *e) {
     BioProgram *p;
-    int32_t result;
+    int ok;
+    if (!runtime) { bio_error(e, "runtime is required"); return 0; }
     /* Retaining under the same lock as publication closes the free/acquire race. */
     AcquireSRWLockShared(&runtime->lock);
     p = runtime->active;
     bio_program_retain(p);
     ReleaseSRWLockShared(&runtime->lock);
-    result = bio_program_run(p);
+    ok = bio_program_run(p, arguments, argument_count, result, e);
     bio_program_release(p);
-    return result;
+    return ok;
 }
 
 int bio_runtime_reload(BioRuntime *runtime, const char *path, int repair, BioError *e) {
     BioProgram *old;
-    BioProgram *candidate = bio_compile(path, repair, e);
+    BioProgram *candidate;
     unsigned i;
+    if (!runtime) { bio_error(e, "runtime is required"); return 0; }
+    candidate = bio_compile(path, repair, e);
     if (!candidate) return 0;
     AcquireSRWLockExclusive(&runtime->lock);
     old = runtime->active;

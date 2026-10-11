@@ -9,6 +9,27 @@ static char directory[128];
 #define REQUIRE(expr) do { ++checks; if (!(expr)) { \
     fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #expr); exit(1); } } while (0)
 
+static int32_t run0(BioProgram *p) {
+    BioError e = {{0}};
+    int32_t result;
+    REQUIRE(bio_program_run(p, NULL, 0, &result, &e));
+    return result;
+}
+
+static int32_t interpret0(BioProgram *p) {
+    BioError e = {{0}};
+    int32_t result;
+    REQUIRE(bio_program_interpret(p, NULL, 0, &result, &e));
+    return result;
+}
+
+static int32_t runtime0(BioRuntime *runtime) {
+    BioError e = {{0}};
+    int32_t result;
+    REQUIRE(bio_runtime_run(runtime, NULL, 0, &result, &e));
+    return result;
+}
+
 static void path_for(char *out, size_t size, const char *name) {
     snprintf(out, size, "%s\\%s", directory, name);
 }
@@ -43,8 +64,8 @@ static void expect_value(const char *source, int32_t expected) {
     p = compile_name("case.dna", 0, &e);
     if (!p) fprintf(stderr, "%s\n", e.message);
     REQUIRE(p != NULL);
-    REQUIRE(bio_program_run(p) == expected);
-    REQUIRE(bio_program_interpret(p) == expected);
+    REQUIRE(run0(p) == expected);
+    REQUIRE(interpret0(p) == expected);
     REQUIRE(VirtualQuery(p->code, &memory, sizeof(memory)) == sizeof(memory));
     REQUIRE(memory.Protect == PAGE_EXECUTE_READ);
     table = RtlLookupFunctionEntry((DWORD64)(uintptr_t)(p->code + p->genes[p->main_gene].code_offset + 4), &base, NULL);
@@ -91,7 +112,7 @@ static void language_tests(void) {
     expect_error("GENE main i32\nLOAD r0 -2147483649\n", "i32 literal");
     expect_error("GENE main i32\nLOAD r0 12x\n", "i32 literal");
     expect_error("GENE main f64\n", "signature");
-    expect_error("GENE main i32/1\nRET r0 _\nEND _ _\n", "main must");
+    expect_error("GENE main i32/1\nRET r1 _\nEND _ _\n", "uninitialized register");
     expect_error("GENE main i32\nCALL missing _\nRET r0 _\nEND _ _\n", "undefined gene");
     expect_error("GENE main i32\nCALL main r0\nRET r0 _\nEND _ _\n", "expects 0 arguments");
     expect_error("GENE main i32\nCALL main _\nRET r0 _\nEND _ _\n", "recursive call cycle");
@@ -120,8 +141,8 @@ static void module_and_repair_tests(void) {
     write_source("module.dna", "IMPORT left.dna _\nIMPORT right.dna _\nGENE main i32\nLOAD r1 10\nLOAD r2 20\nCALL add r1,r2\nRET r0 _\nEND _ _\n");
     p = compile_name("module.dna", 0, &e);
     REQUIRE(p != NULL);
-    REQUIRE(bio_program_run(p) == 30);
-    REQUIRE(bio_program_interpret(p) == 30);
+    REQUIRE(run0(p) == 30);
+    REQUIRE(interpret0(p) == 30);
     s = bio_program_stats(p);
     REQUIRE(s.files == 4 && s.genes == 3 && s.live_genes == 2);
     REQUIRE(p->genes[bio_find_gene(p, "unused")].code_end == 0);
@@ -135,7 +156,7 @@ static void module_and_repair_tests(void) {
     p = compile_name("repair.dna", 1, &e);
     REQUIRE(p != NULL);
     REQUIRE(bio_program_stats(p).repairs == 2);
-    REQUIRE(bio_program_run(p) == 42);
+    REQUIRE(run0(p) == 42);
     bio_program_release(p);
     write_source("repair_bad.dna", "GENE main i32\nLOAD r0\nRET r0\nEND _\n");
     p = compile_name("repair_bad.dna", 1, &e);
@@ -165,18 +186,109 @@ static void differential_tests(void) {
             length += (size_t)snprintf(source + length, sizeof(source) - length, "LOAD r%u %" PRId32 "\n", i, value);
         }
         for (i = 0; i < 100; ++i) {
-            static const char *ops[] = {"ADD", "SUB", "MUL", "MOV"};
-            unsigned op = next_random() % 4, a = next_random() % 8, b = next_random() % 8;
+            static const char *ops[] = {"ADD", "SUB", "MUL", "MOV", "EQ", "LT", "MIN", "MAX"};
+            unsigned op = next_random() % 8, a = next_random() % 8, b = next_random() % 8;
+            int32_t left, right;
+            memcpy(&left, &r[a], sizeof(left));
+            memcpy(&right, &r[b], sizeof(right));
             if (op == 0) r[a] += r[b];
             else if (op == 1) r[a] -= r[b];
             else if (op == 2) r[a] *= r[b];
-            else r[a] = r[b];
+            else if (op == 3) r[a] = r[b];
+            else if (op == 4) r[a] = left == right;
+            else if (op == 5) r[a] = left < right;
+            else if (op == 6 && left > right) r[a] = r[b];
+            else if (op == 7 && left < right) r[a] = r[b];
             length += (size_t)snprintf(source + length, sizeof(source) - length, "%s r%u r%u\n", ops[op], a, b);
         }
         i = next_random() % 8;
         snprintf(source + length, sizeof(source) - length, "RET r%u _\nEND _ _\n", i);
         memcpy(&expected, &r[i], sizeof(expected));
         expect_value(source, expected);
+    }
+}
+
+static void argument_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    BioRuntime *runtime;
+    int32_t args[] = {-7, 6, 9}, result = 123;
+    char path[256];
+    FILE *dump;
+    write_source("args.dna", "GENE main i32/2\nCALL product r0,r1\nRET r0 _\nEND _ _\nGENE product i32/2\nMUL r0 r1\nRET r0 _\nEND _ _\n");
+    p = compile_name("args.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_stats(p).arity == 2 && bio_program_stats(p).execution_steps == 4);
+    REQUIRE(bio_program_run(p, args, 2, &result, &e) && result == -42);
+    REQUIRE(bio_program_interpret(p, args, 2, &result, &e) && result == -42);
+    result = 123;
+    REQUIRE(!bio_program_run(p, args, 1, &result, &e) && result == 123);
+    REQUIRE(strstr(e.message, "expects 2 arguments") != NULL);
+    REQUIRE(!bio_program_run(p, args, 3, &result, &e) && result == 123);
+    REQUIRE(!bio_program_run(p, NULL, 2, &result, &e) && result == 123);
+    REQUIRE(!bio_program_interpret(p, args, 0, &result, &e) && result == 123);
+    REQUIRE(!bio_program_run(p, args, 2, NULL, &e));
+    runtime = bio_runtime_create(p, &e); REQUIRE(runtime != NULL);
+    REQUIRE(bio_runtime_run(runtime, args, 2, &result, &e) && result == -42);
+    REQUIRE(!bio_runtime_run(runtime, args, 0, &result, &e) && result == -42);
+    bio_runtime_destroy(runtime);
+    path_for(path, sizeof(path), "normalized.dna");
+    dump = fopen(path, "wb"); REQUIRE(dump != NULL);
+    bio_program_dump(p, dump); REQUIRE(fclose(dump) == 0);
+    bio_program_release(p);
+    p = bio_load(path, 0, &e); REQUIRE(p != NULL);
+    REQUIRE(p->code == NULL && p->unwind_table == NULL && p->stats.code_bytes == 0);
+    REQUIRE(bio_program_interpret(p, args, 2, &result, &e) && result == -42);
+    REQUIRE(!bio_program_run(p, args, 2, &result, &e) && result == -42);
+    REQUIRE(bio_runtime_create(p, &e) == NULL);
+    bio_program_release(p);
+    write_source("one-arg.dna", "GENE main i32/1\nLOAD r1 -2\nMUL r0 r1\nRET r0 _\nEND _ _\n");
+    p = compile_name("one-arg.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, args, 1, &result, &e) && result == 14);
+    bio_program_release(p);
+}
+
+static void execution_budget_tests(void) {
+    unsigned excess, i;
+    char path[256];
+    BioError e = {{0}};
+    BioProgram *p;
+    FILE *f;
+    path_for(path, sizeof(path), "steps.dna");
+    for (excess = 0; excess < 2; ++excess) {
+        f = fopen(path, "wb"); REQUIRE(f != NULL);
+        fputs("GENE main i32\n", f);
+        for (i = 0; i < 999; ++i) fputs("CALL unit _\n", f);
+        if (excess) fputs("LOAD r0 1\n", f);
+        fputs("RET r0 _\nEND _ _\nGENE unit i32\n", f);
+        for (i = 0; i < 333; ++i) fputs("CALL one _\n", f);
+        fputs("RET r0 _\nEND _ _\nGENE one i32\nLOAD r0 1\nRET r0 _\nEND _ _\n", f);
+        REQUIRE(fclose(f) == 0);
+        p = bio_compile(path, 0, &e);
+        if (!excess) {
+            REQUIRE(p != NULL && p->stats.execution_steps == BIO_EXECUTION_LIMIT);
+            REQUIRE(run0(p) == 1 && interpret0(p) == 1);
+            bio_program_release(p);
+        } else REQUIRE(p == NULL && strstr(e.message, "execution budget exceeded"));
+    }
+    /* A tiny DAG can expand exponentially; never execute it to test the guard. */
+    for (excess = 0; excess < 2; ++excess) {
+        f = fopen(path, "wb"); REQUIRE(f != NULL);
+        fputs("GENE main i32\n", f);
+        fputs(excess ? "LOAD r0 1\n" : "CALL g0 _\n", f);
+        fputs("RET r0 _\nEND _ _\n", f);
+        for (i = 0; i < 60; ++i) {
+            fprintf(f, "GENE g%u i32\n", i);
+            if (i < 59) fprintf(f, "CALL g%u _\nCALL g%u _\n", i + 1, i + 1);
+            else fputs("LOAD r0 1\n", f);
+            fputs("RET r0 _\nEND _ _\n", f);
+        }
+        REQUIRE(fclose(f) == 0);
+        p = bio_compile(path, 0, &e);
+        if (!excess) REQUIRE(p == NULL && strstr(e.message, "execution budget exceeded"));
+        else {
+            REQUIRE(p != NULL && p->stats.execution_steps == 2 && p->stats.live_genes == 1);
+            bio_program_release(p);
+        }
     }
 }
 
@@ -248,8 +360,10 @@ static DWORD WINAPI reader(LPVOID arg) {
     InterlockedIncrement(&workers->ready);
     WaitForSingleObject(workers->start, INFINITE);
     do {
-        int32_t value = bio_runtime_run(workers->runtime);
-        if (value != 30 && value != 42) InterlockedIncrement(&workers->failures);
+        int32_t value = 0;
+        BioError e = {{0}};
+        if (!bio_runtime_run(workers->runtime, NULL, 0, &value, &e) || (value != 30 && value != 42))
+            InterlockedIncrement(&workers->failures);
         InterlockedIncrement(&workers->calls);
     } while (!InterlockedCompareExchange(&workers->stop, 0, 0));
     return 0;
@@ -273,17 +387,17 @@ static void runtime_tests(void) {
     path_for(changed_path, sizeof(changed_path), "changed.dna");
     initial = compile_name("old.dna", 0, &e); REQUIRE(initial != NULL);
     runtime = bio_runtime_create(initial, &e); REQUIRE(runtime != NULL);
-    REQUIRE(bio_runtime_run(runtime) == 30);
+    REQUIRE(runtime0(runtime) == 30);
     REQUIRE(bio_runtime_reload(runtime, new_path, 0, &e));
-    REQUIRE(bio_runtime_run(runtime) == 42);
+    REQUIRE(runtime0(runtime) == 42);
     /* An independently retained old snapshot remains executable after publication. */
-    REQUIRE(bio_program_run(initial) == 30);
+    REQUIRE(run0(initial) == 30);
     bio_program_release(initial);
     REQUIRE(!bio_runtime_reload(runtime, bad_path, 0, &e));
-    REQUIRE(bio_runtime_run(runtime) == 42);
+    REQUIRE(runtime0(runtime) == 42);
     REQUIRE(!bio_runtime_reload(runtime, changed_path, 0, &e));
     REQUIRE(strstr(e.message, "incompatible signature") != NULL);
-    REQUIRE(bio_runtime_run(runtime) == 42);
+    REQUIRE(runtime0(runtime) == 42);
     workers.runtime = runtime;
     workers.start = CreateEventA(NULL, TRUE, FALSE, NULL); REQUIRE(workers.start != NULL);
     for (i = 0; i < 4; ++i) { threads[i] = CreateThread(NULL, 0, reader, &workers, 0, NULL); REQUIRE(threads[i] != NULL); }
@@ -310,6 +424,8 @@ int main(void) {
     language_tests();
     module_and_repair_tests();
     differential_tests();
+    argument_tests();
+    execution_budget_tests();
     budget_tests();
     runtime_tests();
     printf("PASS: %u checks; 250 generated programs matched JIT, interpreter and reference.\n", checks);

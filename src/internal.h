@@ -20,7 +20,10 @@
 #define BIO_NODES_PER_BLOCK 256u
 #define BIO_MAX_SOURCE_BYTES (4u * 1024u * 1024u)
 
-typedef enum { OP_GENE, OP_LOAD, OP_MOV, OP_ADD, OP_SUB, OP_MUL, OP_CALL, OP_RET } BioOp;
+typedef enum {
+    OP_GENE, OP_LOAD, OP_MOV, OP_ADD, OP_SUB, OP_MUL, OP_CALL, OP_RET,
+    OP_EQ, OP_LT, OP_MIN, OP_MAX
+} BioOp;
 
 typedef struct CodonNode {
     uint8_t op_code;
@@ -45,6 +48,7 @@ typedef struct {
     unsigned live;
     unsigned visit;
     unsigned depth;
+    uint64_t execution_steps;
     CodonNode *head;
     CodonNode *tail;
     uint32_t code_offset;
@@ -82,5 +86,7 @@ int bio_parse(BioProgram *p, const char *path, int repair, BioError *e);
 int bio_analyze(BioProgram *p, BioError *e);
 int bio_jit(BioProgram *p, BioError *e);
 int bio_find_gene(const BioProgram *p, const char *name);
+int bio_wide_path(const char *path, wchar_t *out, size_t capacity);
+FILE *bio_fopen(const char *path, const wchar_t *mode);
 
 #endif

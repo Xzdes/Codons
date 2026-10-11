@@ -17,6 +17,7 @@ static int validate_gene(BioProgram *p, BioGene *g, BioError *e) {
             initialized |= 1u << n->arg1;
             break;
         case OP_ADD: case OP_SUB: case OP_MUL:
+        case OP_EQ: case OP_LT: case OP_MIN: case OP_MAX:
             if (!require_reg(p, n, initialized, n->arg1, e) ||
                 !require_reg(p, n, initialized, n->arg2, e)) return 0;
             break;
@@ -46,7 +47,7 @@ static int validate_gene(BioProgram *p, BioGene *g, BioError *e) {
     return 1;
 }
 
-/* DAG only in v0.1: prevent both cycles and excessive stack depth.
+/* DAG only: prevent both cycles and excessive stack depth.
    Memoized longest paths also catch deep paths through already visited genes. */
 static int check_calls(BioProgram *p, unsigned index, unsigned nesting, BioError *e) {
     BioGene *g = &p->genes[index];
@@ -62,8 +63,12 @@ static int check_calls(BioProgram *p, unsigned index, unsigned nesting, BioError
     g->depth = 1;
     for (n = g->head->next; n; n = n->next) {
         unsigned depth;
+        /* Saturate at limit+1: even exponential call DAGs cannot overflow this count. */
+        if (g->execution_steps <= BIO_EXECUTION_LIMIT) ++g->execution_steps;
         if (n->op_code != OP_CALL) continue;
         if (!check_calls(p, n->arg1, nesting + 1, e)) return 0;
+        g->execution_steps += p->genes[n->arg1].execution_steps;
+        if (g->execution_steps > BIO_EXECUTION_LIMIT) g->execution_steps = BIO_EXECUTION_LIMIT + 1u;
         depth = p->genes[n->arg1].depth + 1;
         if (depth > BIO_MAX_DEPTH) {
             bio_node_error(p, n, e, "apoptosis: call depth exceeds %u", BIO_MAX_DEPTH); return 0;
@@ -89,11 +94,15 @@ int bio_analyze(BioProgram *p, BioError *e) {
     int main_gene = bio_find_gene(p, "main");
     if (main_gene < 0) { bio_error(e, "missing entry gene main"); return 0; }
     p->main_gene = (unsigned)main_gene;
-    if (p->genes[main_gene].arity != 0) {
-        bio_node_error(p, p->genes[main_gene].head, e, "main must have signature i32/0"); return 0;
-    }
+    p->stats.arity = p->genes[main_gene].arity;
     for (i = 0; i < p->gene_count; ++i) if (!validate_gene(p, &p->genes[i], e)) return 0;
     for (i = 0; i < p->gene_count; ++i) if (!check_calls(p, i, 1, e)) return 0;
     mark_live(p, p->main_gene);
+    p->stats.execution_steps = p->genes[main_gene].execution_steps;
+    if (p->stats.execution_steps > BIO_EXECUTION_LIMIT) {
+        bio_node_error(p, p->genes[main_gene].head, e,
+                       "execution budget exceeded: main requires more than %u steps", BIO_EXECUTION_LIMIT);
+        return 0;
+    }
     return 1;
 }

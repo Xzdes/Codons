@@ -1,31 +1,153 @@
-#include "bio.h"
+#include "internal.h"
+#include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+    const char *command;
+    const char *path;
+    const char *output;
+    int32_t arguments[2];
+    size_t argument_count;
+    int repair;
+    int json;
+} Options;
+
 static void usage(void) {
-    puts("AI-Native Bio-Compiler 0.1 (Windows x64, C11)\n"
-         "  codons run <file.dna> [--repair]\n"
-         "  codons check <file.dna> [--repair]\n"
-         "  codons interpret <file.dna> [--repair]\n"
-         "  codons dump <file.dna>\n"
-         "  codons emit <file.dna> <code.bin>\n"
-         "  codons live <file.dna> [--repair]\n"
-         "Live commands: run | reload <file.dna> | quit");
+    puts("Codons " BIO_VERSION " - a small native language for Windows x64\n"
+         "\nGet started:\n"
+         "  codons new hello.dna\n"
+         "  codons run hello.dna 10 20\n"
+         "\nCommands:\n"
+         "  new <file.dna>                 Create an example; never overwrite a file\n"
+         "  run <file.dna> [number ...]     Compile and run with 0, 1 or 2 i32 inputs\n"
+         "  check <file.dna>               Validate without running or preparing JIT\n"
+         "  interpret <file.dna> [number ...]  Run the reference interpreter\n"
+         "  dump <file.dna>                Show the normalized program\n"
+         "  live <file.dna>                Run and reload in one process\n"
+         "  emit <file.dna> <code.bin>     Export raw machine code (not an .exe)\n"
+         "\nOptions after the file: --repair, --json\n"
+         "  --repair restores only an unused '_' in RET/END\n"
+         "  --json is available for new, run, check, interpret and emit\n"
+         "Live commands: run [number ...] | reload <file.dna> | quit\n"
+         "Exit codes: 0 success, 1 program/file error, 2 invalid command or arguments");
 }
 
-static void stats(BioProgram *p) {
-    BioStats s = bio_program_stats(p);
-    printf("nodes=%zu genes=%zu live=%zu pruned=%zu files=%zu code=%zu bytes repairs=%zu\n",
-           s.nodes, s.genes, s.live_genes, s.genes - s.live_genes, s.files, s.code_bytes, s.repairs);
+static void json_string(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    putchar('"');
+    for (; *p; ++p) {
+        if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
+        else if (*p < 32) printf("\\u%04x", (unsigned)*p);
+        else putchar(*p);
+    }
+    putchar('"');
+}
+
+static int failure(int json, const char *stage, const char *message, int code) {
+    if (json) {
+        fputs("{\"ok\":false,\"error\":{\"stage\":", stdout); json_string(stage);
+        fputs(",\"message\":", stdout); json_string(message); puts("}}");
+    } else fprintf(stderr, "%s\n", message);
+    return code;
+}
+
+static int parse_i32(const char *s, int32_t *out) {
+    const char *digit = s;
+    char *end;
+    long long value;
+    if (*digit == '+' || *digit == '-') ++digit;
+    if (!*digit) return 0;
+    for (; *digit; ++digit) if (*digit < '0' || *digit > '9') return 0;
+    errno = 0;
+    value = strtoll(s, &end, 10);
+    if (errno || *end || value < INT32_MIN || value > INT32_MAX) return 0;
+    *out = (int32_t)value;
+    return 1;
+}
+
+static int options(int argc, char **argv, Options *o, BioError *e) {
+    int i, is_emit;
+    for (i = 1; i < argc; ++i) if (!strcmp(argv[i], "--json")) o->json = 1;
+    if (argc < 3) { bio_error(e, "expected a command and file; use --help"); return 0; }
+    o->command = argv[1]; o->path = argv[2];
+    is_emit = !strcmp(o->command, "emit");
+    if (strcmp(o->command, "new") && strcmp(o->command, "run") && strcmp(o->command, "check") &&
+        strcmp(o->command, "interpret") && strcmp(o->command, "dump") &&
+        strcmp(o->command, "live") && !is_emit) {
+        bio_error(e, "unknown command '%s'; use --help", o->command); return 0;
+    }
+    if (is_emit) {
+        if (argc < 4 || !strncmp(argv[3], "--", 2)) {
+            bio_error(e, "emit requires an output file"); return 0;
+        }
+        o->output = argv[3];
+    }
+    for (i = is_emit ? 4 : 3; i < argc; ++i) {
+        if (!strcmp(argv[i], "--repair")) o->repair = 1;
+        else if (!strcmp(argv[i], "--json")) o->json = 1;
+        else if ((!strcmp(o->command, "run") || !strcmp(o->command, "interpret")) &&
+                 o->argument_count < 2 && parse_i32(argv[i], &o->arguments[o->argument_count]))
+            ++o->argument_count;
+        else { bio_error(e, "unexpected argument '%s'; inputs must be at most two decimal i32 values", argv[i]); return 0; }
+    }
+    if (o->json && (!strcmp(o->command, "live") || !strcmp(o->command, "dump"))) {
+        bio_error(e, "--json is not supported for live or dump"); return 0;
+    }
+    if (o->repair && !strcmp(o->command, "new")) {
+        bio_error(e, "--repair is not supported for new"); return 0;
+    }
+    return 1;
+}
+
+static void stats(BioStats s, int json) {
+    if (json) {
+        printf("\"stats\":{\"nodes\":%zu,\"genes\":%zu,\"live_genes\":%zu,\"files\":%zu,"
+               "\"code_bytes\":%zu,\"repairs\":%zu,\"arity\":%u,\"execution_steps\":%" PRIu64
+               ",\"entry_offset\":%u}",
+               s.nodes, s.genes, s.live_genes, s.files, s.code_bytes, s.repairs, s.arity,
+               s.execution_steps, s.entry_offset);
+    } else {
+        printf("Valid: inputs=%u steps=%" PRIu64 "/%u genes=%zu live=%zu files=%zu repairs=%zu\n",
+               s.arity, s.execution_steps, BIO_EXECUTION_LIMIT, s.genes, s.live_genes, s.files, s.repairs);
+    }
+}
+
+static int create_source(const char *path, BioError *e) {
+    static const char source[] =
+        "# Run with: codons run <this-file.dna> 10 20\n"
+        "# Inputs are r0 and r1. The result is 30.\n"
+        "GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n";
+    wchar_t wide[BIO_PATH_SIZE];
+    HANDLE file;
+    DWORD written = 0;
+    int ok;
+    if (!bio_wide_path(path, wide, BIO_PATH_SIZE)) {
+        bio_error(e, "invalid UTF-8 path or path too long"); return 0;
+    }
+    file = CreateFileW(wide, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS)
+            bio_error(e, "file already exists; choose a new path: %s", path);
+        else bio_error(e, "cannot create %s (Windows error %lu)", path, error);
+        return 0;
+    }
+    ok = WriteFile(file, source, (DWORD)(sizeof(source) - 1), &written, NULL) && written == sizeof(source) - 1;
+    if (!CloseHandle(file)) ok = 0;
+    if (!ok) bio_error(e, "could not finish writing %s", path);
+    return ok;
 }
 
 static int live(BioProgram *p, int repair, BioError *e) {
     BioRuntime *runtime = bio_runtime_create(p, e);
     char line[1200];
-    if (!runtime) { fprintf(stderr, "%s\n", e->message); return 1; }
-    /* Transfer CLI ownership so replaced generations can actually be reclaimed. */
-    bio_program_release(p);
-    puts("Live runtime ready. Commands: run | reload <file.dna> | quit");
+    bio_program_release(p); /* Transfer CLI ownership to the runtime, including on failure. */
+    if (!runtime) return failure(0, "runtime", e->message, 1);
+    puts("Ready. Commands: run [number ...] | reload <file.dna> | quit");
+    fflush(stdout);
     while (fgets(line, sizeof(line), stdin)) {
         size_t n = strlen(line);
         if (n && line[n - 1] != '\n' && !feof(stdin)) {
@@ -35,52 +157,101 @@ static int live(BioProgram *p, int repair, BioError *e) {
             continue;
         }
         line[strcspn(line, "\r\n")] = '\0';
-        if (strcmp(line, "quit") == 0) break;
-        if (strcmp(line, "run") == 0) printf("result=%" PRId32 "\n", bio_runtime_run(runtime));
-        else if (strncmp(line, "reload ", 7) == 0 && line[7]) {
-            if (bio_runtime_reload(runtime, line + 7, repair, e)) puts("updated");
+        if (!strcmp(line, "quit")) break;
+        if (!strncmp(line, "run", 3) && (!line[3] || isspace((unsigned char)line[3]))) {
+            int32_t args[2], result;
+            size_t argc = 0;
+            char *part = strtok(line + 3, " \t");
+            int valid = 1;
+            while (part) {
+                if (argc == 2 || !parse_i32(part, &args[argc])) { valid = 0; break; }
+                ++argc; part = strtok(NULL, " \t");
+            }
+            if (!valid) fputs("run accepts at most two decimal i32 inputs\n", stderr);
+            else if (bio_runtime_run(runtime, args, argc, &result, e)) printf("result=%" PRId32 "\n", result);
             else fprintf(stderr, "%s\n", e->message);
-        } else puts("expected: run | reload <file.dna> | quit");
+        } else if (!strncmp(line, "reload ", 7) && line[7]) {
+            if (bio_runtime_reload(runtime, line + 7, repair, e)) puts("updated");
+            else fprintf(stderr, "%s\nUpdate rejected; previous version is still active.\n", e->message);
+        } else puts("expected: run [number ...] | reload <file.dna> | quit");
         fflush(stdout);
     }
     bio_runtime_destroy(runtime);
     return 0;
 }
 
-int main(int argc, char **argv) {
+static int cli(int argc, char **argv) {
+    Options o = {0};
     BioError e = {{0}};
     BioProgram *p;
-    int repair = 0, result = 0;
-    int emit, is_live;
-    if (argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+    BioStats s;
+    int code = 0, is_run, is_interpret;
+    if (argc == 1 || (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")))) {
         usage(); return 0;
     }
-    if (argc < 3) { usage(); return 2; }
-    emit = strcmp(argv[1], "emit") == 0;
-    is_live = strcmp(argv[1], "live") == 0;
-    if (strcmp(argv[1], "run") && strcmp(argv[1], "check") && strcmp(argv[1], "interpret") &&
-        strcmp(argv[1], "dump") && !emit && !is_live) { usage(); return 2; }
-    if (emit) {
-        if (argc != 4) { usage(); return 2; }
-    } else if (argc == 4 && strcmp(argv[3], "--repair") == 0) repair = 1;
-    else if (argc != 3) { usage(); return 2; }
-    p = bio_compile(argv[2], repair, &e);
-    if (!p) { fprintf(stderr, "%s\n", e.message); return 1; }
-    if (is_live) {
-        result = live(p, repair, &e);
-        if (result) bio_program_release(p);
-        return result;
+    if (argc == 2 && !strcmp(argv[1], "--version")) { puts("Codons " BIO_VERSION); return 0; }
+    if (!options(argc, argv, &o, &e)) return failure(o.json, "arguments", e.message, 2);
+    if (!strcmp(o.command, "new")) {
+        if (!create_source(o.path, &e)) return failure(o.json, "file", e.message, 1);
+        if (o.json) { fputs("{\"ok\":true,\"file\":", stdout); json_string(o.path); puts("}"); }
+        else printf("Created %s\nRun: codons run \"%s\" 10 20\n", o.path, o.path);
+        return 0;
     }
-    if (repair && bio_program_stats(p).repairs)
-        fprintf(stderr, "repair: restored %zu unused '_' fields\n", bio_program_stats(p).repairs);
-    if (strcmp(argv[1], "run") == 0) printf("%" PRId32 "\n", bio_program_run(p));
-    else if (strcmp(argv[1], "interpret") == 0) printf("%" PRId32 "\n", bio_program_interpret(p));
-    else if (strcmp(argv[1], "check") == 0) stats(p);
-    else if (strcmp(argv[1], "dump") == 0) bio_program_dump(p, stdout);
-    else if (emit) {
-        if (!bio_program_write_code(p, argv[3], &e)) { fprintf(stderr, "%s\n", e.message); result = 1; }
-        else { stats(p); puts("Raw x64 code written (not a standalone executable). Use dump for entry offset."); }
+    is_run = !strcmp(o.command, "run");
+    is_interpret = !strcmp(o.command, "interpret");
+    if (is_interpret || !strcmp(o.command, "check") || !strcmp(o.command, "dump"))
+        p = bio_load(o.path, o.repair, &e);
+    else p = bio_compile(o.path, o.repair, &e);
+    if (!p) return failure(o.json, "compile", e.message, 1);
+    s = bio_program_stats(p);
+    if (s.repairs && !o.json) fprintf(stderr, "repair: restored %zu unused '_' fields\n", s.repairs);
+    if (is_run || is_interpret) {
+        int32_t result;
+        if (o.argument_count != s.arity) {
+            bio_error(&e, "main expects %u arguments, got %zu", s.arity, o.argument_count);
+            code = failure(o.json, "arguments", e.message, 2);
+        } else {
+            int ok = is_interpret ? bio_program_interpret(p, o.arguments, o.argument_count, &result, &e) :
+                                    bio_program_run(p, o.arguments, o.argument_count, &result, &e);
+            if (!ok) code = failure(o.json, "run", e.message, 1);
+            else if (o.json) {
+                printf("{\"ok\":true,\"result\":%" PRId32 ",", result); stats(s, 1); puts("}");
+            } else printf("%" PRId32 "\n", result);
+        }
+    } else if (!strcmp(o.command, "check")) {
+        if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); puts("}"); }
+        else stats(s, 0);
+    } else if (!strcmp(o.command, "dump")) bio_program_dump(p, stdout);
+    else if (!strcmp(o.command, "live")) return live(p, o.repair, &e);
+    else if (!strcmp(o.command, "emit")) {
+        if (!bio_program_write_code(p, o.output, &e)) code = failure(o.json, "file", e.message, 1);
+        else if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); puts("}"); }
+        else printf("Wrote %zu bytes; main offset=%u. Raw x64 code, not a standalone .exe.\n", s.code_bytes, s.entry_offset);
     }
     bio_program_release(p);
-    return result;
+    return code;
+}
+
+int wmain(int argc, wchar_t **wide_argv) {
+    char **argv = calloc((size_t)argc + 1, sizeof(*argv));
+    int i, code = 1;
+    UINT old_output = GetConsoleOutputCP(), old_input = GetConsoleCP();
+    if (!argv) { fputs("out of memory\n", stderr); return 1; }
+    if (old_output) SetConsoleOutputCP(CP_UTF8);
+    if (old_input) SetConsoleCP(CP_UTF8);
+    for (i = 0; i < argc; ++i) {
+        int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_argv[i], -1, NULL, 0, NULL, NULL);
+        if (!size || !(argv[i] = malloc((size_t)size))) {
+            fputs("invalid command-line encoding or out of memory\n", stderr); goto cleanup;
+        }
+        if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_argv[i], -1, argv[i], size, NULL, NULL))
+            goto cleanup;
+    }
+    code = cli(argc, argv);
+cleanup:
+    for (i = 0; i < argc; ++i) free(argv[i]);
+    free(argv);
+    if (old_output) SetConsoleOutputCP(old_output);
+    if (old_input) SetConsoleCP(old_input);
+    return code;
 }

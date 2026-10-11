@@ -57,6 +57,18 @@ static void emit_gene(Emitter *b, BioGene *g) {
             byte(b, 0x44); byte(b, 0x24); byte(b, slot(n->arg2));
             store_eax(b, n->arg1);
             break;
+        case OP_EQ: case OP_LT: case OP_MIN: case OP_MAX:
+            load_eax(b, n->arg1);
+            byte(b, 0x3b); byte(b, 0x44); byte(b, 0x24); byte(b, slot(n->arg2)); /* cmp eax,[rsp+slot] */
+            if (n->op_code == OP_EQ || n->op_code == OP_LT) {
+                byte(b, 0x0f); byte(b, n->op_code == OP_EQ ? 0x94 : 0x9c); byte(b, 0xc0); /* sete/setl al */
+                byte(b, 0x0f); byte(b, 0xb6); byte(b, 0xc0); /* movzx eax,al */
+            } else {
+                byte(b, 0x0f); byte(b, n->op_code == OP_MIN ? 0x4f : 0x4c); /* cmovg/cmovl eax,[rsp+slot] */
+                byte(b, 0x44); byte(b, 0x24); byte(b, slot(n->arg2));
+            }
+            store_eax(b, n->arg1);
+            break;
         case OP_CALL: {
             unsigned argc = n->arg2 >> 16;
             if (argc > 0) {
@@ -95,6 +107,7 @@ int bio_jit(BioProgram *p, BioError *e) {
         if (p->genes[i].live) emit_gene(&b, &p->genes[i]);
     if (b.failed) { bio_error(e, "internal error: JIT output exceeds reserved buffer"); return 0; }
     p->stats.code_bytes = b.length;
+    p->stats.entry_offset = p->genes[p->main_gene].code_offset;
     for (i = 0; i < p->gene_count; ++i) {
         CodonNode *n;
         if (!p->genes[i].live) continue;

@@ -21,6 +21,12 @@ static int reg(const char *s) {
     return strlen(s) == 2 && s[0] == 'r' && s[1] >= '0' && s[1] <= '7' ? s[1] - '0' : -1;
 }
 
+static int same_path(const char *a, const char *b) {
+    wchar_t left[BIO_PATH_SIZE], right[BIO_PATH_SIZE];
+    return bio_wide_path(a, left, BIO_PATH_SIZE) && bio_wide_path(b, right, BIO_PATH_SIZE) &&
+        CompareStringOrdinal(left, -1, right, -1, TRUE) == CSTR_EQUAL;
+}
+
 static int symbol(BioProgram *p, const char *name) {
     unsigned i;
     for (i = 0; i < p->symbol_count; ++i)
@@ -33,6 +39,7 @@ static int symbol(BioProgram *p, const char *name) {
 /* Imports resolve against the importing file, never the process working directory. */
 static int resolve_path(const char *name, const char *parent, char *out, BioError *e) {
     char combined[BIO_PATH_SIZE];
+    wchar_t input[BIO_PATH_SIZE], resolved[BIO_PATH_SIZE];
     DWORD length;
     int absolute = name[0] == '/' || name[0] == '\\' || (strlen(name) > 1 && name[1] == ':');
     if (parent && !absolute) {
@@ -45,8 +52,12 @@ static int resolve_path(const char *name, const char *parent, char *out, BioErro
         strcpy(combined + prefix, name);
         name = combined;
     }
-    length = GetFullPathNameA(name, BIO_PATH_SIZE, out, NULL);
-    if (!length || length >= BIO_PATH_SIZE) {
+    if (!bio_wide_path(name, input, BIO_PATH_SIZE)) {
+        bio_error(e, "source path must be valid UTF-8 and fit the path limit"); return 0;
+    }
+    length = GetFullPathNameW(input, BIO_PATH_SIZE, resolved, NULL);
+    if (!length || length >= BIO_PATH_SIZE ||
+        !WideCharToMultiByte(CP_UTF8, 0, resolved, -1, out, BIO_PATH_SIZE, NULL, NULL)) {
         bio_error(e, "cannot resolve source path: %s", name); return 0;
     }
     return 1;
@@ -67,6 +78,9 @@ static int read_line(BioProgram *p, FILE *f, char *line, BioError *e) {
     }
     if (ferror(f)) { bio_error(e, "source read failed"); return -1; }
     line[n] = '\0';
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, line, -1, NULL, 0)) {
+        bio_error(e, "source must be valid UTF-8"); return -1;
+    }
     return c == EOF && n == 0 ? 0 : 1;
 }
 
@@ -84,7 +98,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
     }
     if (!resolve_path(name, parent, path, e)) return 0;
     for (i = 0; i < p->file_count; ++i) {
-        if (_stricmp(p->files[i].path, path) != 0) continue;
+        if (!same_path(p->files[i].path, path)) continue;
         if (p->files[i].state == 1) {
             bio_error(e, "apoptosis: cyclic import: %s", path); return 0;
         }
@@ -93,7 +107,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
     if (p->file_count == BIO_MAX_FILES) {
         bio_error(e, "apoptosis: file budget exceeded (%u)", BIO_MAX_FILES); return 0;
     }
-    f = fopen(path, "rb");
+    f = bio_fopen(path, L"rb");
     if (!f) { bio_error(e, "cannot open source: %s", path); return 0; }
     index = p->file_count++;
     strcpy(p->files[index].path, path);
@@ -206,6 +220,10 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             else if (strcmp(fields[0], "ADD") == 0) n->op_code = OP_ADD;
             else if (strcmp(fields[0], "SUB") == 0) n->op_code = OP_SUB;
             else if (strcmp(fields[0], "MUL") == 0) n->op_code = OP_MUL;
+            else if (strcmp(fields[0], "EQ") == 0) n->op_code = OP_EQ;
+            else if (strcmp(fields[0], "LT") == 0) n->op_code = OP_LT;
+            else if (strcmp(fields[0], "MIN") == 0) n->op_code = OP_MIN;
+            else if (strcmp(fields[0], "MAX") == 0) n->op_code = OP_MAX;
             else FAIL("unknown opcode: %s", fields[0]);
         }
     }
