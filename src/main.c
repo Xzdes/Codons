@@ -1,4 +1,5 @@
 #include "internal.h"
+#include "cli.h"
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -23,6 +24,7 @@ static void usage(void) {
          "\nCommands:\n"
          "  new <file.dna>                 Create an example; never overwrite a file\n"
          "  run <file.dna> [number ...]     Compile and run with 0, 1 or 2 i32 inputs\n"
+         "  test <file.dna> <cases.csv>     Compare CSV examples with native results\n"
          "  check <file.dna>               Validate without running or preparing JIT\n"
          "  interpret <file.dna> [number ...]  Run the reference interpreter\n"
          "  dump <file.dna>                Show the normalized program\n"
@@ -30,13 +32,14 @@ static void usage(void) {
          "  emit <file.dna> <code.bin>     Export raw machine code (not an .exe)\n"
          "\nOptions after the file: --repair, --json\n"
          "  --repair restores only an unused '_' in RET/END\n"
-         "  --json is available for new, run, check, interpret and emit\n"
+         "  --json is available for new, run, test, check, interpret and emit\n"
+         "CSV header: expected | arg1,expected | arg1,arg2,expected\n"
          "Live commands: run [number ...] | reload <file.dna> | quit\n"
          "Every run shares a 1000000-step budget across loops and nested calls.\n"
-         "Exit codes: 0 success, 1 program/file error, 2 invalid command or arguments");
+         "Exit codes: 0 success, 1 failed tests or program/file error, 2 invalid command or arguments");
 }
 
-static void json_string(const char *s) {
+void cli_json_string(const char *s) {
     const unsigned char *p = (const unsigned char *)s;
     putchar('"');
     for (; *p; ++p) {
@@ -49,13 +52,13 @@ static void json_string(const char *s) {
 
 static int failure(int json, const char *stage, const char *message, int code) {
     if (json) {
-        fputs("{\"ok\":false,\"error\":{\"stage\":", stdout); json_string(stage);
-        fputs(",\"message\":", stdout); json_string(message); puts("}}");
+        fputs("{\"ok\":false,\"error\":{\"stage\":", stdout); cli_json_string(stage);
+        fputs(",\"message\":", stdout); cli_json_string(message); puts("}}");
     } else fprintf(stderr, "%s\n", message);
     return code;
 }
 
-static int parse_i32(const char *s, int32_t *out) {
+int cli_parse_i32(const char *s, int32_t *out) {
     const char *digit = s;
     char *end;
     long long value;
@@ -70,29 +73,35 @@ static int parse_i32(const char *s, int32_t *out) {
 }
 
 static int options(int argc, char **argv, Options *o, BioError *e) {
-    int i, is_emit;
+    int i, is_emit, is_test;
     for (i = 1; i < argc; ++i) if (!strcmp(argv[i], "--json")) o->json = 1;
     if (argc < 3) { bio_error(e, "expected a command and file; use --help"); return 0; }
     o->command = argv[1]; o->path = argv[2];
     is_emit = !strcmp(o->command, "emit");
+    is_test = !strcmp(o->command, "test");
     if (strcmp(o->command, "new") && strcmp(o->command, "run") && strcmp(o->command, "check") &&
         strcmp(o->command, "interpret") && strcmp(o->command, "dump") &&
-        strcmp(o->command, "live") && !is_emit) {
+        strcmp(o->command, "live") && !is_emit && !is_test) {
         bio_error(e, "unknown command '%s'; use --help", o->command); return 0;
     }
-    if (is_emit) {
+    if (is_emit || is_test) {
         if (argc < 4 || !strncmp(argv[3], "--", 2)) {
-            bio_error(e, "emit requires an output file"); return 0;
+            bio_error(e, "%s requires %s", o->command, is_test ? "a CSV examples file" : "an output file"); return 0;
         }
         o->output = argv[3];
     }
-    for (i = is_emit ? 4 : 3; i < argc; ++i) {
+    for (i = (is_emit || is_test) ? 4 : 3; i < argc; ++i) {
         if (!strcmp(argv[i], "--repair")) o->repair = 1;
         else if (!strcmp(argv[i], "--json")) o->json = 1;
         else if ((!strcmp(o->command, "run") || !strcmp(o->command, "interpret")) &&
-                 o->argument_count < 2 && parse_i32(argv[i], &o->arguments[o->argument_count]))
+                 o->argument_count < 2 && cli_parse_i32(argv[i], &o->arguments[o->argument_count]))
             ++o->argument_count;
-        else { bio_error(e, "unexpected argument '%s'; inputs must be at most two decimal i32 values", argv[i]); return 0; }
+        else {
+            if (!strcmp(o->command, "run") || !strcmp(o->command, "interpret"))
+                bio_error(e, "unexpected argument '%s'; inputs must be at most two decimal i32 values", argv[i]);
+            else bio_error(e, "unexpected argument '%s' for %s; use --help", argv[i], o->command);
+            return 0;
+        }
     }
     if (o->json && (!strcmp(o->command, "live") || !strcmp(o->command, "dump"))) {
         bio_error(e, "--json is not supported for live or dump"); return 0;
@@ -170,7 +179,7 @@ static int live(BioProgram *p, int repair, BioError *e) {
             char *part = strtok(line + 3, " \t");
             int valid = 1;
             while (part) {
-                if (argc == 2 || !parse_i32(part, &args[argc])) { valid = 0; break; }
+                if (argc == 2 || !cli_parse_i32(part, &args[argc])) { valid = 0; break; }
                 ++argc; part = strtok(NULL, " \t");
             }
             if (!valid) fputs("run accepts at most two decimal i32 inputs\n", stderr);
@@ -199,7 +208,7 @@ static int cli(int argc, char **argv) {
     if (!options(argc, argv, &o, &e)) return failure(o.json, "arguments", e.message, 2);
     if (!strcmp(o.command, "new")) {
         if (!create_source(o.path, &e)) return failure(o.json, "file", e.message, 1);
-        if (o.json) { fputs("{\"ok\":true,\"file\":", stdout); json_string(o.path); puts("}"); }
+        if (o.json) { fputs("{\"ok\":true,\"file\":", stdout); cli_json_string(o.path); puts("}"); }
         else printf("Created %s\nRun: codons run \"%s\" 10 20\n", o.path, o.path);
         return 0;
     }
@@ -227,7 +236,8 @@ static int cli(int argc, char **argv) {
     } else if (!strcmp(o.command, "check")) {
         if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); puts("}"); }
         else stats(s, 0);
-    } else if (!strcmp(o.command, "dump")) bio_program_dump(p, stdout);
+    } else if (!strcmp(o.command, "test")) code = cli_test(p, o.output, o.json);
+    else if (!strcmp(o.command, "dump")) bio_program_dump(p, stdout);
     else if (!strcmp(o.command, "live")) return live(p, o.repair, &e);
     else if (!strcmp(o.command, "emit")) {
         if (!bio_program_write_code(p, o.output, &e)) code = failure(o.json, "file", e.message, 1);

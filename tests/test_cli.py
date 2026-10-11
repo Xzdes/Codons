@@ -1,5 +1,7 @@
 """Exercise the shipped executable as a user or AI client would. Standard library only."""
 import json
+import csv
+import io
 import os
 import random
 from pathlib import Path
@@ -33,7 +35,7 @@ class CliTests(unittest.TestCase):
         return proc
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.3.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.4.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -230,6 +232,167 @@ class CliTests(unittest.TestCase):
         source = self.source("GENE main i32\nLOAD r0 42\nRET r0 _\nEND _ _\n")
         env = dict(os.environ, PATH=str(Path(os.environ["SystemRoot"]) / "System32"))
         self.assertEqual(self.call("run", source, env=env).stdout.strip(), "42")
+
+    def test_csv_shipped_examples_and_all_arities(self):
+        for name, total in [("main", 1), ("sum", 4), ("price", 3), ("factorial", 5)]:
+            with self.subTest(name=name):
+                proc = self.call("test", EXAMPLES / f"{name}.dna", EXAMPLES / f"{name}.csv", "--json")
+                data = json.loads(proc.stdout)
+                self.assertEqual(proc.stderr, "")
+                self.assertTrue(data["ok"])
+                self.assertEqual(data["summary"], {"total": total, "passed": total, "failed": 0,
+                                                  "mismatches": 0, "errors": 0})
+                self.assertTrue(all(case["status"] == "passed" for case in data["cases"]))
+        text = self.call("test", EXAMPLES / "sum.dna", EXAMPLES / "sum.csv").stdout
+        self.assertIn("Tests: 4 total, 4 passed, 0 failed", text)
+        self.assertIn("inputs=[10] expected=55 actual=55", text)
+
+    def test_csv_mismatches_do_not_stop_the_suite(self):
+        source = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n")
+        cases = self.source("arg1,arg2,expected\n10,20,31\n-7,4,-3\n1,2,4\n", "cases.csv")
+        proc = self.call("test", source, cases, "--json", code=1)
+        data = json.loads(proc.stdout)
+        self.assertFalse(data["ok"])
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual(data["summary"], {"total": 3, "passed": 1, "failed": 2, "mismatches": 2, "errors": 0})
+        self.assertEqual(data["cases"][0], {"line": 2, "inputs": [10, 20], "expected": 31,
+                                            "actual": 30, "status": "failed"})
+        self.assertEqual([case["status"] for case in data["cases"]], ["failed", "passed", "failed"])
+        text = self.call("test", source, cases, code=1).stdout
+        self.assertIn(f"FAIL {cases}:2: inputs=[10,20] expected=31 actual=30", text)
+        self.assertIn(f"PASS {cases}:3:", text)
+        self.assertIn("3 total, 1 passed, 2 failed", text)
+
+    def test_csv_runtime_errors_continue_with_a_fresh_budget(self):
+        source = self.source("GENE main i32/1\nJZ r0 done\nLABEL spin _\nJMP spin _\n"
+                             "LABEL done _\nLOAD r0 7\nRET r0 _\nEND _ _\n")
+        cases = self.source("arg1,expected\n1,0\n0,7\n0,8\n1,0\n0,7\n", "cases.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["summary"], {"total": 5, "passed": 2, "failed": 3, "mismatches": 1, "errors": 2})
+        first = data["cases"][0]
+        self.assertEqual(first["status"], "error")
+        self.assertNotIn("actual", first)
+        self.assertEqual(first["error"]["stage"], "run")
+        self.assertIn(f"{source}:4:", first["error"]["message"])
+        self.assertIn("execution budget exhausted", first["error"]["message"])
+        self.assertEqual(data["cases"][-1]["actual"], 7)
+        text = self.call("test", source, cases, code=1).stdout
+        self.assertIn(f"ERROR {cases}:2:", text)
+        self.assertIn("1 mismatches, 2 execution errors", text)
+
+    def test_csv_header_must_match_main(self):
+        for arity, header in [(0, "expected"), (1, "arg1,expected"), (2, "arg1,arg2,expected")]:
+            source = self.source(f"GENE main i32/{arity}\nLOAD r0 42\nRET r0 _\nEND _ _\n")
+            for invalid in ["input,expected", "arg2,arg1,expected", "ARG1,expected", "1,42", "arg1;expected"]:
+                with self.subTest(arity=arity, header=invalid):
+                    cases = self.source(invalid + "\n", "cases.csv")
+                    data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+                    self.assertEqual(data["error"]["stage"], "csv")
+                    self.assertEqual(data["error"]["line"], 1)
+                    self.assertIn(f"CSV header must be {header}", data["error"]["message"])
+                    self.assertNotIn("cases", data)
+
+    def test_csv_empty_files_and_header_only_are_errors(self):
+        source = EXAMPLES / "sum.dna"
+        for content in ["", "\ufeff", "\n \t\n", "arg1,expected\n", "arg1,expected\n\n"]:
+            with self.subTest(content=content):
+                cases = self.source(content, "empty.csv")
+                data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+                self.assertFalse(data["ok"])
+                self.assertIn(data["error"]["code"], ["header", "empty"])
+                self.assertEqual(data["error"]["line"], 0)
+                self.assertNotIn("summary", data)
+
+    def test_csv_reports_invalid_cells_before_running_any_examples(self):
+        bad_rows = [("1,", "integer", 2), (",0", "integer", 1), ("1", "column_count", 2),
+                    ("1,1,1", "column_count", 3), ("1,1,", "column_count", 3),
+                    ("2147483648,0", "integer", 1), ("0,-2147483649", "integer", 2),
+                    ("1.5,1", "integer", 1), ("0x10,1", "integer", 1), ("+,1", "integer", 1),
+                    ('"",1', "integer", 1), ('"1,2",0', "integer", 1),
+                    ('1"2,0', "quotes", 1), ('"1,0', "quotes", 1),
+                    ('"1"junk,0', "quotes", 1), ('"1""2",0', "quotes", 1)]
+        for row, error_code, column in bad_rows:
+            with self.subTest(row=row):
+                cases = self.source("arg1,expected\n1,1\n\n" + row + "\n", "cases.csv")
+                proc = self.call("test", EXAMPLES / "sum.dna", cases, "--json", code=1)
+                data = json.loads(proc.stdout)
+                self.assertEqual(proc.stderr, "")
+                self.assertEqual(data["error"]["code"], error_code)
+                self.assertEqual(data["error"]["file"], str(cases))
+                self.assertEqual(data["error"]["line"], 4)
+                self.assertEqual(data["error"]["column"], column)
+                self.assertNotIn("cases", data)
+        proc = self.call("test", EXAMPLES / "sum.dna", cases, code=1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn(f"{cases}:4: column 1:", proc.stderr)
+
+    def test_csv_unicode_bom_quotes_blank_lines_and_newlines(self):
+        cases = self.root / "Примеры с пробелами.csv"
+        for newline in ["\n", "\r\n"]:
+            content = '\ufeff' + newline + ' "arg1" , "expected" ' + newline + newline + ' "10" , "55" ' + newline + '0,0'
+            cases.write_bytes(content.encode("utf-8"))
+            data = json.loads(self.call("test", EXAMPLES / "sum.dna", cases, "--json").stdout)
+            self.assertEqual([case["line"] for case in data["cases"]], [4, 5])
+            self.assertEqual(data["summary"]["passed"], 2)
+        cases.write_bytes(b"arg1,expected\n" + b"0" * 509 + b",0\n")
+        self.assertEqual(json.loads(self.call("test", EXAMPLES / "sum.dna", cases, "--json").stdout)["summary"]["passed"], 1)
+
+    def test_csv_rejects_damaged_encoding_and_nul(self):
+        cases = self.root / "bad.csv"
+        for content in [b"arg1,expected\n\xff,0\n", b"arg1,expected\n1\x00,1\n",
+                        b"arg1,expected\n1,1\n#\xff\n", "arg1,expected\n1,1".encode("utf-16")]:
+            cases.write_bytes(content)
+            data = json.loads(self.call("test", EXAMPLES / "sum.dna", cases, "--json", code=1).stdout)
+            self.assertEqual(data["error"]["code"], "encoding")
+            self.assertNotIn("cases", data)
+
+    def test_csv_integer_boundaries_and_standard_writer(self):
+        source = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n")
+        values = [-2147483648, -1, 0, 1, 2147483647]
+        text = io.StringIO(newline="")
+        writer = csv.writer(text, quoting=csv.QUOTE_ALL)
+        writer.writerow(["arg1", "arg2", "expected"])
+        for a in values:
+            for b in values:
+                writer.writerow([a, b, (a + b + 2**31) % 2**32 - 2**31])
+        cases = self.root / "standard.csv"
+        cases.write_bytes(text.getvalue().encode("utf-8"))
+        data = json.loads(self.call("test", source, cases, "--json").stdout)
+        self.assertEqual(data["summary"]["passed"], 25)
+        cases.write_text("arg1,arg2,expected\n+1,-0,0001\n", encoding="utf-8")
+        self.call("test", source, cases)
+
+    def test_csv_size_and_case_limits(self):
+        source = self.source("GENE main i32\nLOAD r0 42\nRET r0 _\nEND _ _\n")
+        cases = self.source("expected\n" + "42\n" * 1000, "limit.csv")
+        data = json.loads(self.call("test", source, cases, "--json").stdout)
+        self.assertEqual(data["summary"]["passed"], 1000)
+        for content, error_code in [(b"expected\n" + b"42\n" * 1001, "case_limit"),
+                                    (b"expected\n" + b"0" * 512, "line_limit"),
+                                    (b"\n" * (1024 * 1024 + 1), "file_limit")]:
+            cases.write_bytes(content)
+            data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+            self.assertEqual(data["error"]["code"], error_code)
+            self.assertNotIn("cases", data)
+
+    def test_csv_argument_file_compile_errors_and_repair(self):
+        source = EXAMPLES / "sum.dna"
+        for args in [("test", source), ("test", source, "--json"),
+                     ("test", source, EXAMPLES / "sum.csv", "extra"),
+                     ("test", source, EXAMPLES / "sum.csv", "--interpret")]:
+            data = json.loads(self.call(*args, "--json", code=2).stdout)
+            self.assertEqual(data["error"]["stage"], "arguments")
+        data = json.loads(self.call("test", source, "missing.csv", "--json", code=1).stdout)
+        self.assertEqual(data["error"]["code"], "open")
+        self.assertEqual(data["error"]["file"], "missing.csv")
+        source = self.source("GENE main i32\nLOAD r0 42\nRET r0\nEND _\n")
+        cases = self.source("expected\n42\n", "cases.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["error"]["stage"], "compile")
+        data = json.loads(self.call("test", source, cases, "--repair", "--json").stdout)
+        self.assertTrue(data["ok"])
+        env = dict(os.environ, PATH=str(Path(os.environ["SystemRoot"]) / "System32"))
+        self.call("test", EXAMPLES / "price.dna", EXAMPLES / "price.csv", env=env)
 
 
 if __name__ == "__main__":
