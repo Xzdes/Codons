@@ -22,11 +22,14 @@
 
 typedef enum {
     OP_GENE, OP_LOAD, OP_MOV, OP_ADD, OP_SUB, OP_MUL, OP_CALL, OP_RET,
-    OP_EQ, OP_LT, OP_MIN, OP_MAX
+    OP_EQ, OP_LT, OP_MIN, OP_MAX, OP_LABEL, OP_JMP, OP_JZ, OP_JNZ
 } BioOp;
 
 typedef struct CodonNode {
     uint8_t op_code;
+    uint8_t reachable;
+    uint8_t initialized;
+    uint8_t queued;
     uint32_t arg1;
     uint32_t arg2;
     struct CodonNode *next;
@@ -34,6 +37,8 @@ typedef struct CodonNode {
     uint32_t line;
     uint32_t file;
     uint32_t patch_offset;
+    uint32_t code_offset;
+    uint32_t index;
 } CodonNode;
 
 typedef struct ArenaBlock {
@@ -49,6 +54,7 @@ typedef struct {
     unsigned visit;
     unsigned depth;
     uint64_t execution_steps;
+    unsigned dynamic_steps;
     CodonNode *head;
     CodonNode *tail;
     uint32_t code_offset;
@@ -59,6 +65,15 @@ typedef struct {
     char path[BIO_PATH_SIZE];
     unsigned state; /* 1: currently parsing, 2: complete */
 } BioFile;
+
+/* Each invocation owns one context; nested calls share it, parallel runs do not. */
+typedef struct {
+    uint64_t remaining;
+    uint32_t failed_node;
+} BioExecution;
+
+_Static_assert(offsetof(BioExecution, remaining) == 0, "JIT budget offset");
+_Static_assert(offsetof(BioExecution, failed_node) == 8, "JIT fault offset");
 
 struct BioProgram {
     volatile LONG references;

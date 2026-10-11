@@ -1,0 +1,5 @@
+# Deliberately endless loop: run reports a budget error and exits normally.
+GENE main i32
+LABEL spin _
+JMP spin _
+END _ _

@@ -1,0 +1,9 @@
+# Return the larger input using an explicit branch.
+GENE main i32/2
+MOV r2 r0
+LT r2 r1
+JNZ r2 right
+RET r0 _
+LABEL right _
+RET r1 _
+END _ _

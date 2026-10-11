@@ -1,0 +1,14 @@
+# Sum from 1 to n. Negative n is treated as zero.
+# codons run examples/sum.dna 10 -> 55
+GENE main i32/1
+LOAD r1 0
+MAX r0 r1
+LOAD r2 1
+LABEL loop _
+JZ r0 done
+ADD r1 r0
+SUB r0 r2
+JMP loop _
+LABEL done _
+RET r1 _
+END _ _

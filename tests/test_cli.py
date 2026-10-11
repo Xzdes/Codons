@@ -1,6 +1,7 @@
 """Exercise the shipped executable as a user or AI client would. Standard library only."""
 import json
 import os
+import random
 from pathlib import Path
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import tempfile
 import unittest
 
 EXE = Path(sys.argv.pop(1)).resolve()
+EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 WORK = Path.cwd() / "work"
 WORK.mkdir(exist_ok=True)
 
@@ -31,7 +33,7 @@ class CliTests(unittest.TestCase):
         return proc
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.2.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.3.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -142,6 +144,87 @@ class CliTests(unittest.TestCase):
         data = json.loads(self.call("emit", source, output, "--json").stdout)
         self.assertEqual(output.stat().st_size, data["stats"]["code_bytes"])
         self.assertEqual(data["stats"]["entry_offset"], 0)
+
+    def test_branch_and_loop_examples(self):
+        cases = [("sum.dna", [10], 55), ("sum.dna", [0], 0), ("sum.dna", [-5], 0),
+                 ("factorial.dna", [5], 120), ("factorial.dna", [0], 1),
+                 ("factorial.dna", [-1], 0), ("factorial.dna", [12], 479001600),
+                 ("branch.dna", [-2147483648, 2147483647], 2147483647),
+                 ("branch.dna", [7, -4], 7), ("branch.dna", [-3, -3], -3)]
+        for name, args, expected in cases:
+            for command in ("run", "interpret"):
+                with self.subTest(name=name, args=args, command=command):
+                    data = json.loads(self.call(command, EXAMPLES / name, *args, "--json").stdout)
+                    self.assertEqual(data["result"], expected)
+                    self.assertIsNone(data["stats"]["execution_steps"])
+                    self.assertTrue(data["stats"]["dynamic_steps"])
+                    self.assertEqual(data["stats"]["execution_limit"], 1000000)
+
+    def test_infinite_loop_is_a_run_error(self):
+        source = EXAMPLES / "infinite.dna"
+        data = json.loads(self.call("check", source, "--json").stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["stats"]["code_bytes"], 0)
+        messages = []
+        for command in ("run", "interpret"):
+            data = json.loads(self.call(command, source, "--json", code=1).stdout)
+            self.assertFalse(data["ok"])
+            self.assertNotIn("result", data)
+            self.assertEqual(data["error"]["stage"], "run")
+            self.assertIn("execution budget exhausted after 1000000 steps", data["error"]["message"])
+            messages.append(data["error"]["message"])
+        self.assertEqual(messages[0], messages[1])
+
+    def test_loop_dump_round_trip(self):
+        source = EXAMPLES / "factorial.dna"
+        normalized = self.source(self.call("dump", source).stdout, "normalized.dna")
+        for command in ("run", "interpret"):
+            self.assertEqual(self.call(command, normalized, 6).stdout.strip(), "720")
+        def codons(text):
+            return [line.split("#", 1)[0].strip() for line in text.splitlines() if line.strip()]
+        self.assertEqual(codons(self.call("dump", normalized).stdout), codons(self.call("dump", source).stdout))
+
+    def test_live_recovers_from_loop_limit(self):
+        source = self.source("GENE main i32/1\nJZ r0 done\nLABEL spin _\nJMP spin _\n"
+                             "LABEL done _\nLOAD r0 7\nRET r0 _\nEND _ _\n", "loop.dna")
+        updated = self.source("GENE main i32/1\nLOAD r0 42\nRET r0 _\nEND _ _\n", "updated.dna")
+        proc = self.call("live", source, input=f"run 1\nrun 0\nreload {updated}\nrun 1\nquit\n")
+        self.assertIn("execution budget exhausted", proc.stderr)
+        self.assertEqual([x for x in proc.stdout.splitlines() if x.startswith("result=")],
+                         ["result=7", "result=42"])
+
+    def test_nested_loops_and_long_jumps(self):
+        padding = "LOAD r7 123\n" * 100
+        source = self.source("GENE main i32/2\nLOAD r2 0\nLOAD r3 1\nLABEL outer _\n"
+                             "JZ r0 done\nMOV r4 r1\nLABEL inner _\nJZ r4 next\n" + padding +
+                             "ADD r2 r4\nSUB r4 r3\nJMP inner _\nLABEL next _\n"
+                             "SUB r0 r3\nJMP outer _\nLABEL done _\nRET r2 _\nEND _ _\n")
+        for a, b in [(7, 5), (0, 10), (10, 0), (1, 1)]:
+            for command in ("run", "interpret"):
+                self.assertEqual(int(self.call(command, source, a, b).stdout), a * b * (b + 1) // 2)
+
+    def test_generated_loops_with_calls_and_branches(self):
+        rng = random.Random(303)
+
+        def i32(value):
+            return (value + 2**31) % 2**32 - 2**31
+
+        for case in range(100):
+            count = rng.randrange(21)
+            seed = rng.choice([-2147483648, 2147483647, rng.randrange(-1000, 1001)])
+            threshold, factor, bias = rng.randrange(1, 21), rng.randrange(-3, 4), rng.randrange(-20, 21)
+            expected = seed
+            for counter in range(count, 0, -1):
+                expected = i32(expected + counter) if counter < threshold else i32(expected * factor + bias)
+            source = self.source(f"GENE main i32/2\nMOV r3 r0\nMOV r4 r1\nLOAD r5 1\n"
+                                 f"LOAD r6 {threshold}\nLABEL loop _\nJZ r3 done\nMOV r2 r3\n"
+                                 "LT r2 r6\nJNZ r2 small\nCALL scale r4\nMOV r4 r0\nJMP next _\n"
+                                 "LABEL small _\nADD r4 r3\nLABEL next _\nSUB r3 r5\nJMP loop _\n"
+                                 "LABEL done _\nRET r4 _\nEND _ _\nGENE scale i32/1\n"
+                                 f"LOAD r1 {factor}\nMUL r0 r1\nLOAD r1 {bias}\nADD r0 r1\nRET r0 _\nEND _ _\n")
+            for command in ("run", "interpret"):
+                with self.subTest(case=case, command=command):
+                    self.assertEqual(int(self.call(command, source, count, seed).stdout), expected)
 
     def test_run_without_toolchain_on_path(self):
         source = self.source("GENE main i32\nLOAD r0 42\nRET r0 _\nEND _ _\n")

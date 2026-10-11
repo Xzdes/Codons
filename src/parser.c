@@ -168,16 +168,37 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (strcmp(fields[0], "END") == 0) {
             if (!current || strcmp(fields[1], "_") || strcmp(fields[2], "_"))
                 FAIL("END requires '_ _' inside a GENE");
-            if (current->tail->op_code != OP_RET) FAIL("gene must end with RET before END");
+            if (current->head == current->tail) FAIL("empty gene; add a body before END");
             current = NULL;
             continue;
         }
         if (!current) FAIL("instruction outside a GENE");
-        if (current->tail->op_code == OP_RET) FAIL("instruction after RET");
+        if (current->tail->op_code == OP_RET && strcmp(fields[0], "LABEL"))
+            FAIL("instruction after RET; start another branch with LABEL");
         n = bio_node_new(p, e);
         if (!n) goto fail;
         n->file = index; n->line = location.line;
         current->tail->next = n; current->tail = n;
+        if (!strcmp(fields[0], "LABEL") || !strcmp(fields[0], "JMP")) {
+            int sym;
+            if (!identifier(fields[1]) || strcmp(fields[2], "_"))
+                FAIL("LABEL and JMP require '<name> _'");
+            sym = symbol(p, fields[1]);
+            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            n->op_code = !strcmp(fields[0], "LABEL") ? OP_LABEL : OP_JMP;
+            n->arg1 = (uint32_t)sym;
+            continue;
+        }
+        if (!strcmp(fields[0], "JZ") || !strcmp(fields[0], "JNZ")) {
+            int sym;
+            a = reg(fields[1]);
+            if (a < 0 || !identifier(fields[2])) FAIL("JZ and JNZ require 'rN <label>'");
+            sym = symbol(p, fields[2]);
+            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            n->op_code = !strcmp(fields[0], "JZ") ? OP_JZ : OP_JNZ;
+            n->arg1 = (uint32_t)a; n->arg2 = (uint32_t)sym;
+            continue;
+        }
         if (strcmp(fields[0], "CALL") == 0) {
             char *comma;
             unsigned argc = 0;

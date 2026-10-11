@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define BIO_VERSION "0.2.0"
+#define BIO_VERSION "0.3.0"
 #define BIO_EXECUTION_LIMIT 1000000u
 
 typedef struct BioProgram BioProgram;
@@ -24,6 +24,7 @@ typedef struct {
     size_t repairs;
     unsigned arity;
     uint64_t execution_steps;
+    unsigned dynamic_steps; /* execution_steps is unknown (zero) when this is nonzero. */
     uint32_t entry_offset;
 } BioStats;
 
@@ -34,7 +35,8 @@ BioProgram *bio_load(const char *path, int repair, BioError *error);
 void bio_program_release(BioProgram *program);
 BioStats bio_program_stats(const BioProgram *program);
 /* Return 1 on success; on failure return 0 and leave result unchanged.
-   arguments may be NULL only when argument_count is zero. */
+   arguments may be NULL only when argument_count is zero.
+   Each invocation has BIO_EXECUTION_LIMIT steps, shared by its nested calls. */
 int bio_program_run(const BioProgram *program, const int32_t *arguments, size_t argument_count,
                     int32_t *result, BioError *error);
 int bio_program_interpret(const BioProgram *program, const int32_t *arguments, size_t argument_count,

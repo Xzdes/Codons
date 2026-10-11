@@ -32,6 +32,7 @@ static void usage(void) {
          "  --repair restores only an unused '_' in RET/END\n"
          "  --json is available for new, run, check, interpret and emit\n"
          "Live commands: run [number ...] | reload <file.dna> | quit\n"
+         "Every run shares a 1000000-step budget across loops and nested calls.\n"
          "Exit codes: 0 success, 1 program/file error, 2 invalid command or arguments");
 }
 
@@ -105,13 +106,18 @@ static int options(int argc, char **argv, Options *o, BioError *e) {
 static void stats(BioStats s, int json) {
     if (json) {
         printf("\"stats\":{\"nodes\":%zu,\"genes\":%zu,\"live_genes\":%zu,\"files\":%zu,"
-               "\"code_bytes\":%zu,\"repairs\":%zu,\"arity\":%u,\"execution_steps\":%" PRIu64
-               ",\"entry_offset\":%u}",
-               s.nodes, s.genes, s.live_genes, s.files, s.code_bytes, s.repairs, s.arity,
-               s.execution_steps, s.entry_offset);
+               "\"code_bytes\":%zu,\"repairs\":%zu,\"arity\":%u,\"execution_steps\":",
+               s.nodes, s.genes, s.live_genes, s.files, s.code_bytes, s.repairs, s.arity);
+        if (s.dynamic_steps) fputs("null", stdout);
+        else printf("%" PRIu64, s.execution_steps);
+        printf(",\"dynamic_steps\":%s,\"execution_limit\":%u,\"entry_offset\":%u}",
+               s.dynamic_steps ? "true" : "false", BIO_EXECUTION_LIMIT, s.entry_offset);
     } else {
-        printf("Valid: inputs=%u steps=%" PRIu64 "/%u genes=%zu live=%zu files=%zu repairs=%zu\n",
-               s.arity, s.execution_steps, BIO_EXECUTION_LIMIT, s.genes, s.live_genes, s.files, s.repairs);
+        printf("Valid: inputs=%u steps=", s.arity);
+        if (s.dynamic_steps) fputs("runtime", stdout);
+        else printf("%" PRIu64, s.execution_steps);
+        printf(" limit=%u genes=%zu live=%zu files=%zu repairs=%zu\n",
+               BIO_EXECUTION_LIMIT, s.genes, s.live_genes, s.files, s.repairs);
     }
 }
 

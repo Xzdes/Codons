@@ -30,11 +30,37 @@ static void store_eax(Emitter *b, unsigned r) {
     byte(b, 0x89); byte(b, 0x44); byte(b, 0x24); byte(b, slot(r));
 }
 
+static void epilog(Emitter *b) {
+    byte(b, 0x48); byte(b, 0x83); byte(b, 0xc4); byte(b, 0x48); byte(b, 0xc3);
+}
+
+static void load_context(Emitter *b) {
+    /* mov r8,[rsp+64]; R8 is volatile across a nested call. */
+    byte(b, 0x4c); byte(b, 0x8b); byte(b, 0x44); byte(b, 0x24); byte(b, 64);
+}
+
+static void guard_step(Emitter *b, const CodonNode *n) {
+    load_context(b);
+    byte(b, 0x49); byte(b, 0x83); byte(b, 0x38); byte(b, 0); /* cmp qword [r8],0 */
+    byte(b, 0x75); byte(b, 15); /* jne past fault recording and return */
+    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 8); word32(b, n->index);
+    byte(b, 0x31); byte(b, 0xc0); epilog(b);
+    byte(b, 0x49); byte(b, 0x83); byte(b, 0x28); byte(b, 1); /* sub qword [r8],1 */
+}
+
+static void propagate_failure(Emitter *b) {
+    load_context(b);
+    byte(b, 0x41); byte(b, 0x83); byte(b, 0x78); byte(b, 8); byte(b, 0xff); /* cmp dword [r8+8],-1 */
+    byte(b, 0x74); byte(b, 7); /* je past error return */
+    byte(b, 0x31); byte(b, 0xc0); epilog(b);
+}
+
 static void emit_gene(Emitter *b, BioGene *g) {
     CodonNode *n;
     g->code_offset = (uint32_t)b->length;
-    /* sub rsp,72: shadow space + 8 i32 slots + 8 bytes for ABI alignment. */
+    /* sub rsp,72: shadow space + 8 i32 slots + saved context; keeps ABI alignment. */
     byte(b, 0x48); byte(b, 0x83); byte(b, 0xec); byte(b, 0x48);
+    byte(b, 0x4c); byte(b, 0x89); byte(b, 0x44); byte(b, 0x24); byte(b, 64); /* mov [rsp+64],r8 */
     if (g->arity > 0) {
         byte(b, 0x89); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(0));
     }
@@ -42,6 +68,10 @@ static void emit_gene(Emitter *b, BioGene *g) {
         byte(b, 0x89); byte(b, 0x54); byte(b, 0x24); byte(b, slot(1));
     }
     for (n = g->head->next; n; n = n->next) {
+        if (!n->reachable) continue;
+        n->code_offset = (uint32_t)b->length;
+        if (n->op_code == OP_LABEL) continue;
+        guard_step(b, n);
         switch (n->op_code) {
         case OP_LOAD:
             byte(b, 0xc7); byte(b, 0x44); byte(b, 0x24); byte(b, slot(n->arg1));
@@ -80,12 +110,21 @@ static void emit_gene(Emitter *b, BioGene *g) {
             byte(b, 0xe8);
             n->patch_offset = (uint32_t)b->length;
             word32(b, 0);
+            propagate_failure(b);
             store_eax(b, 0);
             break;
         }
         case OP_RET:
             load_eax(b, n->arg1);
-            byte(b, 0x48); byte(b, 0x83); byte(b, 0xc4); byte(b, 0x48); byte(b, 0xc3);
+            epilog(b);
+            break;
+        case OP_JMP:
+            byte(b, 0xe9); n->patch_offset = (uint32_t)b->length; word32(b, 0);
+            break;
+        case OP_JZ: case OP_JNZ:
+            byte(b, 0x83); byte(b, 0x7c); byte(b, 0x24); byte(b, slot(n->arg1)); byte(b, 0);
+            byte(b, 0x0f); byte(b, n->op_code == OP_JZ ? 0x84 : 0x85);
+            n->patch_offset = (uint32_t)b->length; word32(b, 0);
             break;
         default: break;
         }
@@ -98,8 +137,8 @@ int bio_jit(BioProgram *p, BioError *e) {
     uint32_t unwind_offset;
     DWORD old_protection;
     Emitter b = {0};
-    /* Bounded by the parser: every instruction needs fewer than 32 bytes. */
-    p->allocation_size = (p->stats.nodes + p->gene_count) * 32u + 16u;
+    /* Guards and error propagation included: every instruction fits in 96 bytes. */
+    p->allocation_size = (p->stats.nodes + p->gene_count) * 96u + 16u;
     p->code = VirtualAlloc(NULL, p->allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!p->code) { bio_error(e, "VirtualAlloc failed (%lu)", GetLastError()); return 0; }
     b.data = p->code; b.capacity = p->allocation_size;
@@ -114,8 +153,11 @@ int bio_jit(BioProgram *p, BioError *e) {
         for (n = p->genes[i].head->next; n; n = n->next) {
             uint32_t delta;
             unsigned j;
-            if (n->op_code != OP_CALL) continue;
-            delta = p->genes[n->arg1].code_offset - (n->patch_offset + 4u);
+            if (!n->reachable) continue;
+            if (n->op_code == OP_CALL) delta = p->genes[n->arg1].code_offset - (n->patch_offset + 4u);
+            else if (n->op_code == OP_JMP || n->op_code == OP_JZ || n->op_code == OP_JNZ)
+                delta = n->bond->code_offset - (n->patch_offset + 4u);
+            else continue;
             for (j = 0; j < 4; ++j)
                 p->code[n->patch_offset + j] = (unsigned char)(delta >> (8u * j));
         }

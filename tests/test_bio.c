@@ -247,6 +247,118 @@ static void argument_tests(void) {
     bio_program_release(p);
 }
 
+static void flow_tests(void) {
+    expect_value("GENE main i32\nLOAD r0 0\nJZ r0 yes\nLOAD r1 8\nJMP done _\nLABEL yes _\nLOAD r1 42\nLABEL done _\nRET r1 _\nEND _ _\n", 42);
+    expect_value("GENE main i32\nLOAD r0 -1\nJNZ r0 yes\nLOAD r1 8\nRET r1 _\nLABEL yes _\nLOAD r1 42\nRET r1 _\nEND _ _\n", 42);
+    expect_value("GENE main i32\nLOAD r0 3\nLOAD r1 1\nLABEL loop _\nSUB r0 r1\nJNZ r0 loop\nRET r0 _\nEND _ _\n", 0);
+    expect_value("GENE main i32\nJMP done _\nADD r5 r6\nLABEL done _\nLOAD r0 7\nRET r0 _\nEND _ _\n", 7);
+    expect_value("GENE main i32\nLABEL same _\nCALL f _\nRET r0 _\nEND _ _\nGENE f i32\nJMP same _\nLABEL same _\nLOAD r0 9\nRET r0 _\nEND _ _\n", 9);
+    expect_error("GENE main i32\nJMP missing _\nEND _ _\n", "undefined label");
+    expect_error("GENE main i32\nLABEL x _\nLABEL x _\nJMP x _\nEND _ _\n", "duplicate label");
+    expect_error("GENE main i32\nJMP other _\nEND _ _\nGENE f i32\nLABEL other _\nLOAD r0 1\nRET r0 _\nEND _ _\n", "undefined label");
+    expect_error("GENE main i32\nJZ r0 x\nLABEL x _\nJMP x _\nEND _ _\n", "uninitialized register");
+    expect_error("GENE main i32/1\nJZ r0 skip\nLOAD r1 1\nLABEL skip _\nRET r1 _\nEND _ _\n", "uninitialized register");
+    expect_error("GENE main i32/1\nJZ r0 late\nLOAD r1 7\nJMP join _\nLABEL late _\nJMP join _\nLABEL join _\nRET r1 _\nEND _ _\n", "uninitialized register");
+    expect_error("GENE main i32/1\nLOAD r2 1\nLABEL loop _\nJZ r0 done\nLOAD r1 7\nSUB r0 r2\nJMP loop _\nLABEL done _\nRET r1 _\nEND _ _\n", "uninitialized register");
+    expect_error("GENE main i32/1\nJNZ r0 done\nRET r0 _\nLABEL done _\nEND _ _\n", "falls through END");
+    expect_error("GENE main i32\nLABEL loop _\nEND _ _\n", "falls through END");
+    expect_error("GENE main i32\nEND _ _\n", "empty gene");
+    expect_error("GENE main i32\nLABEL x 1\n", "'<name> _'");
+    expect_error("GENE main i32\nJMP x r0\n", "'<name> _'");
+    expect_error("GENE main i32\nJZ r8 x\n", "'rN <label>'");
+}
+
+static void expect_budget_failure(BioProgram *p, const int32_t *args, size_t argc) {
+    BioError native_error = {{0}}, interpreted_error = {{0}};
+    int32_t result = 2468;
+    REQUIRE(!bio_program_run(p, args, argc, &result, &native_error));
+    REQUIRE(result == 2468);
+    REQUIRE(!bio_program_interpret(p, args, argc, &result, &interpreted_error));
+    REQUIRE(result == 2468);
+    REQUIRE(strstr(native_error.message, "execution budget exhausted") != NULL);
+    REQUIRE(!strcmp(native_error.message, interpreted_error.message));
+}
+
+static void loop_budget_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    int32_t input, result;
+    write_source("loop.dna", "GENE main i32\nLABEL spin _\nLABEL alias _\nJMP spin _\nEND _ _\n");
+    p = compile_name("loop.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(p->stats.dynamic_steps && p->stats.execution_steps == 0);
+    expect_budget_failure(p, NULL, 0);
+    bio_program_release(p);
+    /* 1 initial LOAD + 2*n loop steps + RET: exactly one million is permitted. */
+    write_source("loop.dna", "GENE main i32/1\nLOAD r1 1\nLABEL loop _\nSUB r0 r1\nJNZ r0 loop\nRET r0 _\nEND _ _\n");
+    p = compile_name("loop.dna", 0, &e); REQUIRE(p != NULL);
+    input = 499999;
+    REQUIRE(bio_program_run(p, &input, 1, &result, &e) && result == 0);
+    REQUIRE(bio_program_interpret(p, &input, 1, &result, &e) && result == 0);
+    input = 500000; expect_budget_failure(p, &input, 1);
+    input = 3;
+    REQUIRE(bio_program_run(p, &input, 1, &result, &e) && result == 0);
+    REQUIRE(bio_program_interpret(p, &input, 1, &result, &e) && result == 0);
+    bio_program_release(p);
+    /* One extra LOAD pushes the otherwise identical run to 1,000,001 steps. */
+    write_source("loop.dna", "GENE main i32/1\nLOAD r1 1\nLOAD r2 0\nLABEL loop _\nSUB r0 r1\nJNZ r0 loop\nRET r0 _\nEND _ _\n");
+    p = compile_name("loop.dna", 0, &e); REQUIRE(p != NULL);
+    input = 499999; expect_budget_failure(p, &input, 1);
+    bio_program_release(p);
+    /* Each callee fits individually, but the whole run exceeds the shared budget. */
+    write_source("loop.dna", "GENE main i32/1\nMOV r4 r0\nCALL work r4\nCALL work r4\nRET r0 _\nEND _ _\nGENE work i32/1\nLOAD r1 1\nLABEL again _\nSUB r0 r1\nJNZ r0 again\nRET r0 _\nEND _ _\n");
+    p = compile_name("loop.dna", 0, &e); REQUIRE(p != NULL);
+    input = 300000; expect_budget_failure(p, &input, 1);
+    input = 4; REQUIRE(bio_program_run(p, &input, 1, &result, &e) && result == 0);
+    bio_program_release(p);
+    /* Fault propagation must pass through multiple callers without overwriting output. */
+    write_source("loop.dna", "GENE main i32\nCALL middle _\nRET r0 _\nEND _ _\nGENE middle i32\nCALL spin _\nRET r0 _\nEND _ _\nGENE spin i32\nLABEL spin _\nJMP spin _\nEND _ _\n");
+    p = compile_name("loop.dna", 0, &e); REQUIRE(p != NULL);
+    expect_budget_failure(p, NULL, 0);
+    bio_program_release(p);
+}
+
+typedef struct { BioRuntime *runtime; volatile LONG failures; } LoopWorkers;
+
+static DWORD WINAPI loop_reader(LPVOID arg) {
+    LoopWorkers *workers = arg;
+    unsigned i;
+    for (i = 0; i < 10; ++i) {
+        int32_t input = (int32_t)(i % 2), result = 123;
+        BioError e = {{0}};
+        int ok = bio_runtime_run(workers->runtime, &input, 1, &result, &e);
+        if ((!input && (!ok || result != 7)) ||
+            (input && (ok || result != 123 || !strstr(e.message, "execution budget exhausted"))))
+            InterlockedIncrement(&workers->failures);
+    }
+    return 0;
+}
+
+static void loop_runtime_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    LoopWorkers workers = {0};
+    HANDLE threads[4];
+    unsigned i;
+    char path[256];
+    int32_t input = 1, result;
+    write_source("runtime-loop.dna", "GENE main i32/1\nJZ r0 done\nLABEL spin _\nJMP spin _\nLABEL done _\nLOAD r0 7\nRET r0 _\nEND _ _\n");
+    p = compile_name("runtime-loop.dna", 0, &e); REQUIRE(p != NULL);
+    workers.runtime = bio_runtime_create(p, &e); REQUIRE(workers.runtime != NULL);
+    bio_program_release(p);
+    for (i = 0; i < 4; ++i) {
+        threads[i] = CreateThread(NULL, 0, loop_reader, &workers, 0, NULL);
+        REQUIRE(threads[i] != NULL);
+    }
+    REQUIRE(WaitForMultipleObjects(4, threads, TRUE, 10000) == WAIT_OBJECT_0);
+    REQUIRE(workers.failures == 0);
+    for (i = 0; i < 4; ++i) CloseHandle(threads[i]);
+    write_source("fixed-loop.dna", "GENE main i32/1\nLOAD r0 42\nRET r0 _\nEND _ _\n");
+    path_for(path, sizeof(path), "fixed-loop.dna");
+    REQUIRE(bio_runtime_reload(workers.runtime, path, 0, &e));
+    REQUIRE(bio_runtime_run(workers.runtime, &input, 1, &result, &e) && result == 42);
+    bio_runtime_destroy(workers.runtime);
+}
+
 static void execution_budget_tests(void) {
     unsigned excess, i;
     char path[256];
@@ -425,6 +537,9 @@ int main(void) {
     module_and_repair_tests();
     differential_tests();
     argument_tests();
+    flow_tests();
+    loop_budget_tests();
+    loop_runtime_tests();
     execution_budget_tests();
     budget_tests();
     runtime_tests();

@@ -1,4 +1,4 @@
-Codons 0.2.0 — быстрый запуск в Windows x64
+Codons 0.3.0 — быстрый запуск в Windows x64
 
 Откройте PowerShell в папке распакованной программы.
 Компилятор C, Python и установка не нужны.
@@ -17,6 +17,24 @@ Codons 0.2.0 — быстрый запуск в Windows x64
    Результат: 1 (порог пройден)
    .\codons.exe run examples\clamp.dna 150 100
    Результат: 100
+
+4. Ветвления и циклы:
+   .\codons.exe run examples\sum.dna 10
+   Результат: 55 (сумма от 1 до 10)
+   .\codons.exe run examples\factorial.dna 5
+   Результат: 120
+   .\codons.exe run examples\branch.dna -4 9
+   Результат: 9 (выбор большего числа через ветвление)
+
+Новые триплеты: LABEL name _, JMP name _, JZ r0 name, JNZ r0 name.
+Метки принадлежат своей функции. JZ переходит при нуле, JNZ — при ненулевом значении.
+
+Защита от зависания:
+   .\codons.exe run examples\infinite.dna
+Ожидаемая ошибка: execution budget exhausted after 1000000 steps.
+Весь запуск, включая вложенные вызовы, ограничен миллионом шагов.
+Следующий запуск получает новый лимит. В режиме live можно продолжать работу.
+Большое конечное вычисление тоже может исчерпать лимит.
 
 Проверка файла: .\codons.exe check hello.dna
 Ответ для скрипта или AI-агента: .\codons.exe run hello.dna 10 20 --json

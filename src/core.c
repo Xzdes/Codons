@@ -32,6 +32,7 @@ void bio_node_error(const BioProgram *p, const CodonNode *n, BioError *e, const 
 }
 
 CodonNode *bio_node_new(BioProgram *p, BioError *e) {
+    CodonNode *n;
     if (p->stats.nodes == BIO_MAX_NODES) {
         bio_error(e, "apoptosis: node budget exceeded (%u)", BIO_MAX_NODES);
         return NULL;
@@ -42,8 +43,9 @@ CodonNode *bio_node_new(BioProgram *p, BioError *e) {
         block->next = p->arena;
         p->arena = block;
     }
-    p->stats.nodes++;
-    return &p->arena->nodes[p->arena->used++];
+    n = &p->arena->nodes[p->arena->used++];
+    n->index = (uint32_t)p->stats.nodes++;
+    return n;
 }
 
 void bio_program_retain(BioProgram *p) { InterlockedIncrement(&p->references); }
@@ -112,9 +114,26 @@ static int validate_arguments(const BioProgram *p, const int32_t *args, size_t a
     return 1;
 }
 
+static int execution_ok(const BioProgram *p, const BioExecution *execution, BioError *e) {
+    const ArenaBlock *block;
+    if (execution->failed_node == UINT32_MAX) return 1;
+    for (block = p->arena; block; block = block->next) {
+        uint32_t first = block->nodes[0].index;
+        if (execution->failed_node >= first && execution->failed_node - first < block->used) {
+            bio_node_error(p, &block->nodes[execution->failed_node - first], e,
+                           "execution budget exhausted after %u steps", BIO_EXECUTION_LIMIT);
+            return 0;
+        }
+    }
+    bio_error(e, "execution budget exhausted after %u steps", BIO_EXECUTION_LIMIT);
+    return 0;
+}
+
 int bio_program_run(const BioProgram *p, const int32_t *args, size_t argc,
                     int32_t *result, BioError *e) {
-    typedef int32_t (*Entry)(int32_t, int32_t);
+    typedef int32_t (*Entry)(int32_t, int32_t, BioExecution *);
+    BioExecution execution = {BIO_EXECUTION_LIMIT, UINT32_MAX};
+    int32_t value;
     Entry fn;
     unsigned char *address;
     if (!validate_arguments(p, args, argc, result, e)) return 0;
@@ -122,7 +141,9 @@ int bio_program_run(const BioProgram *p, const int32_t *args, size_t argc,
     address = p->code + p->genes[p->main_gene].code_offset;
     _Static_assert(sizeof(fn) == sizeof(address), "Windows x64 function pointer size");
     memcpy(&fn, &address, sizeof(fn));
-    *result = fn(argc > 0 ? args[0] : 0, argc > 1 ? args[1] : 0);
+    value = fn(argc > 0 ? args[0] : 0, argc > 1 ? args[1] : 0, &execution);
+    if (!execution_ok(p, &execution, e)) return 0;
+    *result = value;
     return 1;
 }
 
@@ -132,11 +153,18 @@ static int32_t signed_value(uint32_t bits) {
     return value;
 }
 
-static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, uint32_t b) {
+static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, uint32_t b,
+                               BioExecution *execution) {
     uint32_t r[8] = {0};
     const CodonNode *n;
     r[0] = a; r[1] = b;
-    for (n = p->genes[gene].head->next; n; n = n->next) {
+    n = p->genes[gene].head->next;
+    while (n) {
+        const CodonNode *next = n->next;
+        if (n->op_code != OP_LABEL) {
+            if (!execution->remaining) { execution->failed_node = n->index; return 0; }
+            --execution->remaining;
+        }
         switch (n->op_code) {
         case OP_LOAD: r[n->arg1] = n->arg2; break;
         case OP_MOV: r[n->arg1] = r[n->arg2]; break;
@@ -155,29 +183,37 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, u
             unsigned argc = n->arg2 >> 16;
             uint32_t x = argc > 0 ? r[n->arg2 & 255u] : 0;
             uint32_t y = argc > 1 ? r[(n->arg2 >> 8) & 255u] : 0;
-            r[0] = interpret_gene(p, n->arg1, x, y);
+            r[0] = interpret_gene(p, n->arg1, x, y, execution);
+            if (execution->failed_node != UINT32_MAX) return 0;
             break;
         }
         case OP_RET: return r[n->arg1];
+        case OP_JMP: next = n->bond; break;
+        case OP_JZ: if (!r[n->arg1]) next = n->bond; break;
+        case OP_JNZ: if (r[n->arg1]) next = n->bond; break;
         default: break;
         }
+        n = next;
     }
-    return 0; /* Validation ensures every gene has RET. */
+    return 0; /* Validation rejects reachable fallthrough. */
 }
 
 int bio_program_interpret(const BioProgram *p, const int32_t *args, size_t argc,
                           int32_t *result, BioError *e) {
     uint32_t bits;
+    BioExecution execution = {BIO_EXECUTION_LIMIT, UINT32_MAX};
     if (!validate_arguments(p, args, argc, result, e)) return 0;
     bits = interpret_gene(p, p->main_gene, argc > 0 ? (uint32_t)args[0] : 0,
-                          argc > 1 ? (uint32_t)args[1] : 0);
+                          argc > 1 ? (uint32_t)args[1] : 0, &execution);
+    if (!execution_ok(p, &execution, e)) return 0;
     *result = signed_value(bits);
     return 1;
 }
 
 void bio_program_dump(const BioProgram *p, FILE *out) {
     static const char *names[] = {
-        "GENE", "LOAD", "MOV", "ADD", "SUB", "MUL", "CALL", "RET", "EQ", "LT", "MIN", "MAX"
+        "GENE", "LOAD", "MOV", "ADD", "SUB", "MUL", "CALL", "RET", "EQ", "LT", "MIN", "MAX",
+        "LABEL", "JMP", "JZ", "JNZ"
     };
     unsigned i;
     for (i = 0; i < p->gene_count; ++i) {
@@ -196,6 +232,10 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
             } else if (n->op_code == OP_LOAD)
                 fprintf(out, "LOAD r%u %ld", n->arg1, (long)signed_value(n->arg2));
             else if (n->op_code == OP_RET) fprintf(out, "RET r%u _", n->arg1);
+            else if (n->op_code == OP_LABEL || n->op_code == OP_JMP)
+                fprintf(out, "%s %s _", names[n->op_code], p->symbols[n->arg1]);
+            else if (n->op_code == OP_JZ || n->op_code == OP_JNZ)
+                fprintf(out, "%s r%u %s", names[n->op_code], n->arg1, p->symbols[n->arg2]);
             else fprintf(out, "%s r%u r%u", names[n->op_code], n->arg1, n->arg2);
             fprintf(out, " # line %u\n", n->line);
         }
