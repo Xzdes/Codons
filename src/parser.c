@@ -180,21 +180,31 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (!n) goto fail;
         n->file = index; n->line = location.line;
         current->tail->next = n; current->tail = n;
-        if (!strcmp(fields[0], "VAR") || !strcmp(fields[0], "ARRAY")) {
+        if (!strcmp(fields[0], "VAR") || !strcmp(fields[0], "ARRAY") || !strcmp(fields[0], "PARAM")) {
             char *end;
             long long value;
-            int sym, is_array = !strcmp(fields[0], "ARRAY");
+            int sym, parameter = !strcmp(fields[0], "PARAM");
+            int is_array = parameter || !strcmp(fields[0], "ARRAY");
             BioLocal *local;
-            if (previous->op_code != OP_GENE && previous->op_code != OP_VAR && previous->op_code != OP_ARRAY)
-                FAIL("VAR and ARRAY declarations must precede all instructions and labels");
+            if (previous->op_code != OP_GENE && previous->op_code != OP_VAR &&
+                previous->op_code != OP_ARRAY && previous->op_code != OP_PARAM)
+                FAIL("VAR, ARRAY and PARAM declarations must precede all instructions and labels");
             if (!identifier(fields[1]) || reg(fields[1]) >= 0 || !strcmp(fields[1], "_"))
                 FAIL("invalid local name: use an identifier other than r0..r7 or _");
-            errno = 0;
-            value = strtoll(fields[2], &end, 10);
-            if (errno || *end || end == fields[2] || value < INT32_MIN || value > INT32_MAX)
-                FAIL("%s requires a decimal i32 literal", fields[0]);
-            if (is_array && (value < 1 || value > BIO_MAX_LOCAL_CELLS))
-                FAIL("ARRAY length must be in 1..%u", BIO_MAX_LOCAL_CELLS);
+            if (parameter) {
+                if (strcmp(fields[2], "r0")) FAIL("PARAM requires '<name> r0'; r0 is the array length");
+                if (!strcmp(current->name, "main")) FAIL("main cannot declare PARAM; use ARRAY and READ");
+                if (!current->arity) FAIL("PARAM requires i32/1 or i32/2; r0 supplies the array length");
+                if (current->has_array) FAIL("only one PARAM array is allowed per gene");
+                value = 0;
+            } else {
+                errno = 0;
+                value = strtoll(fields[2], &end, 10);
+                if (errno || *end || end == fields[2] || value < INT32_MIN || value > INT32_MAX)
+                    FAIL("%s requires a decimal i32 literal", fields[0]);
+                if (is_array && (value < 1 || value > BIO_MAX_LOCAL_CELLS))
+                    FAIL("ARRAY length must be in 1..%u", BIO_MAX_LOCAL_CELLS);
+            }
             sym = symbol(p, fields[1]);
             if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
             for (i = 0; i < current->local_count; ++i)
@@ -207,8 +217,10 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             local->count = is_array ? (uint32_t)value : 1u;
             local->initial = is_array ? 0 : (uint32_t)value;
             local->is_array = (unsigned)is_array;
+            local->is_parameter = (unsigned)parameter;
+            if (parameter) current->has_array = 1;
             current->local_cells += local->count;
-            n->op_code = is_array ? OP_ARRAY : OP_VAR;
+            n->op_code = parameter ? OP_PARAM : is_array ? OP_ARRAY : OP_VAR;
             n->arg1 = (uint32_t)sym; n->arg2 = (uint32_t)value;
             continue;
         }
@@ -271,20 +283,31 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             continue;
         }
         if (strcmp(fields[0], "CALL") == 0) {
-            char *comma;
+            char *comma, *arguments = fields[2];
             unsigned argc = 0;
             int sym;
             if (!identifier(fields[1])) FAIL("invalid callee identifier");
             sym = symbol(p, fields[1]);
             if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
             a = b = 0;
-            if (strcmp(fields[2], "_") != 0) {
-                comma = strchr(fields[2], ',');
+            if (strcmp(arguments, "_") != 0) {
+                comma = strchr(arguments, ',');
+                if (comma) *comma = '\0';
+                if (reg(arguments) < 0) {
+                    int array_symbol;
+                    if (!identifier(arguments) || !strcmp(arguments, "_") || !comma)
+                        FAIL("CALL operands must be _, rN, rN,rM or array,rN[,rM] (r0..r7)");
+                    array_symbol = symbol(p, arguments);
+                    if (array_symbol < 0) FAIL("apoptosis: symbol budget exceeded");
+                    n->call_array = (uint32_t)array_symbol + 1u;
+                    arguments = comma + 1;
+                    comma = strchr(arguments, ',');
+                }
                 if (comma) {
                     *comma++ = '\0'; b = reg(comma); argc = 2;
                 } else argc = 1;
-                a = reg(fields[2]);
-                if (a < 0 || b < 0) FAIL("CALL operands must be _, rN or rN,rM (r0..r7)");
+                a = reg(arguments);
+                if (a < 0 || b < 0) FAIL("CALL operands must be _, rN, rN,rM or array,rN[,rM] (r0..r7)");
             }
             n->op_code = OP_CALL; n->arg1 = (uint32_t)sym;
             n->arg2 = (argc << 16) | ((unsigned)b << 8) | (unsigned)a;

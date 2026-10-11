@@ -549,6 +549,144 @@ static void io_tests(void) {
     bio_program_release(p);
 }
 
+static void array_parameter_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    char source[8192], path[256];
+    unsigned length_slot, value_slot, i, mode;
+    int32_t arg, result;
+    /* The length and optional scalar may come from any slots, including aliases. */
+    for (length_slot = 0; length_slot < 8; ++length_slot) for (value_slot = 0; value_slot < 8; ++value_slot) {
+        snprintf(source, sizeof(source), "GENE main i32\nVAR before 11\nARRAY a 8\nVAR after 13\n"
+                 "LOAD r%u 6\nLOAD r%u 4\nCALL edit a,r%u,r%u\n"
+                 "GET r1 before\nADD r0 r1\nGET r1 after\nADD r0 r1\nRET r0 _\nEND _ _\n"
+                 "GENE edit i32/2\nVAR pad 99\nPARAM items r0\nARRAY scratch 4\n"
+                 "MOV r2 r0\nLOAD r3 1\nSUB r2 r3\nASET items r2,r1\n"
+                 "LOAD r0 0\nLEN r3 items\nAGET r0 items,r2\nADD r0 r3\nRET r0 _\nEND _ _\n",
+                 length_slot, value_slot, length_slot, value_slot);
+        expect_value(source, 28 + (length_slot == value_slot ? 4 : 6));
+    }
+    /* Calls use the caller's local/borrowed array, not the callee's storage slab.
+       A nested narrower view must not replace the caller's view on return. */
+    expect_value("GENE main i32\nARRAY root 8\nLOAD r1 7\nLOAD r2 777\nASET root r1,r2\n"
+                 "LOAD r0 2\nCALL middle root,r0\nLOAD r1 7\nAGET r2 root,r1\nADD r0 r2\nRET r0 _\nEND _ _\n"
+                 "GENE middle i32/1\nPARAM p r0\nVAR saved 11\nARRAY temp 3\n"
+                 "LOAD r0 3\nLOAD r1 31\nCALL edit temp,r0,r1\nLOAD r0 1\nLOAD r1 41\nCALL edit p,r0,r1\n"
+                 "LEN r0 p\nLOAD r1 43\nCALL edit p,r0,r1\n"
+                 "LOAD r2 0\nAGET r3 p,r2\nLOAD r2 1\nAGET r4 p,r2\nADD r3 r4\n"
+                 "LOAD r2 2\nAGET r4 temp,r2\nADD r3 r4\nGET r4 saved\nADD r3 r4\nRET r3 _\nEND _ _\n"
+                 "GENE edit i32/2\nPARAM p r0\nLOAD r2 1\nSUB r0 r2\nASET p r0,r1\nRET r0 _\nEND _ _\n", 903);
+    expect_value("GENE main i32\nARRAY a 65536\nLOAD r0 65536\nCALL set_last a,r0\n"
+                 "LOAD r1 65535\nAGET r0 a,r1\nRET r0 _\nEND _ _\n"
+                 "GENE set_last i32/1\nPARAM a r0\nLOAD r1 65535\nLOAD r2 -2147483648\n"
+                 "ASET a r1,r2\nRET r0 _\nEND _ _\n", INT32_MIN);
+    expect_value("GENE main i32\nARRAY a 1\nLOAD r0 0\nCALL empty a,r0\nRET r0 _\nEND _ _\n"
+                 "GENE empty i32/1\nPARAM a r0\nCALL plain _\nLEN r0 a\nRET r0 _\nEND _ _\n"
+                 "GENE plain i32\nARRAY scratch 64\nLOAD r0 999\nRET r0 _\nEND _ _\n", 0);
+    /* Bound checks are identical in both engines and report the responsible node. */
+    write_source("parameter.dna", "GENE main i32/1\nARRAY a 3\nCALL size a,r0\nRET r0 _\nEND _ _\n"
+                 "GENE size i32/1\nPARAM p r0\nLEN r0 p\nRET r0 _\nEND _ _\n");
+    p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(p->stats.execution_steps == 7 && p->genes[p->main_gene].memory_cells == 3);
+    for (arg = 0; arg <= 3; ++arg) {
+        REQUIRE(bio_program_run(p, &arg, 1, &result, &e) && result == arg);
+        REQUIRE(bio_program_interpret(p, &arg, 1, &result, &e) && result == arg);
+    }
+    arg = -1; expect_run_error(p, &arg, 1, "parameter.dna:3: CALL array length -1 out of bounds: expected 0..3");
+    arg = INT32_MIN; expect_run_error(p, &arg, 1, "CALL array length -2147483648");
+    arg = 4; expect_run_error(p, &arg, 1, "CALL array length 4");
+    arg = INT32_MAX; expect_run_error(p, &arg, 1, "CALL array length 2147483647");
+    bio_program_release(p);
+    for (i = 0; i < 3; ++i) {
+        snprintf(source, sizeof(source), "GENE main i32\nARRAY a 8\nLOAD r0 2\nCALL middle a,r0\nRET r0 _\nEND _ _\n"
+                 "GENE middle i32/1\nPARAM a r0\nLOAD r0 3\n%s\nRET r0 _\nEND _ _\n"
+                 "GENE leaf i32/1\nPARAM a r0\nRET r0 _\nEND _ _\n",
+                 i == 0 ? "CALL leaf a,r0" : i == 1 ? "AGET r0 a,r0" : "ASET a r0,r0");
+        write_source("parameter.dna", source); p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
+        expect_run_error(p, NULL, 0, i == 0 ? "CALL array length 3 out of bounds: expected 0..2" : "array index 3 out of bounds");
+        bio_program_release(p);
+    }
+    write_source("parameter.dna", "GENE main i32\nARRAY a 8\nLOAD r0 0\nCALL empty a,r0\nRET r0 _\nEND _ _\n"
+                 "GENE empty i32/1\nPARAM a r0\nAGET r0 a,r0\nRET r0 _\nEND _ _\n");
+    p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
+    expect_run_error(p, NULL, 0, "array is empty (length 0)"); bio_program_release(p);
+    /* A PARAM owns no cells and consumes no initialization/copy steps, even when forwarded. */
+    {
+        size_t used = (size_t)snprintf(source, sizeof(source), "GENE main i32\nARRAY a 65536\nLOAD r0 65536\nCALL f0 a,r0\nRET r0 _\nEND _ _\n");
+        for (i = 0; i < 8; ++i) {
+            used += (size_t)snprintf(source + used, sizeof(source) - used, "GENE f%u i32/1\nPARAM p r0\n", i);
+            if (i < 7) used += (size_t)snprintf(source + used, sizeof(source) - used, "CALL f%u p,r0\n", i + 1);
+            else used += (size_t)snprintf(source + used, sizeof(source) - used, "LEN r0 p\n");
+            used += (size_t)snprintf(source + used, sizeof(source) - used, "RET r0 _\nEND _ _\n");
+        }
+        write_source("parameter.dna", source); p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
+        REQUIRE(p->genes[p->main_gene].memory_cells == 65536 && p->stats.execution_steps == 65555);
+        REQUIRE(run0(p) == 65536 && interpret0(p) == 65536);
+        bio_program_release(p);
+    }
+    /* 1 cell + 3 setup + 199999*(CALL+LEN+RET+SUB+JNZ) + RET = 1000000. */
+    write_source("parameter.dna", "GENE main i32/1\nARRAY a 1\nMOV r3 r0\nLOAD r4 1\nLOAD r2 1\n"
+                 "LABEL loop _\nCALL size a,r2\nSUB r3 r4\nJNZ r3 loop\nRET r0 _\nEND _ _\n"
+                 "GENE size i32/1\nPARAM p r0\nLEN r0 p\nRET r0 _\nEND _ _\n");
+    p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
+    arg = 199999;
+    REQUIRE(bio_program_run(p, &arg, 1, &result, &e) && result == 1);
+    REQUIRE(bio_program_interpret(p, &arg, 1, &result, &e) && result == 1);
+    arg = 200000; expect_run_error(p, &arg, 1, "execution budget exhausted"); bio_program_release(p);
+    /* Channel operations respect the borrowed bound, and errors do not publish output. */
+    write_source("parameter.dna", "GENE main i32/1\nARRAY a 8\nCALL copy a,r0\nRET r0 _\nEND _ _\n"
+                 "GENE copy i32/1\nPARAM p r0\nREAD p r1\nWRITE p r0\nRET r1 _\nEND _ _\n");
+    p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
+    for (mode = 0; mode < 2; ++mode) {
+        RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
+        int32_t input[3] = {-5, INT32_MIN, INT32_MAX}, output[3] = {11, 12, 13};
+        BioIO io = {input, 3, output, 3, 9, 9};
+        arg = 2; result = 99;
+        REQUIRE(!run(p, &arg, 1, &io, &result, &e) && strstr(e.message, "array capacity is 2"));
+        REQUIRE(output[0] == 11 && io.output_count == 9 && io.output_written == 9 && result == 99);
+        arg = 3;
+        REQUIRE(run(p, &arg, 1, &io, &result, &e) && result == 3);
+        REQUIRE(io.output_count == 3 && !memcmp(input, output, sizeof(input)));
+        arg = 0; io.input_count = 0;
+        REQUIRE(run(p, &arg, 1, &io, &result, &e) && result == 0 && io.output_count == 0 && io.output_written == 1);
+    }
+    bio_program_release(p);
+    /* Independent invocations borrow only their own storage, through two nested calls. */
+    write_source("parameter.dna", "GENE main i32\nARRAY a 3\nLOAD r0 3\nCALL bridge a,r0\nRET r0 _\nEND _ _\n"
+                 "GENE bridge i32/1\nPARAM p r0\nVAR pad 7\nCALL copy p,r0\nRET r0 _\nEND _ _\n"
+                 "GENE copy i32/1\nPARAM p r0\nREAD p r0\nWRITE p r0\nRET r0 _\nEND _ _\n");
+    p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
+    {
+        MemoryWorker workers[4] = {0};
+        HANDLE threads[4];
+        for (i = 0; i < 4; ++i) {
+            workers[i].program = p; workers[i].id = i;
+            threads[i] = CreateThread(NULL, 0, io_reader, &workers[i], 0, NULL); REQUIRE(threads[i] != NULL);
+        }
+        REQUIRE(WaitForMultipleObjects(4, threads, TRUE, 10000) == WAIT_OBJECT_0);
+        for (i = 0; i < 4; ++i) { REQUIRE(workers[i].failures == 0); CloseHandle(threads[i]); }
+    }
+    bio_program_release(p);
+    /* PARAM presence is part of the reload signature; the local name is not. */
+    write_source("parameter.dna", "GENE main i32\nARRAY a 1\nLOAD r0 1\nCALL value a,r0\nRET r0 _\nEND _ _\n"
+                 "GENE value i32/1\nPARAM p r0\nRET r0 _\nEND _ _\n");
+    p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
+    {
+        BioRuntime *runtime = bio_runtime_create(p, &e); REQUIRE(runtime != NULL);
+        path_for(path, sizeof(path), "reload-array.dna");
+        write_source("reload-array.dna", "GENE main i32\nLOAD r0 1\nCALL value r0\nRET r0 _\nEND _ _\n"
+                     "GENE value i32/1\nRET r0 _\nEND _ _\n");
+        REQUIRE(!bio_runtime_reload(runtime, path, 0, &e) && strstr(e.message, "incompatible signature"));
+        REQUIRE(runtime0(runtime) == 1);
+        write_source("reload-array.dna", "GENE main i32\nARRAY a 1\nLOAD r0 1\nCALL value a,r0\nRET r0 _\nEND _ _\n"
+                     "GENE value i32/1\nPARAM renamed r0\nLOAD r0 42\nRET r0 _\nEND _ _\n");
+        REQUIRE(bio_runtime_reload(runtime, path, 0, &e) && runtime0(runtime) == 42);
+        REQUIRE(run0(p) == 1);
+        bio_runtime_destroy(runtime);
+    }
+    bio_program_release(p);
+}
+
 static void module_and_repair_tests(void) {
     BioError e = {{0}};
     BioProgram *p;
@@ -962,6 +1100,7 @@ int main(void) {
     memory_call_and_budget_tests();
     memory_concurrent_tests();
     io_tests();
+    array_parameter_tests();
     module_and_repair_tests();
     differential_tests();
     argument_tests();

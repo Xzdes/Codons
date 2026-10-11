@@ -1,0 +1,12 @@
+# Input -> keep values >= threshold -> sort -> output.
+# Example: codons run examples/list_pipeline.dna 5 --input examples/numbers.txt --output result.txt
+IMPORT lists.dna _
+GENE main i32/1
+ARRAY values 256
+MOV r1 r0
+READ values r0
+CALL filter values,r0,r1
+CALL sort values,r0
+WRITE values r0
+RET r0 _
+END _ _

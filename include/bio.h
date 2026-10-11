@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define BIO_VERSION "0.7.0"
+#define BIO_VERSION "0.8.0"
 #define BIO_EXECUTION_LIMIT 1000000u
 #define BIO_LIST_LIMIT 65536u
 
@@ -54,7 +54,8 @@ BioStats bio_program_stats(const BioProgram *program);
 /* Return 1 on success; on failure return 0 and leave result unchanged.
    arguments may be NULL only when argument_count is zero.
    Each invocation has BIO_EXECUTION_LIMIT steps, shared by its nested calls.
-   Locals are private to each call; initialization consumes one step per i32 cell. */
+   Owned locals are private to each call; initialization consumes one step per i32 cell.
+   Internal PARAM calls borrow a checked prefix of the caller's array without copying. */
 int bio_program_run(const BioProgram *program, const int32_t *arguments, size_t argument_count,
                     int32_t *result, BioError *error);
 int bio_program_interpret(const BioProgram *program, const int32_t *arguments, size_t argument_count,

@@ -95,11 +95,31 @@ static void initialize_locals(Emitter *b, const BioGene *g) {
     }
 }
 
-static void guard_index(Emitter *b, const CodonNode *n, unsigned r, uint32_t count) {
+/* A parameter is a fixed-length borrowed prefix saved in this stack frame.
+   Changing virtual r0 or entering another callee cannot change its bound. */
+static void array_length(Emitter *b, const BioLocal *local, int edx) {
+    if (local->is_parameter) {
+        byte(b, 0x8b); byte(b, edx ? 0x54 : 0x44); byte(b, 0x24); byte(b, 88);
+    } else { byte(b, edx ? 0xba : 0xb8); word32(b, local->count); }
+}
+
+static void array_base(Emitter *b, const BioLocal *local) {
+    if (local->is_parameter) {
+        byte(b, 0x4c); byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, 80); /* r9=[rsp+80] */
+    } else {
+        load_locals(b);
+        if (local->offset) {
+            byte(b, 0x49); byte(b, 0x81); byte(b, 0xc1); word32(b, local->offset * 4u);
+        }
+    }
+}
+
+static void guard_index(Emitter *b, const CodonNode *n, unsigned r, const BioLocal *local) {
     load_eax(b, r);
+    array_length(b, local, 1);
     byte(b, 0x41); byte(b, 0x89); byte(b, 0x40); byte(b, 16); /* mov [r8+16],eax */
-    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 20); word32(b, count);
-    byte(b, 0x3d); word32(b, count); /* cmp eax,count */
+    byte(b, 0x41); byte(b, 0x89); byte(b, 0x50); byte(b, 20); /* mov [r8+20],edx */
+    byte(b, 0x39); byte(b, 0xd0); /* cmp eax,edx */
     require_condition(b, n, BIO_FAULT_BOUNDS, 0x72); /* unsigned jb rejects negative indices too */
 }
 
@@ -114,8 +134,9 @@ static void emit_transfer(Emitter *b, const BioGene *g, const CodonNode *n) {
     if (reading) { byte(b, 0x41); byte(b, 0x8b); byte(b, 0x48); byte(b, 32); }
     else { byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2)); }
     byte(b, 0x41); byte(b, 0x89); byte(b, 0x48); byte(b, 16); /* bad_index=ecx */
-    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 20); word32(b, local->count);
-    byte(b, 0x81); byte(b, 0xf9); word32(b, local->count); /* cmp ecx,array capacity */
+    array_length(b, local, 0);
+    byte(b, 0x41); byte(b, 0x89); byte(b, 0x40); byte(b, 20);
+    byte(b, 0x39); byte(b, 0xc1); /* cmp ecx,array capacity */
     require_condition(b, n, reading ? BIO_FAULT_READ_SIZE : BIO_FAULT_WRITE_SIZE, 0x76);
     if (!reading) {
         byte(b, 0x41); byte(b, 0x8b); byte(b, 0x40); byte(b, 52); /* eax=output capacity */
@@ -133,8 +154,8 @@ static void emit_transfer(Emitter *b, const BioGene *g, const CodonNode *n) {
         byte(b, 0x41); byte(b, 0x89); byte(b, 0x48); byte(b, 48); /* output_count=ecx */
         byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 56); word32(b, 1);
     }
-    load_locals(b);
-    byte(b, 0x4d); byte(b, 0x8d); byte(b, reading ? 0x99 : 0x91); word32(b, local->offset * 4u);
+    array_base(b, local);
+    byte(b, 0x4d); byte(b, 0x89); byte(b, reading ? 0xcb : 0xca); /* r11/r10=r9 */
     byte(b, 0x85); byte(b, 0xc9); /* test ecx,ecx */
     byte(b, 0x74); empty_patch = b->length; byte(b, 0);
     loop = b->length;
@@ -155,10 +176,15 @@ static void emit_transfer(Emitter *b, const BioGene *g, const CodonNode *n) {
 static void emit_gene(Emitter *b, BioGene *g) {
     CodonNode *n;
     g->code_offset = (uint32_t)b->length;
-    /* Shadow space + 8 i32 slots + context + local base + alignment padding. */
+    /* Shadow space + registers + context + local base + borrowed view + padding. */
     byte(b, 0x48); byte(b, 0x83); byte(b, 0xec); byte(b, BIO_STACK_SIZE);
     byte(b, 0x4c); byte(b, 0x89); byte(b, 0x44); byte(b, 0x24); byte(b, 64); /* mov [rsp+64],r8 */
     byte(b, 0x4c); byte(b, 0x89); byte(b, 0x4c); byte(b, 0x24); byte(b, 72); /* mov [rsp+72],r9 */
+    if (g->has_array) {
+        /* Internal CALL passes the checked view in volatile R10/R11D. */
+        byte(b, 0x4c); byte(b, 0x89); byte(b, 0x54); byte(b, 0x24); byte(b, 80);
+        byte(b, 0x44); byte(b, 0x89); byte(b, 0x5c); byte(b, 0x24); byte(b, 88);
+    }
     if (g->arity > 0) {
         byte(b, 0x89); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(0));
     }
@@ -169,7 +195,7 @@ static void emit_gene(Emitter *b, BioGene *g) {
     for (n = g->head->next; n; n = n->next) {
         if (!n->reachable) continue;
         n->code_offset = (uint32_t)b->length;
-        if (n->op_code == OP_LABEL || n->op_code == OP_VAR || n->op_code == OP_ARRAY) continue;
+        if (n->op_code == OP_LABEL || n->op_code == OP_VAR || n->op_code == OP_ARRAY || n->op_code == OP_PARAM) continue;
         guard_step(b, n);
         switch (n->op_code) {
         case OP_READ: case OP_WRITE:
@@ -185,20 +211,20 @@ static void emit_gene(Emitter *b, BioGene *g) {
             byte(b, 0x41); byte(b, 0x89); byte(b, 0x81); word32(b, g->locals[n->arg1].offset * 4u);
             break;
         case OP_LEN:
-            byte(b, 0xc7); byte(b, 0x44); byte(b, 0x24); byte(b, slot(n->arg1));
-            word32(b, g->locals[n->arg2].count);
+            array_length(b, &g->locals[n->arg2], 0);
+            store_eax(b, n->arg1);
             break;
         case OP_AGET: case OP_ASET: {
             const BioLocal *local = &g->locals[n->op_code == OP_AGET ? n->arg2 >> 8 : n->arg1];
-            guard_index(b, n, n->arg2 & 255u, local->count);
-            load_locals(b);
+            guard_index(b, n, n->arg2 & 255u, local);
+            array_base(b, local);
             if (n->op_code == OP_AGET) {
                 byte(b, 0x41); byte(b, 0x8b); byte(b, 0x84); byte(b, 0x81); /* mov eax,[r9+rax*4+offset] */
-                word32(b, local->offset * 4u); store_eax(b, n->arg1);
+                word32(b, 0); store_eax(b, n->arg1);
             } else {
                 byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2 >> 8));
                 byte(b, 0x41); byte(b, 0x89); byte(b, 0x8c); byte(b, 0x81); /* mov [r9+rax*4+offset],ecx */
-                word32(b, local->offset * 4u);
+                word32(b, 0);
             }
             break;
         }
@@ -279,6 +305,18 @@ static void emit_gene(Emitter *b, BioGene *g) {
             break;
         case OP_CALL: {
             unsigned argc = n->arg2 >> 16;
+            if (n->call_array) {
+                const BioLocal *local = &g->locals[n->call_array - 1u];
+                load_eax(b, n->arg2 & 255u);
+                array_length(b, local, 1);
+                byte(b, 0x41); byte(b, 0x89); byte(b, 0x40); byte(b, 16);
+                byte(b, 0x41); byte(b, 0x89); byte(b, 0x50); byte(b, 20);
+                byte(b, 0x39); byte(b, 0xd0); /* cmp eax,edx: requested length <= capacity */
+                require_condition(b, n, BIO_FAULT_ARGUMENT_SIZE, 0x76);
+                byte(b, 0x41); byte(b, 0x89); byte(b, 0xc3); /* r11d=length */
+                array_base(b, local);
+                byte(b, 0x4d); byte(b, 0x89); byte(b, 0xca); /* r10=array */
+            }
             load_locals(b);
             if (g->local_cells) {
                 byte(b, 0x49); byte(b, 0x81); byte(b, 0xc1); word32(b, g->local_cells * 4u); /* add r9,own cells */

@@ -24,6 +24,24 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
                 bio_node_error(p, n, e, "gene %s expects %u arguments, got %u",
                                p->genes[target].name, p->genes[target].arity, argc); return 0;
             }
+            if (p->genes[target].has_array != (n->call_array != 0)) {
+                bio_node_error(p, n, e, "gene %s %s an array argument", p->genes[target].name,
+                               p->genes[target].has_array ? "requires" : "does not accept");
+                return 0;
+            }
+            if (n->call_array) {
+                unsigned i, sym = n->call_array - 1u;
+                for (i = 0; i < g->local_count && g->locals[i].symbol != sym; ++i) {}
+                if (i == g->local_count) {
+                    bio_node_error(p, n, e, "undefined local %s in gene %s", p->symbols[sym], g->name);
+                    return 0;
+                }
+                if (!g->locals[i].is_array) {
+                    bio_node_error(p, n, e, "%s is a variable; CALL requires an array", p->symbols[sym]);
+                    return 0;
+                }
+                n->call_array = i + 1u;
+            }
             n->arg1 = (uint32_t)target;
             n->bond = p->genes[target].head;
         } else if (n->op_code == OP_JMP || n->op_code == OP_JZ || n->op_code == OP_JNZ) {
@@ -157,7 +175,7 @@ static int check_calls(BioProgram *p, unsigned index, unsigned nesting, BioError
     g->memory_cells = g->local_cells;
     for (n = g->head->next; n; n = n->next) {
         if (n->reachable && n->op_code != OP_LABEL && n->op_code != OP_VAR &&
-            n->op_code != OP_ARRAY && g->execution_steps <= BIO_EXECUTION_LIMIT)
+            n->op_code != OP_ARRAY && n->op_code != OP_PARAM && g->execution_steps <= BIO_EXECUTION_LIMIT)
             ++g->execution_steps;
         if (n->op_code == OP_CALL) {
             unsigned depth;

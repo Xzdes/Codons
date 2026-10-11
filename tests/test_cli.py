@@ -60,8 +60,117 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
         return proc
 
+    def test_array_parameter_validation(self):
+        def program(body, helper="PARAM p r0\nRET r0 _\n", arity=1):
+            return ("GENE main i32\n" + body + "RET r0 _\nEND _ _\n"
+                    + f"GENE f i32/{arity}\n" + helper + "END _ _\n")
+        cases = [
+            (program("ARRAY a 1\nLOAD r0 1\nCALL f r0\n"), "requires an array argument"),
+            (program("ARRAY a 1\nLOAD r0 1\nCALL f a,r0\n", "RET r0 _\n"), "does not accept an array"),
+            (program("VAR a 1\nLOAD r0 1\nCALL f a,r0\n"), "requires an array"),
+            (program("LOAD r0 1\nCALL f missing,r0\n"), "undefined local missing"),
+            (program("ARRAY a 1\nCALL f a,r7\n"), "uninitialized register r7"),
+            (program("ARRAY a 1\nLOAD r0 1\nCALL f a,r0,r7\n", arity=2), "uninitialized register r7"),
+            (program("ARRAY a 1\nLOAD r0 1\nCALL f a,r0\n", arity=2), "expects 2 arguments"),
+            (program("PARAM a r0\nLOAD r0 0\n"), "main cannot declare PARAM"),
+            (program("LOAD r0 0\n", arity=0), "PARAM requires i32/1 or i32/2"),
+            (program("LOAD r0 0\n", "PARAM p r1\nRET r0 _\n", 2), "PARAM requires '<name> r0'"),
+            (program("LOAD r0 0\n", "PARAM r0 r0\nRET r0 _\n"), "invalid local name"),
+            (program("LOAD r0 0\n", "PARAM _ r0\nRET r0 _\n"), "invalid local name"),
+            (program("LOAD r0 0\n", "PARAM p r0\nPARAM q r0\nRET r0 _\n"), "only one PARAM"),
+            (program("LOAD r0 0\n", "PARAM p r0\nVAR p 0\nRET r0 _\n"), "duplicate local"),
+            (program("LOAD r0 0\n", "ARRAY p 1\nPARAM p r0\nRET r0 _\n"), "duplicate local"),
+            (program("LOAD r0 0\n", "LOAD r0 0\nPARAM p r0\nRET r0 _\n"), "must precede"),
+            (program("LOAD r0 0\n", "LABEL here _\nPARAM p r0\nRET r0 _\n"), "must precede"),
+            (program("LOAD r0 0\n", "PARAM p r0\nGET r0 p\nRET r0 _\n"), "requires a variable"),
+            (program("LOAD r0 0\n", "PARAM p r0\nSET p r0\nRET r0 _\n"), "requires a variable"),
+            (program("LOAD r0 0\n", "PARAM p\nRET r0 _\n"), "exactly 3 fields"),
+            (program("LOAD r0 0\n", "PARAM p r0\nCALL f p,r0\nRET r0 _\n"), "recursive call cycle"),
+            (program("LOAD r0 0\n", "PARAM p r0\n" + "VAR v 0\n"), "must end with RET"),
+        ]
+        for operands in ("a", "a,", "a,_", "a,r0,", "a,r0,r1,r2", "r0,r1,r2", "a,b,r0", "_,r0"):
+            cases.append((program(f"ARRAY a 1\nLOAD r0 1\nCALL f {operands}\n"), "CALL operands"))
+        cases.append((program("ARRAY a 1\nLOAD r0 1\nCALL f a, r0\n"), "exactly 3 fields"))
+        for source, message in cases:
+            with self.subTest(message=message, source=source):
+                data = json.loads(self.call("check", self.source(source), "--json", code=1).stdout)
+                self.assertEqual(data["error"]["stage"], "compile")
+                self.assertIn(message, data["error"]["message"])
+
+    def test_array_parameter_dump_and_csv(self):
+        source = self.source("GENE main i32/1\nARRAY values 8\nCALL size values,r0\nRET r0 _\nEND _ _\n"
+                             "GENE size i32/1\nPARAM borrowed r0\nLEN r0 borrowed\nRET r0 _\nEND _ _\n")
+        dumped = self.call("dump", source).stdout
+        self.assertIn("PARAM borrowed r0", dumped)
+        self.assertIn("CALL size values,r0", dumped)
+        roundtrip = self.source(dumped, "dump.dna")
+        for command in ("run", "interpret"):
+            self.assertEqual(self.call(command, roundtrip, 3).stdout.strip(), "3")
+        cases = self.source("arg1,expected\n0,0\n8,8\n9,0\n-1,0\n3,3\n", "arrays.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["summary"]["passed"], 3)
+        self.assertEqual(data["summary"]["errors"], 2)
+        self.assertIn("CALL array length 9", data["cases"][2]["error"]["message"])
+
+    def test_array_pipeline_matches_reference(self):
+        rng = random.Random(808)
+        datasets = [[], [0], [7] * 24, [-2147483648, 2147483647, 0, -1, 1], list(range(255, -1, -1))]
+        datasets += [[rng.randint(-10000, 10000) for _ in range(rng.randrange(129))] for _ in range(40)]
+        for number, values in enumerate(datasets):
+            threshold = [-2147483648, 2147483647, 0, -1, 5][number % 5]
+            expected = sorted(v for v in values if v >= threshold)
+            input_path = self.source("".join(f"{v}\n" for v in values), "исходные числа.txt")
+            for command in ("run", "interpret"):
+                with self.subTest(number=number, command=command):
+                    output = self.root / f"{command}-{number}.txt"
+                    data = json.loads(self.call(command, EXAMPLES / "list_pipeline.dna", threshold,
+                                                "--input", input_path, "--output", output, "--json").stdout)
+                    self.assertEqual(data["result"], len(expected))
+                    self.assertEqual(data["output_count"], len(expected))
+                    self.assertEqual(output.read_bytes(), "".join(f"{v}\n" for v in expected).encode())
+
+    def test_array_library_prefixes_and_repeated_calls(self):
+        # Import via a local Unicode path and verify untouched tails against Python.
+        self.source((EXAMPLES / "lists.dna").read_text(encoding="utf-8"), "модуль.dna")
+        source = self.source("IMPORT модуль.dna _\nGENE main i32/2\nARRAY a 64\n"
+                             "READ a r7\nCALL filter a,r0,r1\n"
+                             "CALL sort a,r0\nCALL sum a,r0\nWRITE a r7\nRET r0 _\nEND _ _\n")
+        rng = random.Random(809)
+        for case in range(40):
+            values = [rng.randint(-2147483648, 2147483647) for _ in range(rng.randrange(65))]
+            length = rng.randrange(len(values) + 1)
+            threshold = rng.randint(-2147483648, 2147483647)
+            kept = [v for v in values[:length] if v >= threshold]
+            expected = sorted(kept) + values[len(kept):]
+            input_path = self.source("".join(f"{v}\n" for v in values), "numbers.txt")
+            for command in ("run", "interpret"):
+                output = self.root / f"prefix-{case}-{command}.txt"
+                data = json.loads(self.call(command, source, length, threshold, "--input", input_path,
+                                            "--output", output, "--json").stdout)
+                self.assertEqual(data["result"], i32(sum(kept)))
+                self.assertEqual([int(v) for v in output.read_text().splitlines()], expected)
+
+    def test_array_parameter_failure_preserves_output(self):
+        source = self.source("GENE main i32/2\nARRAY a 8\nREAD a r2\nWRITE a r2\n"
+                             "CALL modify a,r0,r1\nRET r0 _\nEND _ _\n"
+                             "GENE modify i32/2\nPARAM p r0\nLOAD r2 123\nLOAD r3 0\n"
+                             "ASET p r3,r2\nWRITE p r0\nASET p r1,r2\nRET r0 _\nEND _ _\n")
+        input_path = self.source("7\n8\n9\n", "input.txt")
+        for command in ("run", "interpret"):
+            for length, index, error in [(2, 2, "array index 2"), (0, 0, "array is empty"),
+                                          (2, -1, "array index -1"), (-1, 0, "CALL array length -1"),
+                                          (9, 0, "CALL array length 9")]:
+                output = self.root / f"fail-{command}-{length}-{index}.txt"
+                data = json.loads(self.call(command, source, length, index, "--input", input_path,
+                                            "--output", output, "--json", code=1).stdout)
+                self.assertIn(error, data["error"]["message"])
+                self.assertEqual(data["error"]["stage"], "run")
+                self.assertFalse(output.exists())
+        self.assertEqual(input_path.read_text(), "7\n8\n9\n")
+        self.assertFalse(list(self.root.glob("*.tmp")))
+
     def test_help_and_version(self):
-        self.assertIn("Codons 0.7.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.8.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 

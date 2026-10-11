@@ -22,14 +22,14 @@
 #define BIO_MAX_LOCALS 64u
 #define BIO_MAX_LOCAL_CELLS 65536u
 #define BIO_MEMORY_CELLS 262144u /* 1 MiB of i32 storage across an active call chain. */
-#define BIO_STACK_SIZE 88u
+#define BIO_STACK_SIZE 104u
 
 typedef enum {
     OP_GENE, OP_LOAD, OP_MOV, OP_ADD, OP_SUB, OP_MUL, OP_CALL, OP_RET,
     OP_EQ, OP_LT, OP_MIN, OP_MAX, OP_LABEL, OP_JMP, OP_JZ, OP_JNZ,
     OP_DIV, OP_MOD, OP_AND, OP_OR, OP_XOR, OP_NOT,
     OP_LAND, OP_LOR, OP_LXOR, OP_LNOT, OP_SHL, OP_SHR, OP_SAR,
-    OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN, OP_READ, OP_WRITE
+    OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN, OP_READ, OP_WRITE, OP_PARAM
 } BioOp;
 
 typedef struct CodonNode {
@@ -39,6 +39,7 @@ typedef struct CodonNode {
     uint8_t queued;
     uint32_t arg1;
     uint32_t arg2;
+    uint32_t call_array; /* CALL only: zero or array symbol/local index + 1 after linking. */
     struct CodonNode *next;
     struct CodonNode *bond;
     uint32_t line;
@@ -60,11 +61,13 @@ typedef struct {
     uint32_t count;
     uint32_t initial;
     unsigned is_array;
+    unsigned is_parameter; /* Borrowed prefix; no cells owned by this gene. */
 } BioLocal;
 
 typedef struct {
     char name[BIO_NAME_SIZE];
     unsigned arity;
+    unsigned has_array;
     unsigned live;
     unsigned visit;
     unsigned depth;
@@ -90,7 +93,7 @@ typedef enum {
     BIO_FAULT_NONE, BIO_FAULT_BUDGET, BIO_FAULT_DIV_ZERO,
     BIO_FAULT_DIV_OVERFLOW, BIO_FAULT_SHIFT, BIO_FAULT_BOUNDS,
     BIO_FAULT_INPUT, BIO_FAULT_OUTPUT, BIO_FAULT_READ_SIZE,
-    BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE
+    BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE, BIO_FAULT_ARGUMENT_SIZE
 } BioFault;
 
 typedef struct {

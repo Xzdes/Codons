@@ -127,8 +127,11 @@ static int execution_ok(const BioProgram *p, const BioExecution *execution, BioE
     case BIO_FAULT_DIV_OVERFLOW: message = "division overflow: -2147483648 / -1 does not fit i32"; break;
     case BIO_FAULT_SHIFT: message = "shift count must be in 0..31"; break;
     case BIO_FAULT_BOUNDS:
-        snprintf(detail, sizeof(detail), "array index %ld out of bounds: valid indices are 0..%u (length %u)",
-                 (long)execution->bad_index, execution->bound - 1u, execution->bound);
+        if (execution->bound)
+            snprintf(detail, sizeof(detail), "array index %ld out of bounds: valid indices are 0..%u (length %u)",
+                     (long)execution->bad_index, execution->bound - 1u, execution->bound);
+        else snprintf(detail, sizeof(detail), "array index %ld out of bounds: array is empty (length 0)",
+                      (long)execution->bad_index);
         message = detail; break;
     case BIO_FAULT_INPUT: message = "READ requires an input list; use --input <file> or BioIO.input"; break;
     case BIO_FAULT_OUTPUT: message = "WRITE requires an output list; use --output <file> or BioIO.output"; break;
@@ -142,6 +145,10 @@ static int execution_ok(const BioProgram *p, const BioExecution *execution, BioE
         message = detail; break;
     case BIO_FAULT_OUTPUT_SIZE:
         snprintf(detail, sizeof(detail), "WRITE count %ld exceeds output capacity %u",
+                 (long)execution->bad_index, execution->bound);
+        message = detail; break;
+    case BIO_FAULT_ARGUMENT_SIZE:
+        snprintf(detail, sizeof(detail), "CALL array length %ld out of bounds: expected 0..%u",
                  (long)execution->bad_index, execution->bound);
         message = detail; break;
     default: message = "unknown execution error"; break;
@@ -170,7 +177,8 @@ static uint32_t interpreter_fault(BioExecution *execution, const CodonNode *n, B
 }
 
 static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, uint32_t b,
-                               BioExecution *execution, uint32_t *memory) {
+                               BioExecution *execution, uint32_t *memory,
+                               uint32_t *array, uint32_t array_count) {
     uint32_t r[8] = {0};
     const BioGene *g = &p->genes[gene];
     unsigned i;
@@ -186,19 +194,21 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, u
     n = g->head->next;
     while (n) {
         const CodonNode *next = n->next;
-        if (n->op_code != OP_LABEL && n->op_code != OP_VAR && n->op_code != OP_ARRAY) {
+        if (n->op_code != OP_LABEL && n->op_code != OP_VAR && n->op_code != OP_ARRAY && n->op_code != OP_PARAM) {
             if (!execution->remaining) return interpreter_fault(execution, n, BIO_FAULT_BUDGET);
             --execution->remaining;
         }
         switch (n->op_code) {
         case OP_READ: case OP_WRITE: {
             const BioLocal *local = &g->locals[n->arg1];
+            uint32_t capacity = local->is_parameter ? array_count : local->count;
+            uint32_t *data = local->is_parameter ? array : memory + local->offset;
             int reading = n->op_code == OP_READ;
             uint32_t count = reading ? execution->input_count : r[n->arg2];
             if (reading ? !execution->input : !execution->output)
                 return interpreter_fault(execution, n, reading ? BIO_FAULT_INPUT : BIO_FAULT_OUTPUT);
-            execution->bad_index = signed_value(count); execution->bound = local->count;
-            if (count > local->count)
+            execution->bad_index = signed_value(count); execution->bound = capacity;
+            if (count > capacity)
                 return interpreter_fault(execution, n, reading ? BIO_FAULT_READ_SIZE : BIO_FAULT_WRITE_SIZE);
             if (!reading && count > execution->output_capacity) {
                 execution->bound = execution->output_capacity;
@@ -207,26 +217,28 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, u
             if (execution->remaining < count) return interpreter_fault(execution, n, BIO_FAULT_BUDGET);
             execution->remaining -= count;
             if (reading) {
-                if (count) memcpy(memory + local->offset, execution->input, (size_t)count * sizeof(*memory));
+                if (count) memcpy(data, execution->input, (size_t)count * sizeof(*data));
                 r[n->arg2] = count;
             } else {
-                if (count) memcpy(execution->output, memory + local->offset, (size_t)count * sizeof(*memory));
+                if (count) memcpy(execution->output, data, (size_t)count * sizeof(*data));
                 execution->output_count = count; execution->output_written = 1;
             }
             break;
         }
         case OP_GET: r[n->arg1] = memory[g->locals[n->arg2].offset]; break;
         case OP_SET: memory[g->locals[n->arg1].offset] = r[n->arg2]; break;
-        case OP_LEN: r[n->arg1] = g->locals[n->arg2].count; break;
+        case OP_LEN: r[n->arg1] = g->locals[n->arg2].is_parameter ? array_count : g->locals[n->arg2].count; break;
         case OP_AGET: case OP_ASET: {
             const BioLocal *local = &g->locals[n->op_code == OP_AGET ? n->arg2 >> 8 : n->arg1];
+            uint32_t capacity = local->is_parameter ? array_count : local->count;
+            uint32_t *data = local->is_parameter ? array : memory + local->offset;
             uint32_t index = r[n->arg2 & 255u];
-            if (index >= local->count) {
-                execution->bad_index = signed_value(index); execution->bound = local->count;
+            if (index >= capacity) {
+                execution->bad_index = signed_value(index); execution->bound = capacity;
                 return interpreter_fault(execution, n, BIO_FAULT_BOUNDS);
             }
-            if (n->op_code == OP_AGET) r[n->arg1] = memory[local->offset + index];
-            else memory[local->offset + index] = r[n->arg2 >> 8];
+            if (n->op_code == OP_AGET) r[n->arg1] = data[index];
+            else data[index] = r[n->arg2 >> 8];
             break;
         }
         case OP_LOAD: r[n->arg1] = n->arg2; break;
@@ -275,8 +287,18 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, u
             unsigned argc = n->arg2 >> 16;
             uint32_t x = argc > 0 ? r[n->arg2 & 255u] : 0;
             uint32_t y = argc > 1 ? r[(n->arg2 >> 8) & 255u] : 0;
+            uint32_t *passed = NULL;
+            if (n->call_array) {
+                const BioLocal *local = &g->locals[n->call_array - 1u];
+                uint32_t capacity = local->is_parameter ? array_count : local->count;
+                if (x > capacity) {
+                    execution->bad_index = signed_value(x); execution->bound = capacity;
+                    return interpreter_fault(execution, n, BIO_FAULT_ARGUMENT_SIZE);
+                }
+                passed = local->is_parameter ? array : memory + local->offset;
+            }
             r[0] = interpret_gene(p, n->arg1, x, y, execution,
-                                  g->local_cells ? memory + g->local_cells : memory);
+                                  g->local_cells ? memory + g->local_cells : memory, passed, n->call_array ? x : 0);
             if (execution->failed_node != UINT32_MAX) return 0;
             break;
         }
@@ -326,7 +348,7 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
         memcpy(&fn, &address, sizeof(fn));
         value = fn(argc > 0 ? args[0] : 0, argc > 1 ? args[1] : 0, &execution, memory);
     } else value = signed_value(interpret_gene(p, p->main_gene, argc > 0 ? (uint32_t)args[0] : 0,
-                                              argc > 1 ? (uint32_t)args[1] : 0, &execution, memory));
+                                              argc > 1 ? (uint32_t)args[1] : 0, &execution, memory, NULL, 0));
     ok = execution_ok(p, &execution, e);
     if (ok) {
         if (io) {
@@ -365,7 +387,7 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
         "GENE", "LOAD", "MOV", "ADD", "SUB", "MUL", "CALL", "RET", "EQ", "LT", "MIN", "MAX",
         "LABEL", "JMP", "JZ", "JNZ", "DIV", "MOD", "AND", "OR", "XOR", "NOT",
         "LAND", "LOR", "LXOR", "LNOT", "SHL", "SHR", "SAR",
-        "VAR", "ARRAY", "GET", "SET", "AGET", "ASET", "LEN", "READ", "WRITE"
+        "VAR", "ARRAY", "GET", "SET", "AGET", "ASET", "LEN", "READ", "WRITE", "PARAM"
     };
     unsigned i;
     for (i = 0; i < p->gene_count; ++i) {
@@ -376,12 +398,15 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
             if (n->op_code == OP_CALL) {
                 unsigned argc = n->arg2 >> 16;
                 fprintf(out, "CALL %s ", p->genes[n->arg1].name);
+                if (n->call_array) fprintf(out, "%s,", p->symbols[g->locals[n->call_array - 1u].symbol]);
                 if (!argc) fputc('_', out);
                 else {
                     fprintf(out, "r%u", n->arg2 & 255u);
                     if (argc == 2) fprintf(out, ",r%u", (n->arg2 >> 8) & 255u);
                 }
-            } else if (n->op_code == OP_VAR || n->op_code == OP_ARRAY)
+            } else if (n->op_code == OP_PARAM)
+                fprintf(out, "PARAM %s r0", p->symbols[n->arg1]);
+            else if (n->op_code == OP_VAR || n->op_code == OP_ARRAY)
                 fprintf(out, "%s %s %ld", names[n->op_code], p->symbols[n->arg1], (long)signed_value(n->arg2));
             else if (n->op_code == OP_GET || n->op_code == OP_LEN)
                 fprintf(out, "%s r%u %s", names[n->op_code], n->arg1, p->symbols[g->locals[n->arg2].symbol]);

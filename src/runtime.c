@@ -49,7 +49,8 @@ int bio_runtime_reload(BioRuntime *runtime, const char *path, int repair, BioErr
     /* Compare against the currently published version, even with concurrent writers. */
     for (i = 0; i < old->gene_count; ++i) {
         int found = bio_find_gene(candidate, old->genes[i].name);
-        if (found < 0 || candidate->genes[found].arity != old->genes[i].arity) {
+        if (found < 0 || candidate->genes[found].arity != old->genes[i].arity ||
+            candidate->genes[found].has_array != old->genes[i].has_array) {
             bio_error(e, "repair rejected: incompatible signature or removed gene %s", old->genes[i].name);
             ReleaseSRWLockExclusive(&runtime->lock);
             bio_program_release(candidate);
