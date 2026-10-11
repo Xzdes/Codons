@@ -1,0 +1,9 @@
+arg1,input,expected,expected_output
+5,numbers.txt,3,numbers_filtered.txt
+0,list_cases/empty.txt,0,list_cases/empty.txt
+3,list_cases/duplicates.txt,4,list_cases/duplicates_sorted.txt
+-5,list_cases/negative.txt,3,list_cases/negative_sorted.txt
+-2147483648,numbers.txt,7,numbers_sorted.txt
+2147483647,numbers.txt,0,list_cases/empty.txt
+-2147483648,list_cases/extremes.txt,4,list_cases/extremes_sorted.txt
+42,list_cases/single.txt,1,list_cases/single.txt

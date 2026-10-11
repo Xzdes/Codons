@@ -170,7 +170,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.8.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.9.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -764,6 +764,216 @@ class CliTests(unittest.TestCase):
         # Windows text fixtures use CRLF; exported lists deliberately use LF.
         self.assertEqual(output.read_bytes(), inputs[winner].read_text(encoding="utf-8").encode("utf-8"))
         self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_csv_lists_shipped_suite_without_file_changes(self):
+        watched = [EXAMPLES / "list_pipeline.csv", EXAMPLES / "numbers.txt", EXAMPLES / "numbers_filtered.txt"]
+        watched += list((EXAMPLES / "list_cases").glob("*.txt"))
+        before = {path: path.read_bytes() for path in watched}
+        data = json.loads(self.call("test", EXAMPLES / "list_pipeline.dna", EXAMPLES / "list_pipeline.csv", "--json").stdout)
+        self.assertEqual(data["summary"], {"total": 8, "passed": 8, "failed": 0, "mismatches": 0, "errors": 0})
+        self.assertTrue(all(case["output"]["matched"] for case in data["cases"]))
+        text = self.call("test", EXAMPLES / "list_pipeline.dna", EXAMPLES / "list_pipeline.csv").stdout
+        self.assertIn("8 total, 8 passed, 0 failed", text)
+        self.assertEqual(before, {path: path.read_bytes() for path in watched})
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_csv_lists_all_arities_unicode_paths_and_formats(self):
+        input_path = self.source("\ufeff\n -2147483648 \n+7\n2147483647\n", "Данные с пробелами/вход,числа.txt")
+        expected = self.source("-2147483648\r\n7\r\n2147483647\r\n", "Данные с пробелами/эталон.txt")
+        for arity in range(3):
+            source = self.source(f"GENE main i32/{arity}\nARRAY a 3\nREAD a r2\nWRITE a r2\n"
+                                 + ("LOAD r0 3\n" if arity == 0 else "" if arity == 1 else "ADD r0 r1\n")
+                                 + "RET r0 _\nEND _ _\n")
+            cells = ["arg1", "arg2"][:arity] + ["input", "expected", "expected_output"]
+            args = [3] if arity == 1 else [1, 2] if arity == 2 else []
+            text = io.StringIO(newline="")
+            writer = csv.writer(text, quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+            writer.writerow(cells)
+            # Relative path from CSV, with a comma; absolute expected path also works.
+            writer.writerow(args + ["../Данные с пробелами/вход,числа.txt", 3, str(expected)])
+            cases = self.source("", f"Наборы/arity-{arity}.csv")
+            cases.write_bytes(("\ufeff\r\n" + text.getvalue().rstrip("\r\n")).encode("utf-8"))
+            data = json.loads(self.call("test", source, cases, "--json").stdout)
+            case = data["cases"][0]
+            self.assertEqual(case["line"], 3)
+            self.assertEqual(case["inputs"], args)
+            self.assertEqual(case["output"], {"matched": True, "expected_count": 3, "actual_count": 3})
+        self.assertTrue(input_path.is_file())
+
+    def test_csv_lists_first_difference_length_order_and_scalar(self):
+        source = self.source("GENE main i32\nARRAY a 8\nREAD a r0\nWRITE a r0\nRET r0 _\nEND _ _\n")
+        self.source("-2\n7\n9\n", "input.txt")
+        expected_lists = [[-2, 8, 9], [-2, 7], [-2, 7, 9, 11], [], [9, 7, -2], [-1], [-2, 7, 9]]
+        rows = ["input,expected,expected_output"]
+        for i, values in enumerate(expected_lists):
+            self.source("".join(f"{n}\n" for n in values), f"expected-{i}.txt")
+            rows.append(f"input.txt,3,expected-{i}.txt")
+        rows += ["input.txt,4,input.txt", "input.txt,3,input.txt"]
+        cases = self.source("\n".join(rows), "cases.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["summary"], {"total": 9, "passed": 2, "failed": 7, "mismatches": 7, "errors": 0})
+        differences = [(2, 8, 7), (3, None, 9), (4, 11, None), (1, None, -2), (1, 9, -2), (1, -1, -2)]
+        for case, (element, expected, actual) in zip(data["cases"], differences):
+            self.assertEqual(case["actual"], 3)  # Scalar result alone would have passed.
+            self.assertEqual(case["output"]["difference"], {"element": element, "expected": expected, "actual": actual})
+        self.assertTrue(data["cases"][-2]["output"]["matched"])
+        self.assertEqual(data["cases"][-2]["status"], "failed")
+        text = self.call("test", source, cases, code=1).stdout
+        self.assertIn("element 2: expected=8 actual=7", text)
+        self.assertIn("element 3: expected=<missing> actual=9", text)
+        self.assertIn("element 4: expected=11 actual=<missing>", text)
+        self.assertIn("output_count: expected=2 actual=3", text)
+
+    def test_csv_lists_file_errors_continue_and_identify_fixture(self):
+        source = self.source("GENE main i32\nARRAY a 8\nREAD a r0\nWRITE a r0\nRET r0 _\nEND _ _\n")
+        good = self.source("7\n", "данные/good.txt")
+        bad = self.source("7\nnot-a-number\n", "данные/bad.txt")
+        cases = self.source("input,expected,expected_output\n../данные/missing.txt,1,../данные/good.txt\n"
+                            "../данные/bad.txt,1,../данные/good.txt\n../данные/good.txt,1,../данные/bad.txt\n"
+                            "../данные/good.txt,1,../данные/missing.txt\n../данные/good.txt,1,../данные/good.txt\n", "наборы/cases.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["summary"]["errors"], 4)
+        self.assertEqual(data["summary"]["passed"], 1)
+        for i, field in enumerate(["input", "input", "expected_output", "expected_output"]):
+            case = data["cases"][i]
+            self.assertEqual(case["line"], i + 2)
+            self.assertEqual(case["error"]["stage"], "file")
+            self.assertEqual(case["error"]["field"], field)
+            self.assertNotIn("actual", case)
+            self.assertNotIn("output", case)
+        self.assertEqual(data["cases"][2]["error"]["file"], str(bad))
+        self.assertIn(str(bad) + ":2:", data["cases"][2]["error"]["message"])
+        self.assertEqual(good.read_text(), "7\n")
+
+    def test_csv_lists_execution_errors_and_fresh_budgets(self):
+        source = self.source("GENE main i32/1\nARRAY a 1\nREAD a r1\nWRITE a r1\nLOAD r2 1\n"
+                             "JZ r0 done\nLABEL loop _\nSUB r0 r2\nJNZ r0 loop\nLABEL done _\nRET r1 _\nEND _ _\n")
+        self.source("7\n", "one.txt")
+        self.source("7\n8\n", "two.txt")
+        cases = self.source("arg1,input,expected,expected_output\n499996,one.txt,1,one.txt\n"
+                            "499997,one.txt,1,one.txt\n0,two.txt,2,two.txt\n499996,one.txt,1,one.txt\n"
+                            "0,one.txt,1,one.txt\n", "cases.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual([case["status"] for case in data["cases"]], ["passed", "error", "error", "passed", "passed"])
+        self.assertIn("execution budget exhausted", data["cases"][1]["error"]["message"])
+        self.assertIn("array capacity is 1", data["cases"][2]["error"]["message"])
+        self.assertEqual(data["cases"][1]["error"]["stage"], "run")
+        self.assertNotIn("output", data["cases"][1])  # A staged WRITE is not a successful result.
+        self.assertNotIn("actual", data["cases"][1])
+
+    def test_csv_lists_missing_write_is_not_an_empty_result(self):
+        source = self.source("GENE main i32/1\nARRAY a 1\nJZ r0 done\nLOAD r1 0\nWRITE a r1\n"
+                             "LABEL done _\nLOAD r0 0\nRET r0 _\nEND _ _\n")
+        self.source("", "empty.txt")
+        cases = self.source("arg1,input,expected,expected_output\n1,empty.txt,0,empty.txt\n"
+                            "0,empty.txt,0,empty.txt\n1,empty.txt,0,empty.txt\n", "cases.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual([case["status"] for case in data["cases"]], ["passed", "error", "passed"])
+        self.assertIn("did not execute WRITE", data["cases"][1]["error"]["message"])
+        self.assertEqual(data["cases"][0]["output"]["actual_count"], 0)
+        self.assertNotIn("output", data["cases"][1])
+
+    def test_csv_lists_last_write_snapshot_and_fresh_data(self):
+        source = self.source("GENE main i32\nARRAY a 3\nREAD a r0\nLOAD r1 1\nWRITE a r1\n"
+                             "WRITE a r0\nLOAD r1 0\nLOAD r2 99\nASET a r1,r2\nRET r0 _\nEND _ _\n")
+        numbers = self.source("7\n8\n9\n", "numbers.txt")
+        cases = self.source("input,expected,expected_output\nnumbers.txt,3,numbers.txt\n"
+                            "numbers.txt,3,numbers.txt\n", "cases.csv")
+        before = {path: path.read_bytes() for path in self.root.iterdir()}
+        self.call("test", source, cases)
+        self.assertEqual(before, {path: path.read_bytes() for path in self.root.iterdir()})
+        self.assertEqual(numbers.read_text(), "7\n8\n9\n")
+        fresh = self.source("GENE main i32\nARRAY a 1\nLOAD r1 0\nAGET r0 a,r1\n"
+                            "LOAD r2 9\nASET a r1,r2\nLOAD r1 1\nWRITE a r1\nRET r0 _\nEND _ _\n")
+        self.source("9\n", "nine.txt")
+        cases = self.source("input,expected,expected_output\nnumbers.txt,0,nine.txt\n"
+                            + "numbers.txt,0,nine.txt\n", "cases.csv")
+        self.assertEqual(json.loads(self.call("test", fresh, cases, "--json").stdout)["summary"]["passed"], 2)
+
+    def test_csv_lists_bad_csv_is_rejected_before_cases(self):
+        source = EXAMPLES / "list_pipeline.dna"
+        rows = [("5,,3,expected.txt", "path", 2), ("5,input.txt,3,", "path", 4),
+                ('5,"",3,expected.txt', "path", 2), ('5,input.txt,3," "', "path", 4),
+                ("5,input.txt,,expected.txt", "integer", 3), ("no,input.txt,3,expected.txt", "integer", 1),
+                ("5,input.txt,2147483648,expected.txt", "integer", 3),
+                ("5,input.txt,3", "column_count", 4), ("5,input.txt,3,expected.txt,extra", "column_count", 5),
+                ('5,"unclosed,3,expected.txt', "quotes", 2), ('5,in"put.txt,3,expected.txt', "quotes", 2)]
+        for row, error_code, column in rows:
+            with self.subTest(row=row):
+                cases = self.source("arg1,input,expected,expected_output\n5,missing.txt,3,also_missing.txt\n" + row, "cases.csv")
+                data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+                self.assertEqual(data["error"]["stage"], "csv")
+                self.assertEqual(data["error"]["code"], error_code)
+                self.assertEqual(data["error"]["line"], 3)
+                self.assertEqual(data["error"]["column"], column)
+                self.assertNotIn("cases", data)
+        for header in ["arg1,expected,input,expected_output", "arg1,input,expected,output", "input,expected,expected_output",
+                       "arg1,input,expected", "arg1,arg2,input,expected,expected_output"]:
+            cases = self.source(header + "\n", "cases.csv")
+            data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+            self.assertEqual(data["error"]["stage"], "csv")
+            self.assertIn("arg1,input,expected,expected_output", data["error"]["message"])
+
+    def test_csv_lists_invalid_fixtures_are_not_executed(self):
+        # Invalid expected data wins over an infinite program because both files load first.
+        source = EXAMPLES / "infinite.dna"
+        self.source("7\n", "good.txt")
+        bad = self.source("", "bad.txt")
+        cases = self.source("input,expected,expected_output\ngood.txt,0,bad.txt\n", "cases.csv")
+        for content, message in [(b"\xff\n", "UTF-8"), (b"1\x00\n", "NUL"), (b"1,2\n", "one decimal i32"),
+                                 (b"2147483648\n", "one decimal i32"), (b"0" * 512, "511 bytes"),
+                                 (b"0\n" * 65537, "65536 numbers"), (b"\n" * (1024 * 1024 + 1), "1 MiB")]:
+            with self.subTest(message=message):
+                bad.write_bytes(content)
+                data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+                error = data["cases"][0]["error"]
+                self.assertEqual(error["stage"], "file")
+                self.assertEqual(error["field"], "expected_output")
+                self.assertIn(message, error["message"])
+                self.assertNotIn("execution budget", error["message"])
+        # A device must not become a test input; the shared list reader rejects it.
+        cases.write_text("input,expected,expected_output\nNUL,0,good.txt\n", encoding="utf-8")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["cases"][0]["error"]["stage"], "file")
+        self.assertIn("regular disk file", data["cases"][0]["error"]["message"])
+
+    def test_csv_lists_maximum_list_and_case_counts(self):
+        source = self.source("GENE main i32\nARRAY a 65536\nREAD a r0\nWRITE a r0\nRET r0 _\nEND _ _\n")
+        self.source("-2147483648\n" * 65536, "large.txt")
+        expected = self.source("-2147483648\n" * 65535 + "2147483647\n", "expected.txt")
+        cases = self.source("input,expected,expected_output\nlarge.txt,65536,large.txt\n"
+                            "large.txt,65536,expected.txt\n", "cases.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["cases"][0]["status"], "passed")
+        self.assertEqual(data["cases"][1]["output"]["difference"],
+                         {"element": 65536, "expected": 2147483647, "actual": -2147483648})
+        # Case buffers are reused/freed; a maximum suite does not retain 1000 pairs of lists.
+        source = self.source("GENE main i32\nARRAY a 1\nLOAD r0 0\nWRITE a r0\nRET r0 _\nEND _ _\n")
+        self.source("", "empty.txt")
+        cases.write_text("input,expected,expected_output\n" + "empty.txt,0,empty.txt\n" * 1000, encoding="utf-8")
+        self.assertEqual(json.loads(self.call("test", source, cases, "--json").stdout)["summary"]["passed"], 1000)
+        with cases.open("a", encoding="utf-8") as file:
+            file.write("empty.txt,0,empty.txt\n")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["error"]["code"], "case_limit")
+        self.assertNotIn("cases", data)
+        self.assertTrue(expected.is_file())
+
+    def test_csv_lists_generated_pipeline_references(self):
+        rng = random.Random(909)
+        rows = ["arg1,input,expected,expected_output"]
+        for i in range(50):
+            values = [rng.randint(-2147483648, 2147483647) for _ in range(rng.randrange(129))]
+            threshold = rng.randint(-2147483648, 2147483647)
+            expected = sorted(v for v in values if v >= threshold)
+            self.source("".join(f"{v}\n" for v in values), f"lists/in-{i}.txt")
+            self.source("".join(f"{v}\n" for v in expected), f"lists/out-{i}.txt")
+            rows.append(f"{threshold},lists/in-{i}.txt,{len(expected)},lists/out-{i}.txt")
+        cases = self.source("\n".join(rows), "cases.csv")
+        env = dict(os.environ, PATH=str(Path(os.environ["SystemRoot"]) / "System32"))
+        data = json.loads(self.call("test", EXAMPLES / "list_pipeline.dna", cases, "--json", env=env).stdout)
+        self.assertEqual(data["summary"]["passed"], 50)
+        self.assertTrue(all(case["output"]["matched"] for case in data["cases"]))
 
     def test_csv_mismatches_do_not_stop_the_suite(self):
         source = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n")

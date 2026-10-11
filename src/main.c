@@ -26,7 +26,7 @@ static void usage(void) {
          "\nCommands:\n"
          "  new <file.dna>                 Create an example; never overwrite a file\n"
          "  run <file.dna> [number ...]     Compile and run with 0, 1 or 2 i32 inputs\n"
-         "  test <file.dna> <cases.csv>     Compare CSV examples with native results\n"
+         "  test <file.dna> <cases.csv>     Compare CSV examples, including file lists\n"
          "  check <file.dna>               Validate without running or preparing JIT\n"
          "  interpret <file.dna> [number ...]  Run the reference interpreter\n"
          "  dump <file.dna>                Show the normalized program\n"
@@ -38,6 +38,8 @@ static void usage(void) {
          "  run/interpret: --input <numbers.txt> --output <result.txt>\n"
          "  Lists: one i32 per nonblank UTF-8 line; output must be a new file\n"
          "CSV header: expected | arg1,expected | arg1,arg2,expected\n"
+         "CSV with lists: add input before expected and expected_output after it\n"
+         "List paths are relative to CSV; test compares in memory without writing files\n"
          "Live commands: run [number ...] | reload <file.dna> | quit\n"
          "Every run shares a 1000000-step budget across loops, calls, initialization and list copies.\n"
          "Exit codes: 0 success, 1 failed tests or program/file error, 2 invalid command or arguments");
