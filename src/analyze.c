@@ -8,6 +8,10 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
         n->initialized = 255;
         if (n->op_code != OP_LABEL) continue;
         if (labels[n->arg1]) {
+            if (p->repair_mode) {
+                if (!bio_quarantine(p, n, "duplicate label has no unambiguous target", e)) return 0;
+                continue;
+            }
             bio_node_error(p, n, e, "duplicate label %s in gene %s", p->symbols[n->arg1], g->name);
             return 0;
         }
@@ -18,13 +22,25 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
             unsigned argc = n->arg2 >> 16;
             int target = bio_find_gene(p, p->symbols[n->arg1]);
             if (target < 0) {
+                if (p->repair_mode) {
+                    if (!bio_quarantine(p, n, "CALL target is undefined", e)) return 0;
+                    continue;
+                }
                 bio_node_error(p, n, e, "undefined gene: %s", p->symbols[n->arg1]); return 0;
             }
             if (p->genes[target].arity != argc) {
+                if (p->repair_mode) {
+                    if (!bio_quarantine(p, n, "CALL argument count does not match target", e)) return 0;
+                    continue;
+                }
                 bio_node_error(p, n, e, "gene %s expects %u arguments, got %u",
                                p->genes[target].name, p->genes[target].arity, argc); return 0;
             }
             if (p->genes[target].has_array != (n->call_array != 0)) {
+                if (p->repair_mode) {
+                    if (!bio_quarantine(p, n, "CALL array argument does not match target", e)) return 0;
+                    continue;
+                }
                 bio_node_error(p, n, e, "gene %s %s an array argument", p->genes[target].name,
                                p->genes[target].has_array ? "requires" : "does not accept");
                 return 0;
@@ -33,10 +49,18 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
                 unsigned i, sym = n->call_array - 1u;
                 for (i = 0; i < g->local_count && g->locals[i].symbol != sym; ++i) {}
                 if (i == g->local_count) {
+                    if (p->repair_mode) {
+                        if (!bio_quarantine(p, n, "CALL array local is undefined", e)) return 0;
+                        continue;
+                    }
                     bio_node_error(p, n, e, "undefined local %s in gene %s", p->symbols[sym], g->name);
                     return 0;
                 }
                 if (!g->locals[i].is_array) {
+                    if (p->repair_mode) {
+                        if (!bio_quarantine(p, n, "CALL array argument names a scalar variable", e)) return 0;
+                        continue;
+                    }
                     bio_node_error(p, n, e, "%s is a variable; CALL requires an array", p->symbols[sym]);
                     return 0;
                 }
@@ -48,6 +72,10 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
             unsigned target = n->op_code == OP_JMP ? n->arg1 : n->arg2;
             n->bond = labels[target];
             if (!n->bond) {
+                if (p->repair_mode) {
+                    if (!bio_quarantine(p, n, "branch target label is undefined", e)) return 0;
+                    continue;
+                }
                 bio_node_error(p, n, e, "undefined label %s in gene %s", p->symbols[target], g->name);
                 return 0;
             }
@@ -58,10 +86,18 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
                 n->op_code == OP_READ || n->op_code == OP_WRITE;
             for (i = 0; i < g->local_count && g->locals[i].symbol != target; ++i) {}
             if (i == g->local_count) {
+                if (p->repair_mode) {
+                    if (!bio_quarantine(p, n, "local name is undefined", e)) return 0;
+                    continue;
+                }
                 bio_node_error(p, n, e, "undefined local %s in gene %s", p->symbols[target], g->name);
                 return 0;
             }
             if (g->locals[i].is_array != array) {
+                if (p->repair_mode) {
+                    if (!bio_quarantine(p, n, "local kind does not match the operation", e)) return 0;
+                    continue;
+                }
                 bio_node_error(p, n, e, "%s is %s; this operation requires %s", p->symbols[target],
                                array ? "a variable" : "an array", array ? "an array" : "a variable");
                 return 0;
@@ -114,6 +150,11 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
     size_t front = 0, back = 0, pending = 0, capacity = p->stats.nodes;
     CodonNode *entry = g->head->next, *n;
     if (!entry) { bio_node_error(p, g->head, e, "empty gene"); return 0; }
+    for (n = entry; n; n = n->next) {
+        n->reachable = 0;
+        n->initialized = 255;
+        n->queued = 0;
+    }
     entry->initialized = (uint8_t)((1u << g->arity) - 1u);
     entry->reachable = entry->queued = 1;
     queue[back++ % capacity] = entry; ++pending;
@@ -123,7 +164,7 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
         n = queue[front++ % capacity]; --pending; n->queued = 0;
         out = n->initialized | definitions(n);
         if (n->op_code == OP_JMP) successors[count++] = n->bond;
-        else if (n->op_code != OP_RET) {
+        else if (n->op_code != OP_RET && n->op_code != OP_QUARANTINE) {
             successors[count++] = n->next;
             if (n->op_code == OP_JZ || n->op_code == OP_JNZ) successors[count++] = n->bond;
         }
@@ -132,6 +173,10 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
             unsigned mask;
             int changed;
             if (!next) {
+                if (p->repair_mode) {
+                    if (!bio_quarantine(p, n, "reachable path ended without RET or JMP", e)) return 0;
+                    return 2;
+                }
                 bio_node_error(p, n, e, "reachable path falls through END; it must end with RET or JMP");
                 return 0;
             }
@@ -149,6 +194,10 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
         missing = reads(n) & ~n->initialized;
         for (r = 0; r < 8; ++r) {
             if (!(missing & (1u << r))) continue;
+            if (p->repair_mode) {
+                if (!bio_quarantine(p, n, "instruction reads an uninitialized register", e)) return 0;
+                return 2;
+            }
             bio_node_error(p, n, e, "read of uninitialized register r%u on a reachable path", r);
             return 0;
         }
@@ -219,7 +268,9 @@ int bio_analyze(BioProgram *p, BioError *e) {
     queue = malloc(p->stats.nodes * sizeof(*queue));
     if (!queue) { bio_error(e, "out of memory checking control flow"); return 0; }
     for (i = 0; i < p->gene_count; ++i) {
-        if (!validate_flow(p, &p->genes[i], queue, e)) { free(queue); return 0; }
+        int flow;
+        do flow = validate_flow(p, &p->genes[i], queue, e); while (flow == 2);
+        if (!flow) { free(queue); return 0; }
     }
     free(queue);
     for (i = 0; i < p->gene_count; ++i) if (!check_calls(p, i, 1, e)) return 0;

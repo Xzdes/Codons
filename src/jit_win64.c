@@ -64,6 +64,12 @@ static void guard_step(Emitter *b, const CodonNode *n) {
     byte(b, 0x49); byte(b, 0x83); byte(b, 0x28); byte(b, 1); /* sub qword [r8],1 */
 }
 
+static void emit_quarantine(Emitter *b, const CodonNode *n) {
+    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 8); word32(b, n->index);
+    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 12); word32(b, BIO_FAULT_QUARANTINE);
+    byte(b, 0x31); byte(b, 0xc0); epilog(b);
+}
+
 static void propagate_failure(Emitter *b) {
     load_context(b);
     byte(b, 0x41); byte(b, 0x83); byte(b, 0x78); byte(b, 8); byte(b, 0xff); /* cmp dword [r8+8],-1 */
@@ -198,6 +204,9 @@ static void emit_gene(Emitter *b, BioGene *g) {
         if (n->op_code == OP_LABEL || n->op_code == OP_VAR || n->op_code == OP_ARRAY || n->op_code == OP_PARAM) continue;
         guard_step(b, n);
         switch (n->op_code) {
+        case OP_QUARANTINE:
+            emit_quarantine(b, n);
+            break;
         case OP_READ: case OP_WRITE:
             emit_transfer(b, g, n);
             break;

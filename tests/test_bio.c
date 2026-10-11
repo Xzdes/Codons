@@ -716,7 +716,42 @@ static void module_and_repair_tests(void) {
     bio_program_release(p);
     write_source("repair_bad.dna", "GENE main i32\nLOAD r0\nRET r0\nEND _\n");
     p = compile_name("repair_bad.dna", 1, &e);
-    REQUIRE(p == NULL && strstr(e.message, "exactly 3 fields"));
+    REQUIRE(p != NULL);
+    REQUIRE(bio_program_stats(p).repairs == 3 && bio_program_stats(p).quarantines == 1);
+    REQUIRE(bio_program_repair_count(p) == 3);
+    {
+        BioRepair repair = {0};
+        int32_t result = 123;
+        REQUIRE(bio_program_repair_at(p, 0, &repair));
+        REQUIRE(!strcmp(repair.kind, "quarantine") && strstr(repair.detail, "three fields"));
+        REQUIRE(!bio_program_run(p, NULL, 0, &result, &e));
+        REQUIRE(result == 123 && strstr(e.message, "quarantined repaired codon"));
+    }
+    bio_program_release(p);
+    write_source("repair_link.dna", "GENE main i32\nCALL absent _\nRET r0 _\nEND _ _\n");
+    p = compile_name("repair_link.dna", 1, &e);
+    REQUIRE(p != NULL && bio_program_stats(p).quarantines == 1);
+    {
+        int32_t result = 77;
+        REQUIRE(!bio_program_run(p, NULL, 0, &result, &e));
+        REQUIRE(result == 77 && strstr(e.message, "quarantined repaired codon"));
+        REQUIRE(!bio_program_interpret(p, NULL, 0, &result, &e));
+        REQUIRE(result == 77 && strstr(e.message, "quarantined repaired codon"));
+    }
+    bio_program_release(p);
+    write_source("repair_flow.dna", "GENE main i32\nMOV r0 r1\nRET r0 _\nEND _ _\n");
+    p = compile_name("repair_flow.dna", 1, &e);
+    REQUIRE(p != NULL && bio_program_stats(p).quarantines == 1);
+    {
+        int32_t result = 77;
+        REQUIRE(!bio_program_run(p, NULL, 0, &result, &e));
+        REQUIRE(result == 77 && strstr(e.message, "quarantined repaired codon"));
+    }
+    bio_program_release(p);
+    write_source("repair_end.dna", "GENE main i32\nLOAD r0 9\nRET r0 _\n");
+    p = compile_name("repair_end.dna", 1, &e);
+    REQUIRE(p != NULL && bio_program_stats(p).repairs == 1 && run0(p) == 9);
+    bio_program_release(p);
 }
 
 static uint32_t random_state = 0x51921u;

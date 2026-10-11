@@ -170,7 +170,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.9.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.10.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -264,6 +264,18 @@ class CliTests(unittest.TestCase):
         self.assertEqual(data["result"], 42)
         self.assertEqual(data["stats"]["repairs"], 2)
         self.assertIn("RET r0\n", source.read_text())
+
+        broken = self.source("GENE main i32\nCALL absent _\nRET r0 _\nEND _ _\n", "repair-link.dna")
+        self.assertIn("undefined gene", self.call("check", broken, code=1).stderr)
+        report = json.loads(self.call("check", broken, "--repair", "--json").stdout)
+        self.assertEqual(report["stats"]["quarantines"], 1)
+        self.assertEqual(report["repair_log"][0]["line"], 2)
+        self.assertEqual(report["repair_log"][0]["kind"], "quarantine")
+        self.assertIn("CALL target", report["repair_log"][0]["detail"])
+        for command in ("run", "interpret"):
+            failed = json.loads(self.call(command, broken, "--repair", "--json", code=1).stdout)
+            self.assertEqual(failed["error"]["stage"], "run")
+            self.assertIn("quarantined repaired codon", failed["error"]["message"])
 
     def test_live_inputs_and_failed_update(self):
         source = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n", "old.dna")
@@ -468,7 +480,9 @@ class CliTests(unittest.TestCase):
         bad = self.source("GENE main i32\nLOAD r0 0\nLAND r0 r1\nRET r0 _\nEND _ _\n", "bad.dna")
         self.assertIn("uninitialized register", self.call("check", bad, code=1).stderr)
         missing = self.source("GENE main i32/1\nNOT r0\nRET r0 _\nEND _ _\n", "missing.dna")
-        self.assertIn("exactly 3 fields", self.call("check", missing, "--repair", code=1).stderr)
+        data = json.loads(self.call("run", missing, 0, "--repair", "--json").stdout)
+        self.assertEqual(data["result"], -1)
+        self.assertEqual(data["stats"]["repairs"], 1)
         source = self.source("GENE main i32/1\nLOAD r1 1\n" + "DIV r0 r1\n" * 2000 + "RET r0 _\nEND _ _\n")
         for command in ("run", "interpret"):
             self.assertEqual(int(self.call(command, source, -2147483648).stdout), -2147483648)

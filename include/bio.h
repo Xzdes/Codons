@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define BIO_VERSION "0.9.0"
+#define BIO_VERSION "0.10.0"
 #define BIO_EXECUTION_LIMIT 1000000u
 #define BIO_LIST_LIMIT 65536u
 
@@ -23,11 +23,21 @@ typedef struct {
     size_t files;
     size_t code_bytes;
     size_t repairs;
+    size_t quarantines;
     unsigned arity;
     uint64_t execution_steps;
     unsigned dynamic_steps; /* execution_steps is unknown (zero) when this is nonzero. */
     uint32_t entry_offset;
 } BioStats;
+
+/* A repair is retained with the program. The returned string pointers remain
+   valid until bio_program_release(program). */
+typedef struct {
+    const char *file;
+    uint32_t line;
+    const char *kind;
+    const char *detail;
+} BioRepair;
 
 /* Optional lists for one invocation. NULL pointers mean unavailable channels.
    For an available empty input or zero-capacity output, pass a non-NULL pointer.
@@ -45,12 +55,16 @@ typedef struct {
     int output_written;
 } BioIO;
 
-/* Repair only restores an omitted unused '_' in RET/END. */
+/* With repair disabled, source is strict. With repair enabled, unambiguous
+   omitted '_' fields are restored and ambiguous codons become a safe runtime
+   quarantine. The source file is never changed. */
 BioProgram *bio_compile(const char *path, int repair, BioError *error);
 /* Load and validate without allocating executable memory. Paths are UTF-8. */
 BioProgram *bio_load(const char *path, int repair, BioError *error);
 void bio_program_release(BioProgram *program);
 BioStats bio_program_stats(const BioProgram *program);
+size_t bio_program_repair_count(const BioProgram *program);
+int bio_program_repair_at(const BioProgram *program, size_t index, BioRepair *repair);
 /* Return 1 on success; on failure return 0 and leave result unchanged.
    arguments may be NULL only when argument_count is zero.
    Each invocation has BIO_EXECUTION_LIMIT steps, shared by its nested calls.

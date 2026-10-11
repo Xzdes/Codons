@@ -1,4 +1,4 @@
-# Only the unused final fields are missing; --repair may restore them.
+# --repair can restore these unused final fields without changing the result.
 GENE main i32
 LOAD r0 42
 RET r0

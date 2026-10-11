@@ -33,7 +33,7 @@ static void usage(void) {
          "  live <file.dna>                Run and reload in one process\n"
          "  emit <file.dna> <code.bin>     Export raw machine code (not an .exe)\n"
          "\nOptions after the file: --repair, --json\n"
-         "  --repair restores only an unused '_' in RET/END\n"
+         "  --repair restores safe '_' fields and quarantines ambiguous codons\n"
          "  --json is available for new, run, test, check, interpret and emit\n"
          "  run/interpret: --input <numbers.txt> --output <result.txt>\n"
          "  Lists: one i32 per nonblank UTF-8 line; output must be a new file\n"
@@ -130,8 +130,8 @@ static int options(int argc, char **argv, Options *o, BioError *e) {
 static void stats(BioStats s, int json) {
     if (json) {
         printf("\"stats\":{\"nodes\":%zu,\"genes\":%zu,\"live_genes\":%zu,\"files\":%zu,"
-               "\"code_bytes\":%zu,\"repairs\":%zu,\"arity\":%u,\"execution_steps\":",
-               s.nodes, s.genes, s.live_genes, s.files, s.code_bytes, s.repairs, s.arity);
+               "\"code_bytes\":%zu,\"repairs\":%zu,\"quarantines\":%zu,\"arity\":%u,\"execution_steps\":",
+               s.nodes, s.genes, s.live_genes, s.files, s.code_bytes, s.repairs, s.quarantines, s.arity);
         if (s.dynamic_steps) fputs("null", stdout);
         else printf("%" PRIu64, s.execution_steps);
         printf(",\"dynamic_steps\":%s,\"execution_limit\":%u,\"entry_offset\":%u}",
@@ -140,8 +140,31 @@ static void stats(BioStats s, int json) {
         printf("Valid: inputs=%u steps=", s.arity);
         if (s.dynamic_steps) fputs("runtime", stdout);
         else printf("%" PRIu64, s.execution_steps);
-        printf(" limit=%u genes=%zu live=%zu files=%zu repairs=%zu\n",
-               BIO_EXECUTION_LIMIT, s.genes, s.live_genes, s.files, s.repairs);
+        printf(" limit=%u genes=%zu live=%zu files=%zu repairs=%zu quarantines=%zu\n",
+               BIO_EXECUTION_LIMIT, s.genes, s.live_genes, s.files, s.repairs, s.quarantines);
+    }
+}
+
+static void repair_report(const BioProgram *p, int json) {
+    size_t i, count = bio_program_repair_count(p);
+    if (!count) return;
+    if (json) {
+        fputs(",\"repair_log\":[", stdout);
+        for (i = 0; i < count; ++i) {
+            BioRepair repair;
+            if (i) fputc(',', stdout);
+            bio_program_repair_at(p, i, &repair);
+            fputs("{\"file\":", stdout); cli_json_string(repair.file);
+            printf(",\"line\":%u,\"kind\":", repair.line); cli_json_string(repair.kind);
+            fputs(",\"detail\":", stdout); cli_json_string(repair.detail); fputc('}', stdout);
+        }
+        fputc(']', stdout);
+    } else {
+        for (i = 0; i < count; ++i) {
+            BioRepair repair;
+            bio_program_repair_at(p, i, &repair);
+            fprintf(stderr, "repair: %s:%u: %s: %s\n", repair.file, repair.line, repair.kind, repair.detail);
+        }
     }
 }
 
@@ -234,7 +257,7 @@ static int cli(int argc, char **argv) {
     else p = bio_compile(o.path, o.repair, &e);
     if (!p) return failure(o.json, "compile", e.message, 1);
     s = bio_program_stats(p);
-    if (s.repairs && !o.json) fprintf(stderr, "repair: restored %zu unused '_' fields\n", s.repairs);
+    if (s.repairs && !o.json) repair_report(p, 0);
     if (is_run || is_interpret) {
         int32_t result;
         if (o.argument_count != s.arity) {
@@ -270,19 +293,20 @@ static int cli(int argc, char **argv) {
                     fputs(",\"output\":", stdout); cli_json_string(o.output_list);
                     printf(",\"output_count\":%zu", io.output_count);
                 }
+                repair_report(p, 1);
                 puts("}");
             } else printf("%" PRId32 "\n", result);
             free(input); free(output);
         }
     } else if (!strcmp(o.command, "check")) {
-        if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); puts("}"); }
+        if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); repair_report(p, 1); puts("}"); }
         else stats(s, 0);
     } else if (!strcmp(o.command, "test")) code = cli_test(p, o.output, o.json);
     else if (!strcmp(o.command, "dump")) bio_program_dump(p, stdout);
     else if (!strcmp(o.command, "live")) return live(p, o.repair, &e);
     else if (!strcmp(o.command, "emit")) {
         if (!bio_program_write_code(p, o.output, &e)) code = failure(o.json, "file", e.message, 1);
-        else if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); puts("}"); }
+        else if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); repair_report(p, 1); puts("}"); }
         else printf("Wrote %zu bytes; main offset=%u. Raw x64 code, not a standalone .exe.\n", s.code_bytes, s.entry_offset);
     }
     bio_program_release(p);

@@ -93,6 +93,15 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
     CodonNode location = {0};
     int status;
 #define FAIL(...) do { bio_node_error(p, &location, e, __VA_ARGS__); goto fail; } while (0)
+#define QUARANTINE(...) do { \
+    if (repair && current && n) { \
+        char repair_detail[384]; \
+        snprintf(repair_detail, sizeof(repair_detail), __VA_ARGS__); \
+        if (!bio_quarantine(p, n, repair_detail, e)) goto fail; \
+        continue; \
+    } \
+    FAIL(__VA_ARGS__); \
+} while (0)
     if (depth > BIO_IMPORT_DEPTH) {
         bio_error(e, "apoptosis: import depth exceeded (%u)", BIO_IMPORT_DEPTH); return 0;
     }
@@ -134,11 +143,25 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         }
         if (!count) continue;
         if (repair && count == 2 &&
-            (strcmp(fields[0], "RET") == 0 || strcmp(fields[0], "END") == 0)) {
+            (strcmp(fields[0], "RET") == 0 || strcmp(fields[0], "END") == 0 ||
+             strcmp(fields[0], "NOT") == 0 || strcmp(fields[0], "LNOT") == 0 ||
+             strcmp(fields[0], "LABEL") == 0 || strcmp(fields[0], "JMP") == 0 ||
+             strcmp(fields[0], "IMPORT") == 0)) {
             fields[count++] = "_";
-            p->stats.repairs++;
+            if (!bio_record_repair(p, &location, "fill", "inserted an unused '_' third field", e)) goto fail;
         }
-        if (count != 3) FAIL("expected exactly 3 fields; found %u", count);
+        if (count != 3) {
+            if (repair && current) {
+                previous = current->tail;
+                n = bio_node_new(p, e);
+                if (!n) goto fail;
+                n->file = index; n->line = location.line;
+                previous->next = n; current->tail = n;
+                if (!bio_quarantine(p, n, "codon does not contain exactly three fields", e)) goto fail;
+                continue;
+            }
+            FAIL("expected exactly 3 fields; found %u", count);
+        }
         if (strcmp(fields[0], "IMPORT") == 0) {
             if (current || strcmp(fields[2], "_") != 0)
                 FAIL("IMPORT requires '<path> _' outside a GENE");
@@ -168,7 +191,14 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (strcmp(fields[0], "END") == 0) {
             if (!current || strcmp(fields[1], "_") || strcmp(fields[2], "_"))
                 FAIL("END requires '_ _' inside a GENE");
-            if (current->head == current->tail) FAIL("empty gene; add a body before END");
+            if (current->head == current->tail) {
+                if (!repair) FAIL("empty gene; add a body before END");
+                n = bio_node_new(p, e);
+                if (!n) goto fail;
+                n->file = index; n->line = location.line;
+                current->tail->next = n; current->tail = n;
+                if (!bio_quarantine(p, n, "empty gene body", e)) goto fail;
+            }
             current = NULL;
             continue;
         }
@@ -180,6 +210,12 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (!n) goto fail;
         n->file = index; n->line = location.line;
         current->tail->next = n; current->tail = n;
+        if (!strcmp(fields[0], "QUARANTINE")) {
+            if (strcmp(fields[1], "_") || strcmp(fields[2], "_"))
+                QUARANTINE("QUARANTINE requires '_ _'");
+            if (!bio_quarantine(p, n, "explicit quarantine codon", e)) goto fail;
+            continue;
+        }
         if (!strcmp(fields[0], "VAR") || !strcmp(fields[0], "ARRAY") || !strcmp(fields[0], "PARAM")) {
             char *end;
             long long value;
@@ -188,30 +224,30 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             BioLocal *local;
             if (previous->op_code != OP_GENE && previous->op_code != OP_VAR &&
                 previous->op_code != OP_ARRAY && previous->op_code != OP_PARAM)
-                FAIL("VAR, ARRAY and PARAM declarations must precede all instructions and labels");
+                QUARANTINE("VAR, ARRAY and PARAM declarations must precede all instructions and labels");
             if (!identifier(fields[1]) || reg(fields[1]) >= 0 || !strcmp(fields[1], "_"))
-                FAIL("invalid local name: use an identifier other than r0..r7 or _");
+                QUARANTINE("invalid local name: use an identifier other than r0..r7 or _");
             if (parameter) {
-                if (strcmp(fields[2], "r0")) FAIL("PARAM requires '<name> r0'; r0 is the array length");
-                if (!strcmp(current->name, "main")) FAIL("main cannot declare PARAM; use ARRAY and READ");
-                if (!current->arity) FAIL("PARAM requires i32/1 or i32/2; r0 supplies the array length");
-                if (current->has_array) FAIL("only one PARAM array is allowed per gene");
+                if (strcmp(fields[2], "r0")) QUARANTINE("PARAM requires '<name> r0'; r0 is the array length");
+                if (!strcmp(current->name, "main")) QUARANTINE("main cannot declare PARAM");
+                if (!current->arity) QUARANTINE("PARAM requires i32/1 or i32/2; r0 supplies the array length");
+                if (current->has_array) QUARANTINE("only one PARAM array is allowed per gene");
                 value = 0;
             } else {
                 errno = 0;
                 value = strtoll(fields[2], &end, 10);
                 if (errno || *end || end == fields[2] || value < INT32_MIN || value > INT32_MAX)
-                    FAIL("%s requires a decimal i32 literal", fields[0]);
+                    QUARANTINE("%s requires a decimal i32 literal", fields[0]);
                 if (is_array && (value < 1 || value > BIO_MAX_LOCAL_CELLS))
-                    FAIL("ARRAY length must be in 1..%u", BIO_MAX_LOCAL_CELLS);
+                    QUARANTINE("ARRAY length must be in 1..%u", BIO_MAX_LOCAL_CELLS);
             }
             sym = symbol(p, fields[1]);
-            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            if (sym < 0) QUARANTINE("symbol budget exceeded");
             for (i = 0; i < current->local_count; ++i)
-                if (current->locals[i].symbol == (uint32_t)sym) FAIL("duplicate local: %s", fields[1]);
-            if (current->local_count == BIO_MAX_LOCALS) FAIL("local declaration limit exceeded (%u)", BIO_MAX_LOCALS);
+                if (current->locals[i].symbol == (uint32_t)sym) QUARANTINE("duplicate local declaration");
+            if (current->local_count == BIO_MAX_LOCALS) QUARANTINE("local declaration limit exceeded");
             if (current->local_cells + (is_array ? (uint32_t)value : 1u) > BIO_MAX_LOCAL_CELLS)
-                FAIL("local storage limit exceeded (%u i32 cells per gene)", BIO_MAX_LOCAL_CELLS);
+                QUARANTINE("local storage limit exceeded");
             local = &current->locals[current->local_count++];
             local->symbol = (uint32_t)sym; local->offset = current->local_cells;
             local->count = is_array ? (uint32_t)value : 1u;
@@ -227,9 +263,9 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (!strcmp(fields[0], "READ") || !strcmp(fields[0], "WRITE")) {
             int sym;
             a = reg(fields[2]);
-            if (!identifier(fields[1]) || a < 0) FAIL("%s requires '<array> rN' (r0..r7)", fields[0]);
+            if (!identifier(fields[1]) || a < 0) QUARANTINE("%s requires '<array> rN' (r0..r7)", fields[0]);
             sym = symbol(p, fields[1]);
-            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            if (sym < 0) QUARANTINE("symbol budget exceeded");
             n->op_code = !strcmp(fields[0], "READ") ? OP_READ : OP_WRITE;
             n->arg1 = (uint32_t)sym; n->arg2 = (uint32_t)a;
             continue;
@@ -242,15 +278,15 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             char *comma = array ? strchr(fields[2], ',') : NULL;
             a = b = -1;
             if (array) {
-                if (!comma) FAIL("%s requires a comma-separated third field", fields[0]);
+                if (!comma) QUARANTINE("%s requires a comma-separated third field", fields[0]);
                 *comma++ = '\0';
                 b = reg(comma);
             }
             a = reg(store ? fields[2] : fields[1]);
             if (a < 0 || (array && b < 0) || !identifier(local_name))
-                FAIL("invalid %s operands: use a local name and registers r0..r7", fields[0]);
+                QUARANTINE("invalid %s operands: use a local name and registers r0..r7", fields[0]);
             sym = symbol(p, local_name);
-            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            if (sym < 0) QUARANTINE("symbol budget exceeded");
             if (store) {
                 n->op_code = array ? OP_ASET : OP_SET;
                 n->arg1 = (uint32_t)sym;
@@ -265,9 +301,9 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (!strcmp(fields[0], "LABEL") || !strcmp(fields[0], "JMP")) {
             int sym;
             if (!identifier(fields[1]) || strcmp(fields[2], "_"))
-                FAIL("LABEL and JMP require '<name> _'");
+                QUARANTINE("LABEL and JMP require '<name> _'");
             sym = symbol(p, fields[1]);
-            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            if (sym < 0) QUARANTINE("symbol budget exceeded");
             n->op_code = !strcmp(fields[0], "LABEL") ? OP_LABEL : OP_JMP;
             n->arg1 = (uint32_t)sym;
             continue;
@@ -275,9 +311,9 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (!strcmp(fields[0], "JZ") || !strcmp(fields[0], "JNZ")) {
             int sym;
             a = reg(fields[1]);
-            if (a < 0 || !identifier(fields[2])) FAIL("JZ and JNZ require 'rN <label>'");
+            if (a < 0 || !identifier(fields[2])) QUARANTINE("JZ and JNZ require 'rN <label>'");
             sym = symbol(p, fields[2]);
-            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            if (sym < 0) QUARANTINE("symbol budget exceeded");
             n->op_code = !strcmp(fields[0], "JZ") ? OP_JZ : OP_JNZ;
             n->arg1 = (uint32_t)a; n->arg2 = (uint32_t)sym;
             continue;
@@ -286,9 +322,9 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             char *comma, *arguments = fields[2];
             unsigned argc = 0;
             int sym;
-            if (!identifier(fields[1])) FAIL("invalid callee identifier");
+            if (!identifier(fields[1])) QUARANTINE("invalid CALL target name");
             sym = symbol(p, fields[1]);
-            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            if (sym < 0) QUARANTINE("symbol budget exceeded");
             a = b = 0;
             if (strcmp(arguments, "_") != 0) {
                 comma = strchr(arguments, ',');
@@ -296,9 +332,9 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
                 if (reg(arguments) < 0) {
                     int array_symbol;
                     if (!identifier(arguments) || !strcmp(arguments, "_") || !comma)
-                        FAIL("CALL operands must be _, rN, rN,rM or array,rN[,rM] (r0..r7)");
+                        QUARANTINE("invalid CALL operands");
                     array_symbol = symbol(p, arguments);
-                    if (array_symbol < 0) FAIL("apoptosis: symbol budget exceeded");
+                    if (array_symbol < 0) QUARANTINE("symbol budget exceeded");
                     n->call_array = (uint32_t)array_symbol + 1u;
                     arguments = comma + 1;
                     comma = strchr(arguments, ',');
@@ -307,14 +343,14 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
                     *comma++ = '\0'; b = reg(comma); argc = 2;
                 } else argc = 1;
                 a = reg(arguments);
-                if (a < 0 || b < 0) FAIL("CALL operands must be _, rN, rN,rM or array,rN[,rM] (r0..r7)");
+                if (a < 0 || b < 0) QUARANTINE("invalid CALL operands");
             }
             n->op_code = OP_CALL; n->arg1 = (uint32_t)sym;
             n->arg2 = (argc << 16) | ((unsigned)b << 8) | (unsigned)a;
             continue;
         }
         a = reg(fields[1]);
-        if (a < 0) FAIL("first operand must be r0..r7");
+        if (a < 0) QUARANTINE("first operand must be r0..r7");
         n->arg1 = (uint32_t)a;
         if (strcmp(fields[0], "LOAD") == 0) {
             char *end;
@@ -322,17 +358,17 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             errno = 0;
             value = strtoll(fields[2], &end, 10);
             if (errno || *end || end == fields[2] || value < INT32_MIN || value > INT32_MAX)
-                FAIL("LOAD requires a decimal i32 literal");
+                QUARANTINE("LOAD requires a decimal i32 literal");
             n->op_code = OP_LOAD; n->arg2 = (uint32_t)value;
         } else if (strcmp(fields[0], "RET") == 0) {
-            if (strcmp(fields[2], "_") != 0) FAIL("RET requires an unused '_' third field");
+            if (strcmp(fields[2], "_") != 0) QUARANTINE("RET requires an unused '_' third field");
             n->op_code = OP_RET;
         } else if (!strcmp(fields[0], "NOT") || !strcmp(fields[0], "LNOT")) {
-            if (strcmp(fields[2], "_")) FAIL("NOT and LNOT require an unused '_' third field");
+            if (strcmp(fields[2], "_")) QUARANTINE("NOT/LNOT requires an unused '_' third field");
             n->op_code = !strcmp(fields[0], "NOT") ? OP_NOT : OP_LNOT;
         } else {
             b = reg(fields[2]);
-            if (b < 0) FAIL("second operand must be r0..r7");
+            if (b < 0) QUARANTINE("second operand must be a register");
             n->arg2 = (uint32_t)b;
             if (strcmp(fields[0], "MOV") == 0) n->op_code = OP_MOV;
             else if (strcmp(fields[0], "ADD") == 0) n->op_code = OP_ADD;
@@ -353,7 +389,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             else if (strcmp(fields[0], "SHL") == 0) n->op_code = OP_SHL;
             else if (strcmp(fields[0], "SHR") == 0) n->op_code = OP_SHR;
             else if (strcmp(fields[0], "SAR") == 0) n->op_code = OP_SAR;
-            else FAIL("unknown opcode: %s", fields[0]);
+            else QUARANTINE("unknown opcode: %s", fields[0]);
         }
     }
     if (status < 0) {
@@ -362,7 +398,21 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         location.line++;
         FAIL("%s", detail);
     }
-    if (current) FAIL("missing END _ _ at end of file");
+    if (current) {
+        CodonNode end_site = {0};
+        CodonNode *missing;
+        if (!repair) FAIL("missing END _ _ at end of file");
+        end_site.file = index; end_site.line = location.line + 1u;
+        if (!bio_record_repair(p, &end_site, "close", "closed a gene at end of file", e)) goto fail;
+        if (current->head == current->tail) {
+            missing = bio_node_new(p, e);
+            if (!missing) goto fail;
+            missing->file = index; missing->line = end_site.line;
+            current->tail->next = missing; current->tail = missing;
+            if (!bio_quarantine(p, missing, "empty gene body", e)) goto fail;
+        }
+        current = NULL;
+    }
     fclose(f);
     p->files[index].state = 2;
     return 1;
@@ -370,6 +420,7 @@ fail:
     fclose(f);
     return 0;
 #undef FAIL
+#undef QUARANTINE
 }
 
 int bio_parse(BioProgram *p, const char *path, int repair, BioError *e) {

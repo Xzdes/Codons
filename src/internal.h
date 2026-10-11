@@ -12,6 +12,7 @@
 #define BIO_MAX_SYMBOLS 512u
 #define BIO_MAX_FILES 64u
 #define BIO_MAX_NODES 65536u
+#define BIO_MAX_REPAIRS 1024u
 #define BIO_MAX_DEPTH 64u
 #define BIO_IMPORT_DEPTH 16u
 #define BIO_LINE_SIZE 512u
@@ -29,7 +30,8 @@ typedef enum {
     OP_EQ, OP_LT, OP_MIN, OP_MAX, OP_LABEL, OP_JMP, OP_JZ, OP_JNZ,
     OP_DIV, OP_MOD, OP_AND, OP_OR, OP_XOR, OP_NOT,
     OP_LAND, OP_LOR, OP_LXOR, OP_LNOT, OP_SHL, OP_SHR, OP_SAR,
-    OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN, OP_READ, OP_WRITE, OP_PARAM
+    OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN, OP_READ, OP_WRITE, OP_PARAM,
+    OP_QUARANTINE
 } BioOp;
 
 typedef struct CodonNode {
@@ -93,8 +95,15 @@ typedef enum {
     BIO_FAULT_NONE, BIO_FAULT_BUDGET, BIO_FAULT_DIV_ZERO,
     BIO_FAULT_DIV_OVERFLOW, BIO_FAULT_SHIFT, BIO_FAULT_BOUNDS,
     BIO_FAULT_INPUT, BIO_FAULT_OUTPUT, BIO_FAULT_READ_SIZE,
-    BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE, BIO_FAULT_ARGUMENT_SIZE
+    BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE, BIO_FAULT_ARGUMENT_SIZE, BIO_FAULT_QUARANTINE
 } BioFault;
+
+typedef struct {
+    uint32_t file;
+    uint32_t line;
+    char kind[24];
+    char detail[128];
+} BioRepairEntry;
 
 typedef struct {
     uint64_t remaining;
@@ -133,7 +142,10 @@ struct BioProgram {
     unsigned file_count;
     unsigned symbol_count;
     unsigned main_gene;
+    unsigned repair_mode;
     size_t source_bytes;
+    size_t repair_count;
+    BioRepairEntry repair_log[BIO_MAX_REPAIRS];
     BioStats stats;
     unsigned char *code;
     size_t allocation_size;
@@ -143,6 +155,8 @@ struct BioProgram {
 
 void bio_error(BioError *error, const char *format, ...);
 void bio_node_error(const BioProgram *p, const CodonNode *n, BioError *e, const char *format, ...);
+int bio_record_repair(BioProgram *p, const CodonNode *n, const char *kind, const char *detail, BioError *e);
+int bio_quarantine(BioProgram *p, CodonNode *n, const char *detail, BioError *e);
 CodonNode *bio_node_new(BioProgram *p, BioError *e);
 void bio_program_retain(BioProgram *p);
 int bio_parse(BioProgram *p, const char *path, int repair, BioError *e);

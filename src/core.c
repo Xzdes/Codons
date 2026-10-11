@@ -31,6 +31,30 @@ void bio_node_error(const BioProgram *p, const CodonNode *n, BioError *e, const 
     bio_error(e, "%s:%u: %s", p->files[n->file].path, n->line, detail);
 }
 
+int bio_record_repair(BioProgram *p, const CodonNode *n, const char *kind, const char *detail, BioError *e) {
+    BioRepairEntry *record;
+    if (p->repair_count == BIO_MAX_REPAIRS) {
+        bio_node_error(p, n, e, "apoptosis: repair log exceeded %u entries", BIO_MAX_REPAIRS);
+        return 0;
+    }
+    record = &p->repair_log[p->repair_count++];
+    record->file = n->file;
+    record->line = n->line;
+    snprintf(record->kind, sizeof(record->kind), "%s", kind);
+    snprintf(record->detail, sizeof(record->detail), "%s", detail);
+    ++p->stats.repairs;
+    if (!strcmp(kind, "quarantine")) ++p->stats.quarantines;
+    return 1;
+}
+
+int bio_quarantine(BioProgram *p, CodonNode *n, const char *detail, BioError *e) {
+    if (!bio_record_repair(p, n, "quarantine", detail, e)) return 0;
+    n->op_code = OP_QUARANTINE;
+    n->arg1 = n->arg2 = n->call_array = 0;
+    n->bond = NULL;
+    return 1;
+}
+
 CodonNode *bio_node_new(BioProgram *p, BioError *e) {
     CodonNode *n;
     if (p->stats.nodes == BIO_MAX_NODES) {
@@ -79,6 +103,7 @@ BioProgram *bio_load(const char *path, int repair, BioError *e) {
     if (e) e->message[0] = '\0';
     if (!p) { bio_error(e, "out of memory allocating program"); return NULL; }
     p->references = 1;
+    p->repair_mode = repair ? 1u : 0u;
     if (!path || !bio_parse(p, path, repair, e) || !bio_analyze(p, e)) {
         if (!path) bio_error(e, "source path is required");
         bio_program_release(p);
@@ -94,6 +119,19 @@ BioProgram *bio_compile(const char *path, int repair, BioError *e) {
 }
 
 BioStats bio_program_stats(const BioProgram *p) { return p->stats; }
+
+size_t bio_program_repair_count(const BioProgram *p) { return p ? p->repair_count : 0; }
+
+int bio_program_repair_at(const BioProgram *p, size_t index, BioRepair *repair) {
+    const BioRepairEntry *entry;
+    if (!p || !repair || index >= p->repair_count) return 0;
+    entry = &p->repair_log[index];
+    repair->file = p->files[entry->file].path;
+    repair->line = entry->line;
+    repair->kind = entry->kind;
+    repair->detail = entry->detail;
+    return 1;
+}
 
 int bio_find_gene(const BioProgram *p, const char *name) {
     unsigned i;
@@ -151,6 +189,8 @@ static int execution_ok(const BioProgram *p, const BioExecution *execution, BioE
         snprintf(detail, sizeof(detail), "CALL array length %ld out of bounds: expected 0..%u",
                  (long)execution->bad_index, execution->bound);
         message = detail; break;
+    case BIO_FAULT_QUARANTINE:
+        message = "quarantined repaired codon reached; inspect the repair report"; break;
     default: message = "unknown execution error"; break;
     }
     for (block = p->arena; block; block = block->next) {
@@ -303,6 +343,7 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, u
             break;
         }
         case OP_RET: return r[n->arg1];
+        case OP_QUARANTINE: return interpreter_fault(execution, n, BIO_FAULT_QUARANTINE);
         case OP_JMP: next = n->bond; break;
         case OP_JZ: if (!r[n->arg1]) next = n->bond; break;
         case OP_JNZ: if (r[n->arg1]) next = n->bond; break;
@@ -387,7 +428,7 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
         "GENE", "LOAD", "MOV", "ADD", "SUB", "MUL", "CALL", "RET", "EQ", "LT", "MIN", "MAX",
         "LABEL", "JMP", "JZ", "JNZ", "DIV", "MOD", "AND", "OR", "XOR", "NOT",
         "LAND", "LOR", "LXOR", "LNOT", "SHL", "SHR", "SAR",
-        "VAR", "ARRAY", "GET", "SET", "AGET", "ASET", "LEN", "READ", "WRITE", "PARAM"
+        "VAR", "ARRAY", "GET", "SET", "AGET", "ASET", "LEN", "READ", "WRITE", "PARAM", "QUARANTINE"
     };
     unsigned i;
     for (i = 0; i < p->gene_count; ++i) {
@@ -395,7 +436,9 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
         const CodonNode *n;
         fprintf(out, "GENE %s i32/%u # %s\n", g->name, g->arity, g->live ? "live" : "pruned");
         for (n = g->head->next; n; n = n->next) {
-            if (n->op_code == OP_CALL) {
+            if (n->op_code == OP_QUARANTINE)
+                fputs("QUARANTINE _ _", out);
+            else if (n->op_code == OP_CALL) {
                 unsigned argc = n->arg2 >> 16;
                 fprintf(out, "CALL %s ", p->genes[n->arg1].name);
                 if (n->call_array) fprintf(out, "%s,", p->symbols[g->locals[n->call_array - 1u].symbol]);
