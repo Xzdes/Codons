@@ -1,0 +1,24 @@
+# Fill 16 cells with start + index * step, then sum them in reverse order.
+GENE main i32/2
+ARRAY items 16
+VAR total 0
+LOAD r2 0
+LOAD r3 1
+LEN r4 items
+LABEL fill _
+ASET items r2,r0
+ADD r0 r1
+ADD r2 r3
+MOV r5 r2
+LT r5 r4
+JNZ r5 fill
+LABEL sum _
+SUB r2 r3
+AGET r5 items,r2
+GET r6 total
+ADD r6 r5
+SET total r6
+JNZ r2 sum
+GET r0 total
+RET r0 _
+END _ _

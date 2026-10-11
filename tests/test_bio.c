@@ -57,7 +57,7 @@ static void expect_value(const char *source, int32_t expected) {
     DWORD64 base = 0;
     PRUNTIME_FUNCTION table;
     CONTEXT context = {0};
-    DWORD64 fake_stack[10] = {0};
+    DWORD64 fake_stack[BIO_STACK_SIZE / 8u + 1u] = {0};
     DWORD64 frame = 0;
     PVOID handler_data = NULL;
     write_source("case.dna", source);
@@ -72,15 +72,15 @@ static void expect_value(const char *source, int32_t expected) {
     REQUIRE(table != NULL);
     REQUIRE(base == (DWORD64)(uintptr_t)p->code);
     REQUIRE(table->BeginAddress == p->genes[p->main_gene].code_offset);
-    /* Exercise Windows' actual unwinder after the JIT's 72-byte prolog. */
-    fake_stack[9] = 0x12345678u;
+    /* Exercise Windows' actual unwinder after the JIT's stack allocation. */
+    fake_stack[BIO_STACK_SIZE / 8u] = 0x12345678u;
     context.ContextFlags = CONTEXT_FULL;
     context.Rip = base + table->BeginAddress + 4;
     context.Rsp = (DWORD64)(uintptr_t)fake_stack;
     RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, context.Rip, table, &context,
                      &handler_data, &frame, NULL);
-    REQUIRE(context.Rip == fake_stack[9]);
-    REQUIRE(context.Rsp == (DWORD64)(uintptr_t)fake_stack + 80);
+    REQUIRE(context.Rip == fake_stack[BIO_STACK_SIZE / 8u]);
+    REQUIRE(context.Rsp == (DWORD64)(uintptr_t)fake_stack + sizeof(fake_stack));
     bio_program_release(p);
 }
 
@@ -129,6 +129,288 @@ static void language_tests(void) {
     expect_error("GENE main i32\nCALL f r0,r1,r2\n", "CALL operands");
     expect_error("GENE main i32\nMOV r0 r1\nRET r0 _\nEND _ _\n", "uninitialized register");
     expect_error("GENE main i32\nIMPORT f.dna _\n", "outside a GENE");
+}
+
+static void arithmetic_slot_tests(void) {
+    static const struct { const char *name; int unary; int32_t separate, alias; } ops[] = {
+        {"DIV", 0, 7, 1}, {"MOD", 0, 0, 0}, {"AND", 0, 1, 3},
+        {"OR", 0, 23, 3}, {"XOR", 0, 22, 0}, {"NOT", 1, -22, -22},
+        {"LAND", 0, 1, 1}, {"LOR", 0, 1, 1}, {"LXOR", 0, 0, 0},
+        {"LNOT", 1, 0, 0}, {"SHL", 0, 168, 24}, {"SHR", 0, 2, 0}, {"SAR", 0, 2, 0}
+    };
+    unsigned op, dst, src;
+    char text[512];
+    BioError e = {{0}};
+    for (op = 0; op < sizeof(ops) / sizeof(ops[0]); ++op) {
+        for (dst = 0; dst < 8; ++dst) for (src = 0; src < (ops[op].unary ? 1u : 8u); ++src) {
+            BioProgram *p;
+            int32_t expected = ops[op].separate;
+            if (ops[op].unary)
+                snprintf(text, sizeof(text), "GENE main i32\nLOAD r%u 21\n%s r%u _\nRET r%u _\nEND _ _\n",
+                         dst, ops[op].name, dst, dst);
+            else {
+                snprintf(text, sizeof(text), "GENE main i32\nLOAD r%u 21\nLOAD r%u 3\n%s r%u r%u\nRET r%u _\nEND _ _\n",
+                         dst, src, ops[op].name, dst, src, dst);
+                if (dst == src) expected = ops[op].alias;
+            }
+            write_source("arithmetic.dna", text);
+            p = compile_name("arithmetic.dna", 0, &e); REQUIRE(p != NULL);
+            REQUIRE(run0(p) == expected);
+            REQUIRE(interpret0(p) == expected);
+            bio_program_release(p);
+        }
+        if (ops[op].unary)
+            snprintf(text, sizeof(text), "GENE main i32\n%s r7 _\nRET r7 _\nEND _ _\n", ops[op].name);
+        else
+            snprintf(text, sizeof(text), "GENE main i32/1\n%s r0 r7\nRET r0 _\nEND _ _\n", ops[op].name);
+        expect_error(text, "uninitialized register");
+    }
+    expect_error("GENE main i32/1\nNOT r0 r1\nRET r0 _\nEND _ _\n", "unused '_'");
+    expect_error("GENE main i32/1\nLNOT r0\nRET r0 _\nEND _ _\n", "exactly 3 fields");
+    expect_error("GENE main i32/1\nDIV r0 3\nRET r0 _\nEND _ _\n", "second operand");
+    expect_error("GENE main i32/1\nSHR r0 _\nRET r0 _\nEND _ _\n", "second operand");
+}
+
+static void expect_run_error(BioProgram *p, const int32_t *args, size_t argc, const char *message) {
+    BioError native = {{0}}, interpreted = {{0}};
+    int32_t result = 9876;
+    REQUIRE(!bio_program_run(p, args, argc, &result, &native));
+    REQUIRE(result == 9876);
+    REQUIRE(!bio_program_interpret(p, args, argc, &result, &interpreted));
+    REQUIRE(result == 9876);
+    REQUIRE(strstr(native.message, message) != NULL);
+    REQUIRE(!strcmp(native.message, interpreted.message));
+}
+
+typedef struct { BioProgram *program; volatile LONG failures; } ArithmeticWorkers;
+
+static DWORD WINAPI arithmetic_reader(LPVOID arg) {
+    ArithmeticWorkers *workers = arg;
+    unsigned i;
+    for (i = 0; i < 120; ++i) {
+        int32_t args[2] = {i % 3 == 0 ? INT32_MIN : 12, i % 3 == 0 ? -1 : i % 3 == 1 ? 0 : 3};
+        int32_t result = 99;
+        BioError e = {{0}};
+        int ok = bio_program_run(workers->program, args, 2, &result, &e);
+        if (i % 3 == 2 ? (!ok || result != 4 || *e.message) :
+            (ok || result != 99 || !strstr(e.message, i % 3 == 0 ? "division overflow" : "division by zero")))
+            InterlockedIncrement(&workers->failures);
+    }
+    return 0;
+}
+
+static void arithmetic_error_tests(void) {
+    const char *ops[] = {"DIV", "MOD", "SHL", "SHR", "SAR"};
+    BioError e = {{0}};
+    BioProgram *p;
+    char source[768];
+    int32_t args[2], result;
+    unsigned i;
+    for (i = 0; i < 5; ++i) {
+        snprintf(source, sizeof(source), "GENE main i32/2\nCALL middle r0,r1\nRET r0 _\nEND _ _\n"
+                 "GENE middle i32/2\nCALL work r0,r1\nRET r0 _\nEND _ _\n"
+                 "GENE work i32/2\n%s r0 r1\nRET r0 _\nEND _ _\n", ops[i]);
+        write_source("fault.dna", source);
+        p = compile_name("fault.dna", 0, &e); REQUIRE(p != NULL);
+        args[0] = 8; args[1] = i < 2 ? 0 : 32;
+        expect_run_error(p, args, 2, i < 2 ? "division by zero" : "shift count must be in 0..31");
+        if (i == 0) { args[0] = INT32_MIN; args[1] = -1; expect_run_error(p, args, 2, "division overflow"); }
+        if (i >= 2) { args[1] = -1; expect_run_error(p, args, 2, "shift count"); }
+        args[0] = 8; args[1] = 2;
+        REQUIRE(bio_program_run(p, args, 2, &result, &e));
+        REQUIRE(result == (i == 0 ? 4 : i == 1 ? 0 : i == 2 ? 32 : 2));
+        REQUIRE(!*e.message);
+        REQUIRE(bio_program_interpret(p, args, 2, &result, &e));
+        REQUIRE(!*e.message);
+        bio_program_release(p);
+    }
+    /* A spent budget takes precedence: DIV must not execute at all. */
+    write_source("fault.dna", "GENE main i32/1\nLOAD r1 1\nLABEL loop _\nSUB r0 r1\nJNZ r0 loop\n"
+                 "LOAD r2 0\nDIV r0 r2\nRET r0 _\nEND _ _\n");
+    p = compile_name("fault.dna", 0, &e); REQUIRE(p != NULL);
+    args[0] = 499999; expect_run_error(p, args, 1, "execution budget exhausted");
+    args[0] = 2; expect_run_error(p, args, 1, "division by zero");
+    bio_program_release(p);
+    {
+        ArithmeticWorkers workers = {0};
+        HANDLE threads[4];
+        write_source("fault.dna", "GENE main i32/2\nDIV r0 r1\nRET r0 _\nEND _ _\n");
+        workers.program = compile_name("fault.dna", 0, &e); REQUIRE(workers.program != NULL);
+        for (i = 0; i < 4; ++i) { threads[i] = CreateThread(NULL, 0, arithmetic_reader, &workers, 0, NULL); REQUIRE(threads[i] != NULL); }
+        REQUIRE(WaitForMultipleObjects(4, threads, TRUE, 10000) == WAIT_OBJECT_0);
+        for (i = 0; i < 4; ++i) CloseHandle(threads[i]);
+        REQUIRE(workers.failures == 0);
+        bio_program_release(workers.program);
+    }
+}
+
+static void memory_slot_tests(void) {
+    unsigned index, value, dst;
+    char source[768];
+    for (index = 0; index < 8; ++index) for (value = 0; value < 8; ++value) for (dst = 0; dst < 8; ++dst) {
+        /* Exercise SIB addressing with all register aliases and a nonzero local offset. */
+        snprintf(source, sizeof(source), "GENE main i32\nVAR before 99\nARRAY items 8\nVAR after 77\n"
+                 "LOAD r%u 5\nLOAD r%u 3\nASET items r%u,r%u\nAGET r%u items,r%u\nRET r%u _\nEND _ _\n",
+                 value, index, index, value, dst, index, dst);
+        expect_value(source, index == value ? 3 : 5);
+    }
+    for (dst = 0; dst < 8; ++dst) {
+        snprintf(source, sizeof(source), "GENE main i32\nVAR x -2147483648\nARRAY items 17\nVAR y 0\n"
+                 "GET r%u x\nSET y r%u\nLEN r%u items\nGET r%u y\nRET r%u _\nEND _ _\n", dst, dst, dst, dst, dst);
+        expect_value(source, INT32_MIN);
+        snprintf(source, sizeof(source), "GENE main i32\nARRAY items 17\nLEN r%u items\nRET r%u _\nEND _ _\n", dst, dst);
+        expect_value(source, 17);
+    }
+    expect_value("GENE main i32\nVAR before 99\nARRAY a 2\nARRAY b 2\nVAR after 77\n"
+                 "LOAD r1 1\nLOAD r2 -1\nASET a r1,r2\nLOAD r1 0\nAGET r0 b,r1\n"
+                 "GET r3 before\nADD r0 r3\nGET r3 after\nADD r0 r3\nRET r0 _\nEND _ _\n", 176);
+    expect_value("GENE main i32\nARRAY items 65536\nLOAD r7 65535\nLOAD r6 2147483647\n"
+                 "ASET items r7,r6\nAGET r7 items,r7\nRET r7 _\nEND _ _\n", INT32_MAX);
+}
+
+static void memory_error_tests(void) {
+    static const struct { const char *body, *message; } invalid[] = {
+        {"VAR x 0\nVAR x 1\n", "duplicate local"}, {"VAR x 0\nARRAY x 2\n", "duplicate local"},
+        {"ARRAY a 0\n", "length must be"}, {"ARRAY a -1\n", "length must be"},
+        {"ARRAY a 65537\n", "length must be"}, {"ARRAY a r0\n", "i32 literal"},
+        {"VAR x 2147483648\n", "i32 literal"}, {"VAR x -2147483649\n", "i32 literal"},
+        {"VAR r0 0\n", "invalid local name"}, {"VAR _ 0\n", "invalid local name"},
+        {"VAR 2x 0\n", "invalid local name"}, {"LOAD r0 0\nVAR x 0\n", "must precede"},
+        {"LABEL here _\nARRAY a 1\n", "must precede"}, {"VAR x\n", "exactly 3 fields"},
+        {"GET r0 missing\n", "undefined local"}, {"ARRAY a 1\nGET r0 a\n", "requires a variable"},
+        {"ARRAY a 1\nSET a r0\n", "requires a variable"},
+        {"VAR x 0\nLEN r0 x\n", "requires an array"}, {"VAR x 0\nAGET r0 x,r0\n", "requires an array"},
+        {"VAR x 0\nASET x r0,r0\n", "requires an array"},
+        {"ARRAY a 1\nAGET r0 a,r8\n", "invalid AGET operands"},
+        {"ARRAY a 1\nASET a r0,r1,r2\n", "invalid ASET operands"},
+        {"ARRAY a 1\nAGET r0 a\n", "comma-separated"},
+        {"ARRAY a 1\nASET a r0, r1\n", "exactly 3 fields"},
+        {"VAR x 0\nSET x r7\n", "uninitialized register r7"},
+        {"ARRAY a 1\nAGET r7 a,r7\n", "uninitialized register r7"},
+        {"ARRAY a 1\nLOAD r0 0\nASET a r0,r7\n", "uninitialized register r7"},
+        {"ARRAY a 1\nLOAD r0 0\nASET a r7,r0\n", "uninitialized register r7"},
+        {"ARRAY a 65536\nVAR x 0\n", "local storage limit"}
+    };
+    static const int32_t bad_indices[] = {-1, INT32_MIN, 3, INT32_MAX};
+    BioError e = {{0}};
+    unsigned i, store;
+    char source[1024];
+    for (i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        snprintf(source, sizeof(source), "GENE main i32\n%sLOAD r0 0\nRET r0 _\nEND _ _\n", invalid[i].body);
+        expect_error(source, invalid[i].message);
+    }
+    expect_error("VAR x 0\n", "outside a GENE");
+    expect_error("GENE main i32\nVAR x 0\nCALL other _\nRET r0 _\nEND _ _\n"
+                 "GENE other i32\nGET r0 x\nRET r0 _\nEND _ _\n", "undefined local x");
+    for (store = 0; store < 2; ++store) {
+        BioProgram *p;
+        int32_t arg, result;
+        snprintf(source, sizeof(source), "GENE main i32/1\nVAR x 99\nCALL child r0\nRET r0 _\nEND _ _\n"
+                 "GENE child i32/1\nARRAY a 3\nLOAD r1 42\n%s\nRET r0 _\nEND _ _\n",
+                 store ? "ASET a r0,r1" : "AGET r0 a,r0");
+        write_source("bounds.dna", source); p = compile_name("bounds.dna", 0, &e); REQUIRE(p != NULL);
+        for (i = 0; i < sizeof(bad_indices) / sizeof(bad_indices[0]); ++i) {
+            char message[80];
+            arg = bad_indices[i];
+            snprintf(message, sizeof(message), "array index %ld out of bounds", (long)arg);
+            expect_run_error(p, &arg, 1, message);
+        }
+        arg = 2;
+        REQUIRE(bio_program_run(p, &arg, 1, &result, &e) && result == (store ? 2 : 0));
+        REQUIRE(!*e.message);
+        bio_program_release(p);
+    }
+}
+
+static void memory_call_and_budget_tests(void) {
+    char source[8192], name[32];
+    size_t length;
+    unsigned i, count;
+    BioError e = {{0}};
+    BioProgram *p;
+    int32_t arg, result;
+    expect_value("GENE main i32\nVAR x 100\nARRAY a 1\nLOAD r1 0\nLOAD r2 9\nASET a r1,r2\n"
+                 "CALL child _\nMOV r7 r0\nCALL child _\nADD r7 r0\nGET r0 x\nADD r7 r0\n"
+                 "AGET r0 a,r1\nADD r0 r7\nRET r0 _\nEND _ _\n"
+                 "GENE child i32\nVAR x -5\nARRAY a 1\nLOAD r1 0\nAGET r0 a,r1\n"
+                 "GET r2 x\nADD r0 r2\nLOAD r3 99\nSET x r3\nASET a r1,r3\nRET r0 _\nEND _ _\n", 99);
+    for (count = 64; count <= 65; ++count) {
+        length = (size_t)snprintf(source, sizeof(source), "GENE main i32\n");
+        for (i = 0; i < count; ++i) length += (size_t)snprintf(source + length, sizeof(source) - length, "VAR v%u %u\n", i, i);
+        snprintf(source + length, sizeof(source) - length, "GET r0 v63\nRET r0 _\nEND _ _\n");
+        if (count == 64) expect_value(source, 63); else expect_error(source, "local declaration limit");
+    }
+    /* Four full-size frames fit exactly; the fifth exceeds the invocation limit. */
+    for (count = 4; count <= 5; ++count) {
+        length = 0;
+        for (i = 0; i < count; ++i) {
+            if (!i) strcpy(name, "main"); else snprintf(name, sizeof(name), "f%u", i);
+            length += (size_t)snprintf(source + length, sizeof(source) - length, "GENE %s i32\nARRAY a 65536\n", name);
+            if (i + 1 < count) length += (size_t)snprintf(source + length, sizeof(source) - length, "CALL f%u _\n", i + 1);
+            else length += (size_t)snprintf(source + length, sizeof(source) - length, "LEN r0 a\n");
+            length += (size_t)snprintf(source + length, sizeof(source) - length, "RET r0 _\nEND _ _\n");
+        }
+        if (count == 4) expect_value(source, 65536); else expect_error(source, "memory budget exceeded");
+    }
+    /* Sibling calls reuse storage, but each initialization still consumes steps. */
+    for (count = 15; count <= 16; ++count) {
+        length = (size_t)snprintf(source, sizeof(source), "GENE main i32\n");
+        for (i = 0; i < count; ++i) length += (size_t)snprintf(source + length, sizeof(source) - length, "CALL child _\n");
+        snprintf(source + length, sizeof(source) - length, "RET r0 _\nEND _ _\nGENE child i32\nARRAY a 65536\nLEN r0 a\nRET r0 _\nEND _ _\n");
+        if (count == 15) expect_value(source, 65536); else expect_error(source, "execution budget exceeded");
+    }
+    write_source("init-budget.dna", "GENE main i32/1\nMOV r3 r0\nLOAD r4 1\nLABEL loop _\n"
+                 "CALL child _\nSUB r3 r4\nJNZ r3 loop\nRET r0 _\nEND _ _\n"
+                 "GENE child i32\nARRAY a 65536\nLEN r0 a\nRET r0 _\nEND _ _\n");
+    p = compile_name("init-budget.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(p->genes[p->main_gene].memory_cells == 65536);
+    arg = 16; expect_run_error(p, &arg, 1, "init-budget.dna:10: execution budget exhausted");
+    arg = 15; REQUIRE(bio_program_run(p, &arg, 1, &result, &e) && result == 65536);
+    REQUIRE(bio_program_interpret(p, &arg, 1, &result, &e) && result == 65536);
+    bio_program_release(p);
+    write_source("exact-memory-budget.dna", "GENE main i32/1\nARRAY a 4\nLOAD r1 1\nLABEL loop _\nSUB r0 r1\nJNZ r0 loop\nRET r0 _\nEND _ _\n");
+    p = compile_name("exact-memory-budget.dna", 0, &e); REQUIRE(p != NULL);
+    arg = 499997;
+    REQUIRE(bio_program_run(p, &arg, 1, &result, &e) && result == 0);
+    REQUIRE(bio_program_interpret(p, &arg, 1, &result, &e) && result == 0);
+    arg = 499998; expect_run_error(p, &arg, 1, "execution budget exhausted");
+    bio_program_release(p);
+}
+
+typedef struct { BioProgram *program; unsigned id; volatile LONG failures; } MemoryWorker;
+
+static DWORD WINAPI memory_reader(LPVOID arg) {
+    MemoryWorker *worker = arg;
+    unsigned i, mode;
+    for (i = 0; i < 100; ++i) for (mode = 0; mode < 2; ++mode) {
+        int32_t args[2] = {i % 3 == 0 ? -1 : 0, (int32_t)(worker->id * 1000u + i)}, result = 99;
+        BioError e = {{0}};
+        int ok = mode ? bio_program_interpret(worker->program, args, 2, &result, &e) :
+                        bio_program_run(worker->program, args, 2, &result, &e);
+        if (args[0] < 0 ? (ok || result != 99 || !strstr(e.message, "out of bounds")) :
+            (!ok || result != args[1] + 100 || *e.message)) InterlockedIncrement(&worker->failures);
+    }
+    return 0;
+}
+
+static void memory_concurrent_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    MemoryWorker workers[4] = {0};
+    HANDLE threads[4];
+    unsigned i;
+    write_source("memory-threads.dna", "GENE main i32/2\nVAR saved 0\nARRAY a 1\nSET saved r1\n"
+                 "AGET r2 a,r0\nADD r2 r1\nASET a r0,r2\nLOAD r3 100\nLOAD r4 1\nLABEL loop _\n"
+                 "AGET r2 a,r0\nADD r2 r4\nASET a r0,r2\nSUB r3 r4\nJNZ r3 loop\n"
+                 "AGET r2 a,r0\nGET r5 saved\nSUB r2 r5\nADD r2 r1\nRET r2 _\nEND _ _\n");
+    p = compile_name("memory-threads.dna", 0, &e); REQUIRE(p != NULL);
+    for (i = 0; i < 4; ++i) {
+        workers[i].program = p; workers[i].id = i;
+        threads[i] = CreateThread(NULL, 0, memory_reader, &workers[i], 0, NULL); REQUIRE(threads[i] != NULL);
+    }
+    REQUIRE(WaitForMultipleObjects(4, threads, TRUE, 10000) == WAIT_OBJECT_0);
+    for (i = 0; i < 4; ++i) { REQUIRE(workers[i].failures == 0); CloseHandle(threads[i]); }
+    bio_program_release(p);
 }
 
 static void module_and_repair_tests(void) {
@@ -489,8 +771,11 @@ static void runtime_tests(void) {
     HANDLE threads[4];
     Workers workers = {0};
     unsigned i;
-    write_source("old.dna", "GENE main i32\nCALL val _\nRET r0 _\nEND _ _\nGENE val i32\nLOAD r0 30\nRET r0 _\nEND _ _\n");
-    write_source("new.dna", "GENE main i32\nCALL val _\nRET r0 _\nEND _ _\nGENE val i32\nLOAD r0 42\nRET r0 _\nEND _ _\n");
+    write_source("old.dna", "GENE main i32\nARRAY a 1\nCALL val _\nLOAD r1 0\nASET a r1,r0\nAGET r0 a,r1\nRET r0 _\nEND _ _\n"
+                 "GENE val i32\nVAR x 30\nGET r0 x\nRET r0 _\nEND _ _\n");
+    write_source("new.dna", "GENE main i32\nVAR saved 0\nARRAY a 32\nCALL val _\nSET saved r0\nLOAD r1 31\n"
+                 "ASET a r1,r0\nGET r2 saved\nAGET r0 a,r1\nADD r0 r2\nRET r0 _\nEND _ _\n"
+                 "GENE val i32\nARRAY data 7\nVAR x 21\nGET r0 x\nRET r0 _\nEND _ _\n");
     write_source("invalid.dna", "GENE main i32\nRET r0 _\nEND _ _\n");
     write_source("changed.dna", "GENE main i32\nLOAD r0 8\nCALL val r0\nRET r0 _\nEND _ _\nGENE val i32/1\nRET r0 _\nEND _ _\n");
     path_for(new_path, sizeof(new_path), "new.dna");
@@ -534,6 +819,12 @@ int main(void) {
     snprintf(directory, sizeof(directory), "work\\test-%lu", GetCurrentProcessId());
     REQUIRE(CreateDirectoryA(directory, NULL) || GetLastError() == ERROR_ALREADY_EXISTS);
     language_tests();
+    arithmetic_slot_tests();
+    arithmetic_error_tests();
+    memory_slot_tests();
+    memory_error_tests();
+    memory_call_and_budget_tests();
+    memory_concurrent_tests();
     module_and_repair_tests();
     differential_tests();
     argument_tests();

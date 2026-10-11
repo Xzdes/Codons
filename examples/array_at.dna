@@ -1,0 +1,20 @@
+# A table of squares, indices 0..7. An invalid input reports a bounds error.
+GENE main i32/1
+ARRAY squares 8
+VAR requested 0
+SET requested r0
+LOAD r1 0
+LOAD r2 1
+LEN r3 squares
+LABEL fill _
+MOV r4 r1
+MUL r4 r1
+ASET squares r1,r4
+ADD r1 r2
+MOV r5 r1
+LT r5 r3
+JNZ r5 fill
+GET r1 requested
+AGET r0 squares,r1
+RET r0 _
+END _ _

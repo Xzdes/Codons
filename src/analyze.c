@@ -33,6 +33,23 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
                 bio_node_error(p, n, e, "undefined label %s in gene %s", p->symbols[target], g->name);
                 return 0;
             }
+        } else if (n->op_code >= OP_GET && n->op_code <= OP_LEN) {
+            unsigned i, target = n->op_code == OP_AGET ? n->arg2 >> 8 :
+                (n->op_code == OP_SET || n->op_code == OP_ASET) ? n->arg1 : n->arg2;
+            unsigned array = n->op_code == OP_AGET || n->op_code == OP_ASET || n->op_code == OP_LEN;
+            for (i = 0; i < g->local_count && g->locals[i].symbol != target; ++i) {}
+            if (i == g->local_count) {
+                bio_node_error(p, n, e, "undefined local %s in gene %s", p->symbols[target], g->name);
+                return 0;
+            }
+            if (g->locals[i].is_array != array) {
+                bio_node_error(p, n, e, "%s is %s; this operation requires %s", p->symbols[target],
+                               array ? "a variable" : "an array", array ? "an array" : "a variable");
+                return 0;
+            }
+            if (n->op_code == OP_AGET) n->arg2 = (i << 8) | (n->arg2 & 255u);
+            else if (n->op_code == OP_SET || n->op_code == OP_ASET) n->arg1 = i;
+            else n->arg2 = i;
         }
     }
     return 1;
@@ -41,7 +58,11 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
 static unsigned definitions(const CodonNode *n) {
     switch (n->op_code) {
     case OP_LOAD: case OP_MOV: case OP_ADD: case OP_SUB: case OP_MUL:
-    case OP_EQ: case OP_LT: case OP_MIN: case OP_MAX: return 1u << n->arg1;
+    case OP_EQ: case OP_LT: case OP_MIN: case OP_MAX:
+    case OP_DIV: case OP_MOD: case OP_AND: case OP_OR: case OP_XOR: case OP_NOT:
+    case OP_LAND: case OP_LOR: case OP_LXOR: case OP_LNOT:
+    case OP_SHL: case OP_SHR: case OP_SAR:
+    case OP_GET: case OP_AGET: case OP_LEN: return 1u << n->arg1;
     case OP_CALL: return 1;
     default: return 0;
     }
@@ -49,10 +70,14 @@ static unsigned definitions(const CodonNode *n) {
 
 static unsigned reads(const CodonNode *n) {
     switch (n->op_code) {
-    case OP_MOV: return 1u << n->arg2;
+    case OP_MOV: case OP_SET: return 1u << n->arg2;
+    case OP_AGET: return 1u << (n->arg2 & 255u);
+    case OP_ASET: return (1u << (n->arg2 & 255u)) | (1u << (n->arg2 >> 8));
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_EQ: case OP_LT: case OP_MIN: case OP_MAX:
+    case OP_DIV: case OP_MOD: case OP_AND: case OP_OR: case OP_XOR:
+    case OP_LAND: case OP_LOR: case OP_LXOR: case OP_SHL: case OP_SHR: case OP_SAR:
         return (1u << n->arg1) | (1u << n->arg2);
-    case OP_RET: case OP_JZ: case OP_JNZ: return 1u << n->arg1;
+    case OP_RET: case OP_JZ: case OP_JNZ: case OP_NOT: case OP_LNOT: return 1u << n->arg1;
     case OP_CALL: {
         unsigned argc = n->arg2 >> 16;
         unsigned mask = argc ? 1u << (n->arg2 & 255u) : 0;
@@ -125,8 +150,11 @@ static int check_calls(BioProgram *p, unsigned index, unsigned nesting, BioError
     }
     if (g->visit == 2) return 1;
     g->visit = 1; g->depth = 1;
+    g->execution_steps = g->local_cells;
+    g->memory_cells = g->local_cells;
     for (n = g->head->next; n; n = n->next) {
-        if (n->reachable && n->op_code != OP_LABEL && g->execution_steps <= BIO_EXECUTION_LIMIT)
+        if (n->reachable && n->op_code != OP_LABEL && n->op_code != OP_VAR &&
+            n->op_code != OP_ARRAY && g->execution_steps <= BIO_EXECUTION_LIMIT)
             ++g->execution_steps;
         if (n->op_code == OP_CALL) {
             unsigned depth;
@@ -137,6 +165,8 @@ static int check_calls(BioProgram *p, unsigned index, unsigned nesting, BioError
             }
             if (depth > g->depth) g->depth = depth;
             if (n->reachable) {
+                uint32_t cells = g->local_cells + p->genes[n->arg1].memory_cells;
+                if (cells > g->memory_cells) g->memory_cells = cells;
                 g->dynamic_steps |= p->genes[n->arg1].dynamic_steps;
                 g->execution_steps += p->genes[n->arg1].execution_steps;
                 if (g->execution_steps > BIO_EXECUTION_LIMIT) g->execution_steps = BIO_EXECUTION_LIMIT + 1u;
@@ -173,6 +203,11 @@ int bio_analyze(BioProgram *p, BioError *e) {
     free(queue);
     for (i = 0; i < p->gene_count; ++i) if (!check_calls(p, i, 1, e)) return 0;
     mark_live(p, p->main_gene);
+    if (p->genes[main_gene].memory_cells > BIO_MEMORY_CELLS) {
+        bio_node_error(p, p->genes[main_gene].head, e,
+                       "memory budget exceeded: active calls require more than %u i32 cells", BIO_MEMORY_CELLS);
+        return 0;
+    }
     p->stats.execution_steps = p->genes[main_gene].execution_steps;
     p->stats.dynamic_steps = p->genes[main_gene].dynamic_steps;
     if (!p->stats.dynamic_steps && p->stats.execution_steps > BIO_EXECUTION_LIMIT) {

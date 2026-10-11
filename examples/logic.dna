@@ -1,0 +1,5 @@
+# Return 1 if both inputs are nonzero; bit patterns need not overlap.
+GENE main i32/2
+LAND r0 r1
+RET r0 _
+END _ _

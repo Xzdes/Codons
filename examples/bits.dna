@@ -1,0 +1,15 @@
+# Count the set bits in the full 32-bit value, including negative inputs.
+# codons run examples/bits.dna -1 -> 32
+GENE main i32/1
+LOAD r1 0
+LOAD r2 1
+LABEL loop _
+JZ r0 done
+MOV r3 r0
+AND r3 r2
+ADD r1 r3
+SHR r0 r2
+JMP loop _
+LABEL done _
+RET r1 _
+END _ _

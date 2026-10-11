@@ -1,4 +1,4 @@
-Codons 0.4.0 — быстрый запуск в Windows x64
+Codons 0.6.0 — быстрый запуск в Windows x64
 
 Откройте PowerShell в папке распакованной программы.
 Компилятор C, Python и установка не нужны.
@@ -55,6 +55,50 @@ PASS означает совпадение, FAIL — неверный ответ
 При ошибке формата CSV ни один пример не запускается.
 Код завершения: 0 — всё прошло, 1 — есть ошибка, 2 — неверная команда.
 Не более 1000 примеров в одном CSV. Пустой набор считается ошибкой.
+
+6. Деление, логические и битовые операции:
+   .\codons.exe run examples\divide.dna -7 3
+   Результат: -2 (округление к нулю)
+   .\codons.exe run examples\remainder.dna -7 3
+   Результат: -1 (знак делимого)
+   .\codons.exe run examples\logic.dna 8 2
+   Результат: 1 (оба числа ненулевые)
+   .\codons.exe run examples\flags.dna 8 2
+   Результат: 0 (общих единичных битов нет)
+   .\codons.exe run examples\bits.dna -1
+   Результат: 32 (число единичных битов)
+   .\codons.exe test examples\divide.dna examples\divide.csv
+   .\codons.exe test examples\bits.dna examples\bits.csv
+
+Новые команды: DIV, MOD; AND, OR, XOR, NOT; LAND, LOR, LXOR, LNOT; SHL, SHR, SAR.
+Двоичная операция: DIV r0 r1. Одноместная: NOT r0 _ или LNOT r0 _.
+Результат записывается в первый регистр. Логические операции дают 0 или 1.
+Число бит для сдвига — от 0 до 31. SHR заполняет нулями, SAR сохраняет знак.
+Деление на ноль и -2147483648 DIV -1 сообщают ошибку с файлом и строкой.
+-2147483648 MOD -1 возвращает 0. После ошибки live и CSV-проверки продолжают работу.
+
+7. Переменные и массивы:
+   .\codons.exe run examples\variables.dna 10
+   Результат: 55 (сумма с именованной переменной total)
+   .\codons.exe run examples\array_sum.dna 2 3
+   Результат: 392 (заполнить 16 элементов и сложить их в обратном порядке)
+   .\codons.exe run examples\array_at.dna 7
+   Результат: 49 (элемент таблицы квадратов)
+   .\codons.exe test examples\array_sum.dna examples\array_sum.csv
+   Результат: Tests: 6 total, 6 passed, 0 failed
+
+Объявления в начале функции: VAR total 0, ARRAY items 16.
+Переменная: SET total r0, GET r0 total.
+Массив: ASET items r1,r0, AGET r0 items,r1, LEN r2 items.
+В ASET первый регистр — индекс, второй — значение. Запятые без пробелов.
+Индексы начинаются с нуля. Выход за границы сообщает файл, строку и неверный индекс:
+   .\codons.exe run examples\array_at.dna 8
+   Ожидаемая ошибка: array index 8 out of bounds (допустимы 0..7).
+
+Данные локальны для каждого вызова; массивы начинают с нулей.
+Инициализация каждой ячейки расходует один шаг общего лимита.
+До 64 объявлений и 65536 ячеек i32 на функцию; до 1 MiB данных на активную цепочку вызовов.
+Размер массива фиксирован. Состояние между запусками не сохраняется.
 
 Проверка файла: .\codons.exe check hello.dna
 Ответ для скрипта или AI-агента: .\codons.exe run hello.dna 10 20 --json

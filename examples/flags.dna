@@ -1,0 +1,6 @@
+# Return 1 if the two inputs share at least one set bit, otherwise 0.
+GENE main i32/2
+AND r0 r1
+LOR r0 r0
+RET r0 _
+END _ _

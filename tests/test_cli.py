@@ -16,6 +16,32 @@ WORK = Path.cwd() / "work"
 WORK.mkdir(exist_ok=True)
 
 
+def i32(value):
+    return (value + 2**31) % 2**32 - 2**31
+
+
+def arithmetic_reference(op, a, b=0):
+    if op in ("DIV", "MOD"):
+        if b == 0:
+            raise ValueError("division by zero")
+        quotient = abs(a) // abs(b)
+        if (a < 0) != (b < 0):
+            quotient = -quotient
+        if op == "MOD":
+            return a - quotient * b
+        if quotient > 2147483647:
+            raise ValueError("division overflow")
+        return quotient
+    if op in ("SHL", "SHR", "SAR"):
+        if not 0 <= b <= 31:
+            raise ValueError("shift count must be in 0..31")
+        return i32(a << b) if op == "SHL" else (a & 0xffffffff) >> b if op == "SHR" else a >> b
+    return {"AND": lambda: i32(a & b), "OR": lambda: i32(a | b), "XOR": lambda: i32(a ^ b),
+            "NOT": lambda: i32(~a), "LAND": lambda: int(bool(a) and bool(b)),
+            "LOR": lambda: int(bool(a) or bool(b)), "LXOR": lambda: int(bool(a) != bool(b)),
+            "LNOT": lambda: int(not a)}[op]()
+
+
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="cli-", dir=WORK)
@@ -35,7 +61,7 @@ class CliTests(unittest.TestCase):
         return proc
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.4.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.6.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -246,6 +272,225 @@ class CliTests(unittest.TestCase):
         text = self.call("test", EXAMPLES / "sum.dna", EXAMPLES / "sum.csv").stdout
         self.assertIn("Tests: 4 total, 4 passed, 0 failed", text)
         self.assertIn("inputs=[10] expected=55 actual=55", text)
+
+    def test_arithmetic_boundaries_both_engines(self):
+        values = [-2147483648, -7, -1, 0, 1, 2, 7, 2147483647]
+        ops = ["DIV", "MOD", "AND", "OR", "XOR", "NOT", "LAND", "LOR", "LXOR", "LNOT", "SHL", "SHR", "SAR"]
+        for op in ops:
+            unary = op in ("NOT", "LNOT")
+            source = self.source(f"GENE main i32/{1 if unary else 2}\n{op} r0 {'_' if unary else 'r1'}\nRET r0 _\nEND _ _\n")
+            right = [0] if unary else [-2147483648, -1, 0, 1, 2, 15, 30, 31, 32, 2147483647] if op in ("SHL", "SHR", "SAR") else values
+            for a in values:
+                for b in right:
+                    try:
+                        expected, error = arithmetic_reference(op, a, b), None
+                    except ValueError as exc:
+                        expected, error = None, str(exc)
+                    messages = []
+                    for command in ("run", "interpret"):
+                        with self.subTest(op=op, a=a, b=b, command=command):
+                            data = json.loads(self.call(command, source, *([a] if unary else [a, b]),
+                                                        "--json", code=1 if error else 0).stdout)
+                            if error:
+                                self.assertFalse(data["ok"])
+                                self.assertNotIn("result", data)
+                                self.assertEqual(data["error"]["stage"], "run")
+                                self.assertIn(error, data["error"]["message"])
+                                self.assertIn(f"{source}:2:", data["error"]["message"])
+                                messages.append(data["error"]["message"])
+                            else:
+                                self.assertEqual(data["result"], i32(expected))
+                    if error:
+                        self.assertEqual(messages[0], messages[1])
+
+    def test_arithmetic_generated_mixed_programs_and_dump(self):
+        rng = random.Random(505)
+        ops = ["DIV", "MOD", "AND", "OR", "XOR", "NOT", "LAND", "LOR", "LXOR", "LNOT", "SHL", "SHR", "SAR"]
+        for case in range(100):
+            registers = [rng.randrange(-2**31, 2**31) for _ in range(8)]
+            lines = ["GENE main i32"] + [f"LOAD r{i} {value}" for i, value in enumerate(registers)]
+            for _ in range(30):
+                op = rng.choice(ops)
+                dst, src = rng.sample(range(8), 2)
+                if op in ("SHL", "SHR", "SAR"):
+                    registers[src] = rng.randrange(32)
+                    lines.append(f"LOAD r{src} {registers[src]}")
+                if op in ("DIV", "MOD") and (registers[src] == 0 or (registers[dst] == -2**31 and registers[src] == -1)):
+                    registers[src] = rng.randrange(1, 100)
+                    lines.append(f"LOAD r{src} {registers[src]}")
+                lines.append(f"{op} r{dst} {'_' if op in ('NOT', 'LNOT') else f'r{src}'}")
+                registers[dst] = i32(arithmetic_reference(op, registers[dst], registers[src]))
+            result_register = rng.randrange(8)
+            source = self.source("\n".join(lines + [f"RET r{result_register} _", "END _ _"]))
+            for command in ("run", "interpret"):
+                with self.subTest(case=case, command=command):
+                    self.assertEqual(int(self.call(command, source).stdout), registers[result_register])
+            if case < 10:
+                normalized = self.source(self.call("dump", source).stdout, "normalized.dna")
+                self.assertEqual(int(self.call("run", normalized).stdout), registers[result_register])
+
+    def test_arithmetic_nested_calls_preserve_registers_and_error_location(self):
+        helper = self.source("GENE helper i32/2\nDIV r0 r1\nSHL r0 r1\nNOT r0 _\nRET r0 _\nEND _ _\n", "операции.dna")
+        source = self.source("IMPORT операции.dna _\nGENE main i32/2\nLOAD r7 19\nCALL helper r0,r1\n"
+                             "ADD r0 r1\nADD r0 r7\nRET r0 _\nEND _ _\n")
+        for command in ("run", "interpret"):
+            self.assertEqual(int(self.call(command, source, 8, 2).stdout), 4)
+            data = json.loads(self.call(command, source, 8, 0, "--json", code=1).stdout)
+            self.assertIn(f"{helper}:2:", data["error"]["message"])
+        updated = self.source("IMPORT операции.dna _\nGENE main i32/2\nMOD r0 r1\nRET r0 _\nEND _ _\n", "updated.dna")
+        proc = self.call("live", source, input=f"run 8 0\nrun 8 2\nreload {updated}\nrun 8 3\nquit\n")
+        self.assertIn("division by zero", proc.stderr)
+        self.assertEqual([line for line in proc.stdout.splitlines() if line.startswith("result=")], ["result=4", "result=2"])
+
+    def test_arithmetic_csv_continues_after_faults(self):
+        source = self.source("GENE main i32/2\nDIV r0 r1\nRET r0 _\nEND _ _\n")
+        cases = self.source("arg1,arg2,expected\n12,3,4\n1,0,0\n-2147483648,-1,0\n-7,3,-2\n5,2,3\n", "cases.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["summary"], {"total": 5, "passed": 2, "failed": 3, "mismatches": 1, "errors": 2})
+        self.assertEqual([case["status"] for case in data["cases"]], ["passed", "error", "error", "passed", "failed"])
+        self.assertNotIn("actual", data["cases"][1])
+        self.assertNotIn("actual", data["cases"][2])
+
+    def test_arithmetic_control_flow_and_large_emission(self):
+        # A skipped bad operation must not fault; LAND still requires both registers initialized.
+        source = self.source("GENE main i32/1\nJZ r0 done\nLOAD r1 0\nDIV r0 r1\nLABEL done _\nRET r0 _\nEND _ _\n")
+        for command in ("run", "interpret"):
+            self.assertEqual(int(self.call(command, source, 0).stdout), 0)
+        bad = self.source("GENE main i32\nLOAD r0 0\nLAND r0 r1\nRET r0 _\nEND _ _\n", "bad.dna")
+        self.assertIn("uninitialized register", self.call("check", bad, code=1).stderr)
+        missing = self.source("GENE main i32/1\nNOT r0\nRET r0 _\nEND _ _\n", "missing.dna")
+        self.assertIn("exactly 3 fields", self.call("check", missing, "--repair", code=1).stderr)
+        source = self.source("GENE main i32/1\nLOAD r1 1\n" + "DIV r0 r1\n" * 2000 + "RET r0 _\nEND _ _\n")
+        for command in ("run", "interpret"):
+            self.assertEqual(int(self.call(command, source, -2147483648).stdout), -2147483648)
+
+    def test_arithmetic_shipped_examples(self):
+        for name, total in [("divide", 7), ("remainder", 6), ("bits", 7), ("flags", 6), ("logic", 5)]:
+            with self.subTest(name=name):
+                data = json.loads(self.call("test", EXAMPLES / f"{name}.dna", EXAMPLES / f"{name}.csv", "--json").stdout)
+                self.assertTrue(data["ok"])
+                self.assertEqual(data["summary"]["passed"], total)
+        self.assertEqual(int(self.call("interpret", EXAMPLES / "bits.dna", -1).stdout), 32)
+
+    def test_memory_generated_programs_and_dump(self):
+        rng = random.Random(606)
+        for case in range(70):
+            arrays = {"left": [0] * rng.randrange(1, 33), "right": [0] * rng.randrange(1, 33)}
+            variables = {"x": rng.randrange(-2**31, 2**31), "y": 0}
+            registers = [rng.randrange(-2**31, 2**31) for _ in range(8)]
+            lines = ["GENE main i32"]
+            lines += [f"VAR {name} {value}" for name, value in variables.items()]
+            lines += [f"ARRAY {name} {len(values)}" for name, values in arrays.items()]
+            lines += [f"LOAD r{i} {value}" for i, value in enumerate(registers)]
+            for _ in range(80):
+                op = rng.choice(["GET", "SET", "AGET", "ASET", "LEN", "ADD", "XOR"])
+                dst, src = rng.randrange(8), rng.randrange(8)
+                name = rng.choice(list(variables if op in ("GET", "SET") else arrays))
+                if op in ("AGET", "ASET"):
+                    registers[src] = rng.randrange(len(arrays[name]))
+                    lines.append(f"LOAD r{src} {registers[src]}")
+                if op == "GET":
+                    lines.append(f"GET r{dst} {name}")
+                    registers[dst] = variables[name]
+                elif op == "SET":
+                    lines.append(f"SET {name} r{dst}")
+                    variables[name] = registers[dst]
+                elif op == "LEN":
+                    lines.append(f"LEN r{dst} {name}")
+                    registers[dst] = len(arrays[name])
+                elif op == "AGET":
+                    lines.append(f"AGET r{dst} {name},r{src}")
+                    registers[dst] = arrays[name][registers[src]]
+                elif op == "ASET":
+                    lines.append(f"ASET {name} r{src},r{dst}")
+                    arrays[name][registers[src]] = registers[dst]
+                else:
+                    lines.append(f"{op} r{dst} r{src}")
+                    registers[dst] = i32(registers[dst] + registers[src] if op == "ADD" else registers[dst] ^ registers[src])
+            # Include every final cell and scalar in the checksum, not just the last register.
+            lines.append("LOAD r0 0")
+            expected = i32(sum(variables.values()) + sum(sum(a) for a in arrays.values()))
+            for name in variables:
+                lines += [f"GET r1 {name}", "ADD r0 r1"]
+            for name, values in arrays.items():
+                for index in range(len(values)):
+                    lines += [f"LOAD r2 {index}", f"AGET r1 {name},r2", "ADD r0 r1"]
+            source = self.source("\n".join(lines + ["RET r0 _", "END _ _"]))
+            for command in ("run", "interpret"):
+                with self.subTest(case=case, command=command):
+                    self.assertEqual(int(self.call(command, source).stdout), expected)
+            if case < 10:
+                normalized = self.source(self.call("dump", source).stdout, "normalized.dna")
+                for command in ("run", "interpret"):
+                    self.assertEqual(int(self.call(command, normalized).stdout), expected)
+
+    def test_memory_generated_loops_with_calls(self):
+        rng = random.Random(607)
+        for case in range(50):
+            length, factor = rng.randrange(1, 65), rng.randrange(-10, 11)
+            start, step = rng.randrange(-2**31, 2**31), rng.randrange(-200, 201)
+            expected = i32(sum(i32(i32(start + i * step) * factor + i) for i in range(length)))
+            source = self.source(f"GENE main i32/2\nARRAY data {length}\nVAR sum 0\n"
+                                 "MOV r6 r0\nLOAD r2 0\nLOAD r3 1\nLEN r4 data\nLABEL fill _\n"
+                                 "CALL transform r6,r2\nASET data r2,r0\nADD r6 r1\nADD r2 r3\n"
+                                 "MOV r5 r2\nLT r5 r4\nJNZ r5 fill\nLABEL read _\nSUB r2 r3\n"
+                                 "AGET r5 data,r2\nGET r7 sum\nADD r7 r5\nSET sum r7\nJNZ r2 read\n"
+                                 "GET r0 sum\nRET r0 _\nEND _ _\nGENE transform i32/2\nARRAY data 1\n"
+                                 f"VAR sum {factor}\nLOAD r2 0\nAGET r3 data,r2\nADD r0 r3\n"
+                                 "GET r3 sum\nMUL r0 r3\nADD r0 r1\nASET data r2,r0\n"
+                                 "SET sum r0\nRET r0 _\nEND _ _\n")
+            for command in ("run", "interpret"):
+                with self.subTest(case=case, command=command):
+                    self.assertEqual(int(self.call(command, source, start, step).stdout), expected)
+
+    def test_memory_bounds_csv_and_live_recovery(self):
+        source = self.source("GENE main i32/2\nARRAY data 3\nAGET r2 data,r0\nADD r1 r2\n"
+                             "ASET data r0,r1\nAGET r0 data,r0\nRET r0 _\nEND _ _\n", "массив.dna")
+        cases = self.source("arg1,arg2,expected\n2,42,42\n-1,7,0\n3,7,0\n2,8,8\n0,-9,-9\n", "cases.csv")
+        data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
+        self.assertEqual(data["summary"], {"total": 5, "passed": 3, "failed": 2, "mismatches": 0, "errors": 2})
+        self.assertEqual([case["status"] for case in data["cases"]], ["passed", "error", "error", "passed", "passed"])
+        self.assertNotIn("actual", data["cases"][1])
+        for index in [-2147483648, -1, 3, 2147483647]:
+            messages = []
+            for command in ("run", "interpret"):
+                result = json.loads(self.call(command, source, index, 8, "--json", code=1).stdout)
+                message = result["error"]["message"]
+                self.assertIn(f"{source}:3:", message)
+                self.assertIn(f"array index {index} out of bounds", message)
+                self.assertIn("0..2 (length 3)", message)
+                messages.append(message)
+            self.assertEqual(*messages)
+        updated = self.source("GENE main i32/2\nVAR offset 100\nARRAY data 4\nASET data r0,r1\n"
+                              "AGET r0 data,r0\nGET r1 offset\nADD r0 r1\nRET r0 _\nEND _ _\n", "updated.dna")
+        proc = self.call("live", source, input=f"run -1 7\nrun 2 8\nreload {updated}\nrun 3 8\nrun 4 8\nrun 0 9\nquit\n")
+        self.assertEqual([x for x in proc.stdout.splitlines() if x.startswith("result=")],
+                         ["result=8", "result=108", "result=109"])
+        self.assertIn("array index -1 out of bounds", proc.stderr)
+        self.assertIn("array index 4 out of bounds", proc.stderr)
+
+    def test_memory_static_steps_and_pruned_storage(self):
+        source = self.source("GENE main i32\nVAR x -1\nARRAY a 3\nGET r0 x\nLEN r1 a\nADD r0 r1\nRET r0 _\nEND _ _\n")
+        data = json.loads(self.call("check", source, "--json").stdout)
+        self.assertEqual(data["stats"]["execution_steps"], 8)
+        # Uncalled storage chains do not enlarge main's allocation or initialization budget.
+        lines = ["GENE main i32", "VAR x 42", "GET r0 x", "RET r0 _", "END _ _"]
+        for i in range(6):
+            lines += [f"GENE f{i} i32", "ARRAY a 65536", f"CALL f{i+1} _" if i < 5 else "LEN r0 a", "RET r0 _", "END _ _"]
+        source = self.source("\n".join(lines))
+        for command in ("run", "interpret"):
+            data = json.loads(self.call(command, source, "--json").stdout)
+            self.assertEqual(data["result"], 42)
+            self.assertEqual(data["stats"]["execution_steps"], 3)
+
+    def test_memory_shipped_examples(self):
+        for name, total in [("variables", 5), ("array_sum", 6), ("array_at", 8)]:
+            with self.subTest(name=name):
+                data = json.loads(self.call("test", EXAMPLES / f"{name}.dna", EXAMPLES / f"{name}.csv", "--json").stdout)
+                self.assertEqual(data["summary"]["passed"], total)
+        for command in ("run", "interpret"):
+            self.assertEqual(int(self.call(command, EXAMPLES / "array_sum.dna", 2, 3).stdout), 392)
+            self.assertIn("array index 8 out of bounds", self.call(command, EXAMPLES / "array_at.dna", 8, code=1).stderr)
 
     def test_csv_mismatches_do_not_stop_the_suite(self):
         source = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n")

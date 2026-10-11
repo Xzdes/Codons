@@ -116,7 +116,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
     while ((status = read_line(p, f, line, e)) > 0) {
         char *fields[4], *cursor = line, *comment;
         unsigned count = 0;
-        CodonNode *n;
+        CodonNode *n, *previous;
         int a, b;
         location.line++;
         if (location.line == 1 && strlen(line) >= 3 &&
@@ -175,10 +175,71 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (!current) FAIL("instruction outside a GENE");
         if (current->tail->op_code == OP_RET && strcmp(fields[0], "LABEL"))
             FAIL("instruction after RET; start another branch with LABEL");
+        previous = current->tail;
         n = bio_node_new(p, e);
         if (!n) goto fail;
         n->file = index; n->line = location.line;
         current->tail->next = n; current->tail = n;
+        if (!strcmp(fields[0], "VAR") || !strcmp(fields[0], "ARRAY")) {
+            char *end;
+            long long value;
+            int sym, is_array = !strcmp(fields[0], "ARRAY");
+            BioLocal *local;
+            if (previous->op_code != OP_GENE && previous->op_code != OP_VAR && previous->op_code != OP_ARRAY)
+                FAIL("VAR and ARRAY declarations must precede all instructions and labels");
+            if (!identifier(fields[1]) || reg(fields[1]) >= 0 || !strcmp(fields[1], "_"))
+                FAIL("invalid local name: use an identifier other than r0..r7 or _");
+            errno = 0;
+            value = strtoll(fields[2], &end, 10);
+            if (errno || *end || end == fields[2] || value < INT32_MIN || value > INT32_MAX)
+                FAIL("%s requires a decimal i32 literal", fields[0]);
+            if (is_array && (value < 1 || value > BIO_MAX_LOCAL_CELLS))
+                FAIL("ARRAY length must be in 1..%u", BIO_MAX_LOCAL_CELLS);
+            sym = symbol(p, fields[1]);
+            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            for (i = 0; i < current->local_count; ++i)
+                if (current->locals[i].symbol == (uint32_t)sym) FAIL("duplicate local: %s", fields[1]);
+            if (current->local_count == BIO_MAX_LOCALS) FAIL("local declaration limit exceeded (%u)", BIO_MAX_LOCALS);
+            if (current->local_cells + (is_array ? (uint32_t)value : 1u) > BIO_MAX_LOCAL_CELLS)
+                FAIL("local storage limit exceeded (%u i32 cells per gene)", BIO_MAX_LOCAL_CELLS);
+            local = &current->locals[current->local_count++];
+            local->symbol = (uint32_t)sym; local->offset = current->local_cells;
+            local->count = is_array ? (uint32_t)value : 1u;
+            local->initial = is_array ? 0 : (uint32_t)value;
+            local->is_array = (unsigned)is_array;
+            current->local_cells += local->count;
+            n->op_code = is_array ? OP_ARRAY : OP_VAR;
+            n->arg1 = (uint32_t)sym; n->arg2 = (uint32_t)value;
+            continue;
+        }
+        if (!strcmp(fields[0], "GET") || !strcmp(fields[0], "SET") ||
+            !strcmp(fields[0], "AGET") || !strcmp(fields[0], "ASET") || !strcmp(fields[0], "LEN")) {
+            int sym, store = !strcmp(fields[0], "SET") || !strcmp(fields[0], "ASET");
+            int array = !strcmp(fields[0], "AGET") || !strcmp(fields[0], "ASET");
+            char *local_name = store ? fields[1] : fields[2];
+            char *comma = array ? strchr(fields[2], ',') : NULL;
+            a = b = -1;
+            if (array) {
+                if (!comma) FAIL("%s requires a comma-separated third field", fields[0]);
+                *comma++ = '\0';
+                b = reg(comma);
+            }
+            a = reg(store ? fields[2] : fields[1]);
+            if (a < 0 || (array && b < 0) || !identifier(local_name))
+                FAIL("invalid %s operands: use a local name and registers r0..r7", fields[0]);
+            sym = symbol(p, local_name);
+            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            if (store) {
+                n->op_code = array ? OP_ASET : OP_SET;
+                n->arg1 = (uint32_t)sym;
+                n->arg2 = (uint32_t)a | (array ? (uint32_t)b << 8 : 0);
+            } else {
+                n->op_code = array ? OP_AGET : !strcmp(fields[0], "LEN") ? OP_LEN : OP_GET;
+                n->arg1 = (uint32_t)a;
+                n->arg2 = array ? ((uint32_t)sym << 8) | (uint32_t)b : (uint32_t)sym;
+            }
+            continue;
+        }
         if (!strcmp(fields[0], "LABEL") || !strcmp(fields[0], "JMP")) {
             int sym;
             if (!identifier(fields[1]) || strcmp(fields[2], "_"))
@@ -233,6 +294,9 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         } else if (strcmp(fields[0], "RET") == 0) {
             if (strcmp(fields[2], "_") != 0) FAIL("RET requires an unused '_' third field");
             n->op_code = OP_RET;
+        } else if (!strcmp(fields[0], "NOT") || !strcmp(fields[0], "LNOT")) {
+            if (strcmp(fields[2], "_")) FAIL("NOT and LNOT require an unused '_' third field");
+            n->op_code = !strcmp(fields[0], "NOT") ? OP_NOT : OP_LNOT;
         } else {
             b = reg(fields[2]);
             if (b < 0) FAIL("second operand must be r0..r7");
@@ -245,6 +309,17 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             else if (strcmp(fields[0], "LT") == 0) n->op_code = OP_LT;
             else if (strcmp(fields[0], "MIN") == 0) n->op_code = OP_MIN;
             else if (strcmp(fields[0], "MAX") == 0) n->op_code = OP_MAX;
+            else if (strcmp(fields[0], "DIV") == 0) n->op_code = OP_DIV;
+            else if (strcmp(fields[0], "MOD") == 0) n->op_code = OP_MOD;
+            else if (strcmp(fields[0], "AND") == 0) n->op_code = OP_AND;
+            else if (strcmp(fields[0], "OR") == 0) n->op_code = OP_OR;
+            else if (strcmp(fields[0], "XOR") == 0) n->op_code = OP_XOR;
+            else if (strcmp(fields[0], "LAND") == 0) n->op_code = OP_LAND;
+            else if (strcmp(fields[0], "LOR") == 0) n->op_code = OP_LOR;
+            else if (strcmp(fields[0], "LXOR") == 0) n->op_code = OP_LXOR;
+            else if (strcmp(fields[0], "SHL") == 0) n->op_code = OP_SHL;
+            else if (strcmp(fields[0], "SHR") == 0) n->op_code = OP_SHR;
+            else if (strcmp(fields[0], "SAR") == 0) n->op_code = OP_SAR;
             else FAIL("unknown opcode: %s", fields[0]);
         }
     }

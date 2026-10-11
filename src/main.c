@@ -35,7 +35,7 @@ static void usage(void) {
          "  --json is available for new, run, test, check, interpret and emit\n"
          "CSV header: expected | arg1,expected | arg1,arg2,expected\n"
          "Live commands: run [number ...] | reload <file.dna> | quit\n"
-         "Every run shares a 1000000-step budget across loops and nested calls.\n"
+         "Every run shares a 1000000-step budget across loops, calls and local initialization.\n"
          "Exit codes: 0 success, 1 failed tests or program/file error, 2 invalid command or arguments");
 }
 

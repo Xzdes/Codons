@@ -1,0 +1,5 @@
+# Remainder has the dividend's sign: -7 MOD 3 -> -1.
+GENE main i32/2
+MOD r0 r1
+RET r0 _
+END _ _

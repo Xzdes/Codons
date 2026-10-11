@@ -31,7 +31,11 @@ static void store_eax(Emitter *b, unsigned r) {
 }
 
 static void epilog(Emitter *b) {
-    byte(b, 0x48); byte(b, 0x83); byte(b, 0xc4); byte(b, 0x48); byte(b, 0xc3);
+    byte(b, 0x48); byte(b, 0x83); byte(b, 0xc4); byte(b, BIO_STACK_SIZE); byte(b, 0xc3);
+}
+
+static void load_locals(Emitter *b) {
+    byte(b, 0x4c); byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, 72); /* mov r9,[rsp+72] */
 }
 
 static void load_context(Emitter *b) {
@@ -39,12 +43,24 @@ static void load_context(Emitter *b) {
     byte(b, 0x4c); byte(b, 0x8b); byte(b, 0x44); byte(b, 0x24); byte(b, 64);
 }
 
+/* Jump past a normal error return when the x86 condition is satisfied.
+   R8 points to this invocation's context, restored by guard_step. */
+static void require_condition(Emitter *b, const CodonNode *n, BioFault fault, unsigned condition) {
+    size_t patch, distance;
+    byte(b, condition); patch = b->length; byte(b, 0);
+    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 8); word32(b, n->index);
+    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 12); word32(b, (uint32_t)fault);
+    byte(b, 0x31); byte(b, 0xc0); epilog(b);
+    if (b->failed) return;
+    distance = b->length - (patch + 1);
+    if (distance > 127) { b->failed = 1; return; }
+    b->data[patch] = (unsigned char)distance;
+}
+
 static void guard_step(Emitter *b, const CodonNode *n) {
     load_context(b);
     byte(b, 0x49); byte(b, 0x83); byte(b, 0x38); byte(b, 0); /* cmp qword [r8],0 */
-    byte(b, 0x75); byte(b, 15); /* jne past fault recording and return */
-    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 8); word32(b, n->index);
-    byte(b, 0x31); byte(b, 0xc0); epilog(b);
+    require_condition(b, n, BIO_FAULT_BUDGET, 0x75); /* jne */
     byte(b, 0x49); byte(b, 0x83); byte(b, 0x28); byte(b, 1); /* sub qword [r8],1 */
 }
 
@@ -55,24 +71,85 @@ static void propagate_failure(Emitter *b) {
     byte(b, 0x31); byte(b, 0xc0); epilog(b);
 }
 
+static void initialize_locals(Emitter *b, const BioGene *g) {
+    size_t loop, distance;
+    unsigned i;
+    if (!g->local_cells) return;
+    byte(b, 0x4d); byte(b, 0x89); byte(b, 0xca); /* mov r10,r9 */
+    byte(b, 0xb9); word32(b, g->local_cells); /* mov ecx,count */
+    byte(b, 0x31); byte(b, 0xc0); /* xor eax,eax */
+    loop = b->length;
+    guard_step(b, g->head); /* Initialization consumes one step per cell. */
+    byte(b, 0x41); byte(b, 0x89); byte(b, 0x02); /* mov [r10],eax */
+    byte(b, 0x49); byte(b, 0x83); byte(b, 0xc2); byte(b, 4); /* add r10,4 */
+    byte(b, 0xff); byte(b, 0xc9); /* dec ecx */
+    byte(b, 0x75); /* jnz loop */
+    distance = b->length + 1 - loop;
+    if (distance > 128) b->failed = 1;
+    byte(b, (unsigned)(0u - (unsigned)distance));
+    for (i = 0; i < g->local_count; ++i) {
+        const BioLocal *local = &g->locals[i];
+        if (local->is_array || !local->initial) continue;
+        byte(b, 0x41); byte(b, 0xc7); byte(b, 0x81); /* mov dword [r9+offset],initial */
+        word32(b, local->offset * 4u); word32(b, local->initial);
+    }
+}
+
+static void guard_index(Emitter *b, const CodonNode *n, unsigned r, uint32_t count) {
+    load_eax(b, r);
+    byte(b, 0x41); byte(b, 0x89); byte(b, 0x40); byte(b, 16); /* mov [r8+16],eax */
+    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 20); word32(b, count);
+    byte(b, 0x3d); word32(b, count); /* cmp eax,count */
+    require_condition(b, n, BIO_FAULT_BOUNDS, 0x72); /* unsigned jb rejects negative indices too */
+}
+
 static void emit_gene(Emitter *b, BioGene *g) {
     CodonNode *n;
     g->code_offset = (uint32_t)b->length;
-    /* sub rsp,72: shadow space + 8 i32 slots + saved context; keeps ABI alignment. */
-    byte(b, 0x48); byte(b, 0x83); byte(b, 0xec); byte(b, 0x48);
+    /* Shadow space + 8 i32 slots + context + local base + alignment padding. */
+    byte(b, 0x48); byte(b, 0x83); byte(b, 0xec); byte(b, BIO_STACK_SIZE);
     byte(b, 0x4c); byte(b, 0x89); byte(b, 0x44); byte(b, 0x24); byte(b, 64); /* mov [rsp+64],r8 */
+    byte(b, 0x4c); byte(b, 0x89); byte(b, 0x4c); byte(b, 0x24); byte(b, 72); /* mov [rsp+72],r9 */
     if (g->arity > 0) {
         byte(b, 0x89); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(0));
     }
     if (g->arity > 1) {
         byte(b, 0x89); byte(b, 0x54); byte(b, 0x24); byte(b, slot(1));
     }
+    initialize_locals(b, g);
     for (n = g->head->next; n; n = n->next) {
         if (!n->reachable) continue;
         n->code_offset = (uint32_t)b->length;
-        if (n->op_code == OP_LABEL) continue;
+        if (n->op_code == OP_LABEL || n->op_code == OP_VAR || n->op_code == OP_ARRAY) continue;
         guard_step(b, n);
         switch (n->op_code) {
+        case OP_GET:
+            load_locals(b);
+            byte(b, 0x41); byte(b, 0x8b); byte(b, 0x81); word32(b, g->locals[n->arg2].offset * 4u);
+            store_eax(b, n->arg1);
+            break;
+        case OP_SET:
+            load_locals(b); load_eax(b, n->arg2);
+            byte(b, 0x41); byte(b, 0x89); byte(b, 0x81); word32(b, g->locals[n->arg1].offset * 4u);
+            break;
+        case OP_LEN:
+            byte(b, 0xc7); byte(b, 0x44); byte(b, 0x24); byte(b, slot(n->arg1));
+            word32(b, g->locals[n->arg2].count);
+            break;
+        case OP_AGET: case OP_ASET: {
+            const BioLocal *local = &g->locals[n->op_code == OP_AGET ? n->arg2 >> 8 : n->arg1];
+            guard_index(b, n, n->arg2 & 255u, local->count);
+            load_locals(b);
+            if (n->op_code == OP_AGET) {
+                byte(b, 0x41); byte(b, 0x8b); byte(b, 0x84); byte(b, 0x81); /* mov eax,[r9+rax*4+offset] */
+                word32(b, local->offset * 4u); store_eax(b, n->arg1);
+            } else {
+                byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2 >> 8));
+                byte(b, 0x41); byte(b, 0x89); byte(b, 0x8c); byte(b, 0x81); /* mov [r9+rax*4+offset],ecx */
+                word32(b, local->offset * 4u);
+            }
+            break;
+        }
         case OP_LOAD:
             byte(b, 0xc7); byte(b, 0x44); byte(b, 0x24); byte(b, slot(n->arg1));
             word32(b, n->arg2);
@@ -80,11 +157,60 @@ static void emit_gene(Emitter *b, BioGene *g) {
         case OP_MOV:
             load_eax(b, n->arg2); store_eax(b, n->arg1);
             break;
-        case OP_ADD: case OP_SUB: case OP_MUL:
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_AND: case OP_OR: case OP_XOR:
             load_eax(b, n->arg1);
             if (n->op_code == OP_MUL) { byte(b, 0x0f); byte(b, 0xaf); }
-            else byte(b, n->op_code == OP_ADD ? 0x03 : 0x2b);
+            else byte(b, n->op_code == OP_ADD ? 0x03 : n->op_code == OP_SUB ? 0x2b :
+                         n->op_code == OP_AND ? 0x23 : n->op_code == OP_OR ? 0x0b : 0x33);
             byte(b, 0x44); byte(b, 0x24); byte(b, slot(n->arg2));
+            store_eax(b, n->arg1);
+            break;
+        case OP_DIV: case OP_MOD:
+            load_eax(b, n->arg1);
+            byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2)); /* mov ecx,[rsp+slot] */
+            byte(b, 0x85); byte(b, 0xc9); /* test ecx,ecx */
+            require_condition(b, n, BIO_FAULT_DIV_ZERO, 0x75); /* jne */
+            /* Widen both i32 inputs before IDIV: even INT32_MIN / -1 fits i64.
+               Zero is checked first, so IDIV cannot raise a divide exception. */
+            byte(b, 0x48); byte(b, 0x98); /* cdqe */
+            byte(b, 0x48); byte(b, 0x63); byte(b, 0xc9); /* movsxd rcx,ecx */
+            byte(b, 0x48); byte(b, 0x99); /* cqo */
+            byte(b, 0x48); byte(b, 0xf7); byte(b, 0xf9); /* idiv rcx */
+            if (n->op_code == OP_DIV) {
+                byte(b, 0x48); byte(b, 0x63); byte(b, 0xc8); /* movsxd rcx,eax */
+                byte(b, 0x48); byte(b, 0x39); byte(b, 0xc8); /* cmp rax,rcx */
+                require_condition(b, n, BIO_FAULT_DIV_OVERFLOW, 0x74); /* je: quotient fits i32 */
+            } else { byte(b, 0x89); byte(b, 0xd0); } /* mov eax,edx: remainder */
+            store_eax(b, n->arg1);
+            break;
+        case OP_NOT: case OP_LNOT:
+            load_eax(b, n->arg1);
+            if (n->op_code == OP_NOT) { byte(b, 0xf7); byte(b, 0xd0); } /* not eax */
+            else {
+                byte(b, 0x85); byte(b, 0xc0); /* test eax,eax */
+                byte(b, 0x0f); byte(b, 0x94); byte(b, 0xc0); /* sete al */
+                byte(b, 0x0f); byte(b, 0xb6); byte(b, 0xc0); /* movzx eax,al */
+            }
+            store_eax(b, n->arg1);
+            break;
+        case OP_LAND: case OP_LOR: case OP_LXOR:
+            load_eax(b, n->arg1);
+            byte(b, 0x85); byte(b, 0xc0); /* test eax,eax */
+            byte(b, 0x0f); byte(b, 0x95); byte(b, 0xc0); /* setne al */
+            byte(b, 0x0f); byte(b, 0xb6); byte(b, 0xc0); /* movzx eax,al */
+            byte(b, 0x83); byte(b, 0x7c); byte(b, 0x24); byte(b, slot(n->arg2)); byte(b, 0);
+            byte(b, 0x0f); byte(b, 0x95); byte(b, 0xc1); /* setne cl */
+            byte(b, 0x0f); byte(b, 0xb6); byte(b, 0xc9); /* movzx ecx,cl */
+            byte(b, n->op_code == OP_LAND ? 0x23 : n->op_code == OP_LOR ? 0x0b : 0x33);
+            byte(b, 0xc1); /* and/or/xor eax,ecx */
+            store_eax(b, n->arg1);
+            break;
+        case OP_SHL: case OP_SHR: case OP_SAR:
+            load_eax(b, n->arg1);
+            byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2));
+            byte(b, 0x83); byte(b, 0xf9); byte(b, 31); /* cmp ecx,31 */
+            require_condition(b, n, BIO_FAULT_SHIFT, 0x76); /* jbe: unsigned also rejects negatives */
+            byte(b, 0xd3); byte(b, n->op_code == OP_SHL ? 0xe0 : n->op_code == OP_SHR ? 0xe8 : 0xf8);
             store_eax(b, n->arg1);
             break;
         case OP_EQ: case OP_LT: case OP_MIN: case OP_MAX:
@@ -101,6 +227,10 @@ static void emit_gene(Emitter *b, BioGene *g) {
             break;
         case OP_CALL: {
             unsigned argc = n->arg2 >> 16;
+            load_locals(b);
+            if (g->local_cells) {
+                byte(b, 0x49); byte(b, 0x81); byte(b, 0xc1); word32(b, g->local_cells * 4u); /* add r9,own cells */
+            }
             if (argc > 0) {
                 byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2 & 255u));
             } else { byte(b, 0x31); byte(b, 0xc9); }
@@ -137,8 +267,8 @@ int bio_jit(BioProgram *p, BioError *e) {
     uint32_t unwind_offset;
     DWORD old_protection;
     Emitter b = {0};
-    /* Guards and error propagation included: every instruction fits in 96 bytes. */
-    p->allocation_size = (p->stats.nodes + p->gene_count) * 96u + 16u;
+    /* DIV includes three guards; every instruction fits in 160 bytes. */
+    p->allocation_size = (p->stats.nodes + p->gene_count) * 160u + 16u;
     p->code = VirtualAlloc(NULL, p->allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!p->code) { bio_error(e, "VirtualAlloc failed (%lu)", GetLastError()); return 0; }
     b.data = p->code; b.capacity = p->allocation_size;
@@ -164,9 +294,9 @@ int bio_jit(BioProgram *p, BioError *e) {
     }
     while (b.length % 4) byte(&b, 0);
     unwind_offset = (uint32_t)b.length;
-    /* UNWIND_INFO v1; prolog 4 bytes; UWOP_ALLOC_SMALL for sub rsp,72. */
+    /* UNWIND_INFO v1; prolog 4 bytes; UWOP_ALLOC_SMALL matches the frame. */
     byte(&b, 1); byte(&b, 4); byte(&b, 1); byte(&b, 0);
-    byte(&b, 4); byte(&b, 0x82); byte(&b, 0); byte(&b, 0);
+    byte(&b, 4); byte(&b, ((BIO_STACK_SIZE / 8u - 1u) << 4) | 2u); byte(&b, 0); byte(&b, 0);
     if (b.failed) { bio_error(e, "internal error: unwind data exceeds buffer"); return 0; }
     p->unwind_table = calloc(p->stats.live_genes, sizeof(*p->unwind_table));
     if (!p->unwind_table) { bio_error(e, "out of memory allocating unwind table"); return 0; }

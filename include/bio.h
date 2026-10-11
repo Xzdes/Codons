@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define BIO_VERSION "0.4.0"
+#define BIO_VERSION "0.6.0"
 #define BIO_EXECUTION_LIMIT 1000000u
 
 typedef struct BioProgram BioProgram;
@@ -36,7 +36,8 @@ void bio_program_release(BioProgram *program);
 BioStats bio_program_stats(const BioProgram *program);
 /* Return 1 on success; on failure return 0 and leave result unchanged.
    arguments may be NULL only when argument_count is zero.
-   Each invocation has BIO_EXECUTION_LIMIT steps, shared by its nested calls. */
+   Each invocation has BIO_EXECUTION_LIMIT steps, shared by its nested calls.
+   Locals are private to each call; initialization consumes one step per i32 cell. */
 int bio_program_run(const BioProgram *program, const int32_t *arguments, size_t argument_count,
                     int32_t *result, BioError *error);
 int bio_program_interpret(const BioProgram *program, const int32_t *arguments, size_t argument_count,
