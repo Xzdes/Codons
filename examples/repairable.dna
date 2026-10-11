@@ -1,0 +1,5 @@
+# Only the unused final fields are missing; --repair may restore them.
+GENE main i32
+LOAD r0 42
+RET r0
+END _
