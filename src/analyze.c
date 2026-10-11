@@ -33,10 +33,11 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
                 bio_node_error(p, n, e, "undefined label %s in gene %s", p->symbols[target], g->name);
                 return 0;
             }
-        } else if (n->op_code >= OP_GET && n->op_code <= OP_LEN) {
+        } else if (n->op_code >= OP_GET && n->op_code <= OP_WRITE) {
             unsigned i, target = n->op_code == OP_AGET ? n->arg2 >> 8 :
-                (n->op_code == OP_SET || n->op_code == OP_ASET) ? n->arg1 : n->arg2;
-            unsigned array = n->op_code == OP_AGET || n->op_code == OP_ASET || n->op_code == OP_LEN;
+                (n->op_code == OP_SET || n->op_code == OP_ASET || n->op_code == OP_READ || n->op_code == OP_WRITE) ? n->arg1 : n->arg2;
+            unsigned array = n->op_code == OP_AGET || n->op_code == OP_ASET || n->op_code == OP_LEN ||
+                n->op_code == OP_READ || n->op_code == OP_WRITE;
             for (i = 0; i < g->local_count && g->locals[i].symbol != target; ++i) {}
             if (i == g->local_count) {
                 bio_node_error(p, n, e, "undefined local %s in gene %s", p->symbols[target], g->name);
@@ -48,7 +49,7 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
                 return 0;
             }
             if (n->op_code == OP_AGET) n->arg2 = (i << 8) | (n->arg2 & 255u);
-            else if (n->op_code == OP_SET || n->op_code == OP_ASET) n->arg1 = i;
+            else if (n->op_code == OP_SET || n->op_code == OP_ASET || n->op_code == OP_READ || n->op_code == OP_WRITE) n->arg1 = i;
             else n->arg2 = i;
         }
     }
@@ -64,13 +65,14 @@ static unsigned definitions(const CodonNode *n) {
     case OP_SHL: case OP_SHR: case OP_SAR:
     case OP_GET: case OP_AGET: case OP_LEN: return 1u << n->arg1;
     case OP_CALL: return 1;
+    case OP_READ: return 1u << n->arg2;
     default: return 0;
     }
 }
 
 static unsigned reads(const CodonNode *n) {
     switch (n->op_code) {
-    case OP_MOV: case OP_SET: return 1u << n->arg2;
+    case OP_MOV: case OP_SET: case OP_WRITE: return 1u << n->arg2;
     case OP_AGET: return 1u << (n->arg2 & 255u);
     case OP_ASET: return (1u << (n->arg2 & 255u)) | (1u << (n->arg2 >> 8));
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_EQ: case OP_LT: case OP_MIN: case OP_MAX:
@@ -132,7 +134,8 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
             bio_node_error(p, n, e, "read of uninitialized register r%u on a reachable path", r);
             return 0;
         }
-        if (n->op_code == OP_JMP || n->op_code == OP_JZ || n->op_code == OP_JNZ)
+        if (n->op_code == OP_JMP || n->op_code == OP_JZ || n->op_code == OP_JNZ ||
+            n->op_code == OP_READ || n->op_code == OP_WRITE)
             g->dynamic_steps = 1;
     }
     return 1;

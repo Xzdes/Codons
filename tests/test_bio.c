@@ -413,6 +413,142 @@ static void memory_concurrent_tests(void) {
     bio_program_release(p);
 }
 
+typedef int (*RunIO)(const BioProgram *, const int32_t *, size_t, BioIO *, int32_t *, BioError *);
+
+static DWORD WINAPI io_reader(LPVOID arg) {
+    MemoryWorker *worker = arg;
+    unsigned i;
+    for (i = 0; i < 120; ++i) {
+        int32_t input[5] = {(int32_t)worker->id, (int32_t)i, INT32_MIN, 4, 5};
+        int32_t output[3] = {99, 99, 99}, result = 99;
+        BioIO io = {input, i % 3 ? 3 : 5, output, 3, 77, 77};
+        BioError e = {{0}};
+        RunIO run = i % 2 ? bio_program_run_io : bio_program_interpret_io;
+        int ok = run(worker->program, NULL, 0, &io, &result, &e);
+        if (i % 3 ? (!ok || result != 3 || io.output_count != 3 || io.output_written != 1 ||
+                     memcmp(input, output, sizeof(output)) || *e.message) :
+            (ok || result != 99 || io.output_count != 77 || io.output_written != 77 ||
+             output[0] != 99 || !strstr(e.message, "READ input has 5 numbers")))
+            InterlockedIncrement(&worker->failures);
+    }
+    return 0;
+}
+
+static void io_tests(void) {
+    BioError e = {{0}};
+    unsigned mode, slot;
+    char source[1024];
+    const int32_t input[] = {INT32_MIN, -7, INT32_MAX, 55, 99};
+    int32_t output[6], result;
+    BioProgram *p;
+    for (slot = 0; slot < 8; ++slot) {
+        snprintf(source, sizeof(source), "GENE main i32\nVAR before 99\nARRAY a 4\nVAR after 77\n"
+                 "READ a r%u\nWRITE a r%u\nRET r%u _\nEND _ _\n", slot, slot, slot);
+        write_source("io.dna", source); p = compile_name("io.dna", 0, &e); REQUIRE(p != NULL);
+        REQUIRE(p->stats.dynamic_steps && p->stats.execution_steps == 0);
+        for (mode = 0; mode < 2; ++mode) {
+            RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
+            BioIO io = {input, 3, output + 1, 4, 99, 99};
+            unsigned i;
+            for (i = 0; i < 6; ++i) output[i] = 123;
+            REQUIRE(run(p, NULL, 0, &io, &result, &e) && result == 3);
+            REQUIRE(io.output_written == 1 && io.output_count == 3);
+            REQUIRE(!memcmp(output + 1, input, 3 * sizeof(*input)));
+            REQUIRE(output[0] == 123 && output[4] == 123 && output[5] == 123);
+            io.input_count = 0;
+            REQUIRE(run(p, NULL, 0, &io, &result, &e) && result == 0);
+            REQUIRE(io.output_written == 1 && io.output_count == 0 && output[1] == INT32_MIN);
+            io.input_count = 4;
+            REQUIRE(run(p, NULL, 0, &io, &result, &e) && result == 4);
+            REQUIRE(io.output_count == 4 && output[4] == 55);
+            io.input_count = 5; result = 999;
+            REQUIRE(!run(p, NULL, 0, &io, &result, &e));
+            REQUIRE(strstr(e.message, "READ input has 5 numbers; array capacity is 4") != NULL);
+            REQUIRE(result == 999 && io.output_count == 4 && io.output_written == 1 && output[4] == 55);
+            io.input_count = 4; io.output_capacity = 3;
+            REQUIRE(!run(p, NULL, 0, &io, &result, &e));
+            REQUIRE(strstr(e.message, "WRITE count 4 exceeds output capacity 3") != NULL);
+            io.input = NULL; io.input_count = 0;
+            REQUIRE(!run(p, NULL, 0, &io, &result, &e) && strstr(e.message, "READ requires an input list"));
+            io.input = input; io.input_count = 3; io.output = NULL; io.output_capacity = 0;
+            REQUIRE(!run(p, NULL, 0, &io, &result, &e) && strstr(e.message, "WRITE requires an output list"));
+            io.input_count = BIO_LIST_LIMIT + 1u;
+            REQUIRE(!run(p, NULL, 0, &io, &result, &e) && strstr(e.message, "invalid BioIO"));
+        }
+        bio_program_release(p);
+    }
+    /* Last WRITE is a snapshot, remains valid after the callee returns, and is transactional. */
+    write_source("io.dna", "GENE main i32/1\nARRAY parent 4\nREAD parent r2\nWRITE parent r2\n"
+                 "JNZ r0 fail\nCALL child _\nRET r0 _\nLABEL fail _\nLOAD r1 0\nDIV r0 r1\nRET r0 _\nEND _ _\n"
+                 "GENE child i32\nVAR pad 42\nARRAY a 4\nREAD a r0\nLOAD r1 0\nLOAD r2 88\nASET a r1,r2\n"
+                 "READ a r0\nLOAD r1 1\nWRITE a r1\nASET a r1,r2\nRET r0 _\nEND _ _\n");
+    p = compile_name("io.dna", 0, &e); REQUIRE(p != NULL);
+    for (mode = 0; mode < 2; ++mode) {
+        RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
+        int32_t arg = 0;
+        BioIO io = {input, 3, output, 6, 99, 99};
+        output[0] = 123;
+        REQUIRE(run(p, &arg, 1, &io, &result, &e));
+        REQUIRE(result == 3 && io.output_count == 1 && output[0] == INT32_MIN);
+        arg = 1; output[0] = 123; result = 456;
+        REQUIRE(!run(p, &arg, 1, &io, &result, &e) && strstr(e.message, "division by zero"));
+        REQUIRE(output[0] == 123 && io.output_count == 1 && io.output_written == 1 && result == 456);
+    }
+    bio_program_release(p);
+    expect_error("GENE main i32\nVAR x 0\nREAD x r0\nRET r0 _\nEND _ _\n", "requires an array");
+    expect_error("GENE main i32\nARRAY a 1\nWRITE a r7\nLOAD r0 0\nRET r0 _\nEND _ _\n", "uninitialized register r7");
+    expect_error("GENE main i32\nREAD missing r0\nRET r0 _\nEND _ _\n", "undefined local");
+    expect_error("GENE main i32\nARRAY a 1\nREAD a _\n", "requires '<array> rN'");
+    expect_error("GENE main i32\nARRAY a 1\nWRITE a 1\n", "requires '<array> rN'");
+    /* Exactly one million steps: 1 init + 2 setup + 249999*(READ+cell+SUB+JNZ) + RET. */
+    write_source("io-budget.dna", "GENE main i32/1\nARRAY a 1\nMOV r3 r0\nLOAD r4 1\nLABEL loop _\n"
+                 "READ a r2\nSUB r3 r4\nJNZ r3 loop\nRET r2 _\nEND _ _\n");
+    p = compile_name("io-budget.dna", 0, &e); REQUIRE(p != NULL);
+    for (mode = 0; mode < 2; ++mode) {
+        RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
+        BioIO io = {input, 1, NULL, 0, 9, 9};
+        int32_t arg = 249999;
+        REQUIRE(run(p, &arg, 1, &io, &result, &e) && result == 1);
+        REQUIRE(io.output_count == 0 && io.output_written == 0);
+        arg = 250000;
+        REQUIRE(!run(p, &arg, 1, &io, &result, &e) && strstr(e.message, "execution budget exhausted"));
+        REQUIRE(result == 1 && io.output_count == 0 && io.output_written == 0);
+    }
+    bio_program_release(p);
+    write_source("io-runtime.dna", "GENE main i32\nARRAY a 3\nREAD a r0\nWRITE a r0\nRET r0 _\nEND _ _\n");
+    p = compile_name("io-runtime.dna", 0, &e); REQUIRE(p != NULL);
+    {
+        BioRuntime *runtime = bio_runtime_create(p, &e);
+        MemoryWorker workers[4] = {0};
+        HANDLE threads[4];
+        unsigned i;
+        BioIO io = {input, 3, output, 6, 0, 0};
+        REQUIRE(runtime != NULL);
+        REQUIRE(bio_runtime_run_io(runtime, NULL, 0, &io, &result, &e) && result == 3);
+        REQUIRE(io.output_count == 3 && !memcmp(output, input, 3 * sizeof(*input)));
+        bio_runtime_destroy(runtime);
+        for (i = 0; i < 4; ++i) {
+            workers[i].program = p; workers[i].id = i;
+            threads[i] = CreateThread(NULL, 0, io_reader, &workers[i], 0, NULL); REQUIRE(threads[i] != NULL);
+        }
+        REQUIRE(WaitForMultipleObjects(4, threads, TRUE, 10000) == WAIT_OBJECT_0);
+        for (i = 0; i < 4; ++i) { REQUIRE(workers[i].failures == 0); CloseHandle(threads[i]); }
+    }
+    for (mode = 0; mode < 2; ++mode) {
+        RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
+        BioIO io = {input, 0, output, 0, 77, 77};
+        output[0] = 99;
+        REQUIRE(run(p, NULL, 0, &io, &result, &e) && result == 0);
+        REQUIRE(io.output_count == 0 && io.output_written == 1 && output[0] == 99);
+        /* In-place API input/output is safe: publication happens after the computation. */
+        output[0] = -17; output[1] = 42;
+        io.input = output; io.input_count = 2; io.output_capacity = 3;
+        REQUIRE(run(p, NULL, 0, &io, &result, &e) && result == 2);
+        REQUIRE(output[0] == -17 && output[1] == 42 && io.output_count == 2);
+    }
+    bio_program_release(p);
+}
+
 static void module_and_repair_tests(void) {
     BioError e = {{0}};
     BioProgram *p;
@@ -825,6 +961,7 @@ int main(void) {
     memory_error_tests();
     memory_call_and_budget_tests();
     memory_concurrent_tests();
+    io_tests();
     module_and_repair_tests();
     differential_tests();
     argument_tests();

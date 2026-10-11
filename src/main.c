@@ -10,6 +10,8 @@ typedef struct {
     const char *command;
     const char *path;
     const char *output;
+    const char *input_list;
+    const char *output_list;
     int32_t arguments[2];
     size_t argument_count;
     int repair;
@@ -33,9 +35,11 @@ static void usage(void) {
          "\nOptions after the file: --repair, --json\n"
          "  --repair restores only an unused '_' in RET/END\n"
          "  --json is available for new, run, test, check, interpret and emit\n"
+         "  run/interpret: --input <numbers.txt> --output <result.txt>\n"
+         "  Lists: one i32 per nonblank UTF-8 line; output must be a new file\n"
          "CSV header: expected | arg1,expected | arg1,arg2,expected\n"
          "Live commands: run [number ...] | reload <file.dna> | quit\n"
-         "Every run shares a 1000000-step budget across loops, calls and local initialization.\n"
+         "Every run shares a 1000000-step budget across loops, calls, initialization and list copies.\n"
          "Exit codes: 0 success, 1 failed tests or program/file error, 2 invalid command or arguments");
 }
 
@@ -93,7 +97,16 @@ static int options(int argc, char **argv, Options *o, BioError *e) {
     for (i = (is_emit || is_test) ? 4 : 3; i < argc; ++i) {
         if (!strcmp(argv[i], "--repair")) o->repair = 1;
         else if (!strcmp(argv[i], "--json")) o->json = 1;
-        else if ((!strcmp(o->command, "run") || !strcmp(o->command, "interpret")) &&
+        else if (!strcmp(argv[i], "--input") || !strcmp(argv[i], "--output")) {
+            const char **target = !strcmp(argv[i], "--input") ? &o->input_list : &o->output_list;
+            if (strcmp(o->command, "run") && strcmp(o->command, "interpret")) {
+                bio_error(e, "%s is supported only for run and interpret", argv[i]); return 0;
+            }
+            if (*target || i + 1 == argc || !argv[i + 1][0] || !strncmp(argv[i + 1], "--", 2)) {
+                bio_error(e, "%s requires exactly one file path and cannot be repeated", argv[i]); return 0;
+            }
+            *target = argv[++i];
+        } else if ((!strcmp(o->command, "run") || !strcmp(o->command, "interpret")) &&
                  o->argument_count < 2 && cli_parse_i32(argv[i], &o->arguments[o->argument_count]))
             ++o->argument_count;
         else {
@@ -226,12 +239,38 @@ static int cli(int argc, char **argv) {
             bio_error(&e, "main expects %u arguments, got %zu", s.arity, o.argument_count);
             code = failure(o.json, "arguments", e.message, 2);
         } else {
-            int ok = is_interpret ? bio_program_interpret(p, o.arguments, o.argument_count, &result, &e) :
-                                    bio_program_run(p, o.arguments, o.argument_count, &result, &e);
-            if (!ok) code = failure(o.json, "run", e.message, 1);
+            BioIO io = {0};
+            int32_t *input = NULL, *output = NULL;
+            size_t input_count = 0;
+            int ok = 1;
+            const char *stage = "file";
+            if (o.input_list) ok = cli_read_list(o.input_list, &input, &input_count, &e);
+            if (ok && o.output_list) {
+                output = malloc(BIO_LIST_LIMIT * sizeof(*output));
+                if (!output) { bio_error(&e, "out of memory preparing output list"); ok = 0; }
+            }
+            io.input = input; io.input_count = input_count;
+            io.output = output; io.output_capacity = output ? BIO_LIST_LIMIT : 0;
+            if (ok) {
+                stage = "run";
+                ok = is_interpret ? bio_program_interpret_io(p, o.arguments, o.argument_count, &io, &result, &e) :
+                                    bio_program_run_io(p, o.arguments, o.argument_count, &io, &result, &e);
+            }
+            if (ok && o.output_list) {
+                stage = "file";
+                if (!io.output_written) { bio_error(&e, "program did not execute WRITE; output file was not created"); ok = 0; }
+                else ok = cli_write_list(o.output_list, output, io.output_count, &e);
+            }
+            if (!ok) code = failure(o.json, stage, e.message, 1);
             else if (o.json) {
-                printf("{\"ok\":true,\"result\":%" PRId32 ",", result); stats(s, 1); puts("}");
+                printf("{\"ok\":true,\"result\":%" PRId32 ",", result); stats(s, 1);
+                if (o.output_list) {
+                    fputs(",\"output\":", stdout); cli_json_string(o.output_list);
+                    printf(",\"output_count\":%zu", io.output_count);
+                }
+                puts("}");
             } else printf("%" PRId32 "\n", result);
+            free(input); free(output);
         }
     } else if (!strcmp(o.command, "check")) {
         if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); puts("}"); }

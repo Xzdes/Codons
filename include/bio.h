@@ -5,8 +5,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define BIO_VERSION "0.6.0"
+#define BIO_VERSION "0.7.0"
 #define BIO_EXECUTION_LIMIT 1000000u
+#define BIO_LIST_LIMIT 65536u
 
 typedef struct BioProgram BioProgram;
 typedef struct BioRuntime BioRuntime;
@@ -28,6 +29,22 @@ typedef struct {
     uint32_t entry_offset;
 } BioStats;
 
+/* Optional lists for one invocation. NULL pointers mean unavailable channels.
+   For an available empty input or zero-capacity output, pass a non-NULL pointer.
+   Counts/capacities may not exceed BIO_LIST_LIMIT. Input is read-only.
+   Each READ copies the same input; the last WRITE supplies the output.
+   On success output_count/output_written describe that WRITE (both zero if absent).
+   On failure result, output data, output_count and output_written stay unchanged.
+   Concurrent calls must use separate BioIO/output storage. */
+typedef struct {
+    const int32_t *input;
+    size_t input_count;
+    int32_t *output;
+    size_t output_capacity;
+    size_t output_count;
+    int output_written;
+} BioIO;
+
 /* Repair only restores an omitted unused '_' in RET/END. */
 BioProgram *bio_compile(const char *path, int repair, BioError *error);
 /* Load and validate without allocating executable memory. Paths are UTF-8. */
@@ -42,6 +59,10 @@ int bio_program_run(const BioProgram *program, const int32_t *arguments, size_t 
                     int32_t *result, BioError *error);
 int bio_program_interpret(const BioProgram *program, const int32_t *arguments, size_t argument_count,
                           int32_t *result, BioError *error);
+int bio_program_run_io(const BioProgram *program, const int32_t *arguments, size_t argument_count,
+                       BioIO *io, int32_t *result, BioError *error);
+int bio_program_interpret_io(const BioProgram *program, const int32_t *arguments, size_t argument_count,
+                             BioIO *io, int32_t *result, BioError *error);
 void bio_program_dump(const BioProgram *program, FILE *out);
 int bio_program_write_code(const BioProgram *program, const char *path, BioError *error);
 
@@ -50,6 +71,8 @@ int bio_program_write_code(const BioProgram *program, const char *path, BioError
 BioRuntime *bio_runtime_create(BioProgram *initial, BioError *error);
 int bio_runtime_run(BioRuntime *runtime, const int32_t *arguments, size_t argument_count,
                     int32_t *result, BioError *error);
+int bio_runtime_run_io(BioRuntime *runtime, const int32_t *arguments, size_t argument_count,
+                       BioIO *io, int32_t *result, BioError *error);
 int bio_runtime_reload(BioRuntime *runtime, const char *path, int repair, BioError *error);
 void bio_runtime_destroy(BioRuntime *runtime);
 

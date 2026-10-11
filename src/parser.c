@@ -212,6 +212,16 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             n->arg1 = (uint32_t)sym; n->arg2 = (uint32_t)value;
             continue;
         }
+        if (!strcmp(fields[0], "READ") || !strcmp(fields[0], "WRITE")) {
+            int sym;
+            a = reg(fields[2]);
+            if (!identifier(fields[1]) || a < 0) FAIL("%s requires '<array> rN' (r0..r7)", fields[0]);
+            sym = symbol(p, fields[1]);
+            if (sym < 0) FAIL("apoptosis: symbol budget exceeded");
+            n->op_code = !strcmp(fields[0], "READ") ? OP_READ : OP_WRITE;
+            n->arg1 = (uint32_t)sym; n->arg2 = (uint32_t)a;
+            continue;
+        }
         if (!strcmp(fields[0], "GET") || !strcmp(fields[0], "SET") ||
             !strcmp(fields[0], "AGET") || !strcmp(fields[0], "ASET") || !strcmp(fields[0], "LEN")) {
             int sym, store = !strcmp(fields[0], "SET") || !strcmp(fields[0], "ASET");

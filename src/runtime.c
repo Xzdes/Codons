@@ -19,6 +19,11 @@ BioRuntime *bio_runtime_create(BioProgram *initial, BioError *e) {
 
 int bio_runtime_run(BioRuntime *runtime, const int32_t *arguments, size_t argument_count,
                     int32_t *result, BioError *e) {
+    return bio_runtime_run_io(runtime, arguments, argument_count, NULL, result, e);
+}
+
+int bio_runtime_run_io(BioRuntime *runtime, const int32_t *arguments, size_t argument_count,
+                       BioIO *io, int32_t *result, BioError *e) {
     BioProgram *p;
     int ok;
     if (!runtime) { bio_error(e, "runtime is required"); return 0; }
@@ -27,7 +32,7 @@ int bio_runtime_run(BioRuntime *runtime, const int32_t *arguments, size_t argume
     p = runtime->active;
     bio_program_retain(p);
     ReleaseSRWLockShared(&runtime->lock);
-    ok = bio_program_run(p, arguments, argument_count, result, e);
+    ok = bio_program_run_io(p, arguments, argument_count, io, result, e);
     bio_program_release(p);
     return ok;
 }

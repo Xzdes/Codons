@@ -61,7 +61,7 @@ class CliTests(unittest.TestCase):
         return proc
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.6.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.7.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -199,7 +199,7 @@ class CliTests(unittest.TestCase):
             self.assertFalse(data["ok"])
             self.assertNotIn("result", data)
             self.assertEqual(data["error"]["stage"], "run")
-            self.assertIn("execution budget exhausted after 1000000 steps", data["error"]["message"])
+            self.assertIn("execution budget exhausted (limit: 1000000 steps)", data["error"]["message"])
             messages.append(data["error"]["message"])
         self.assertEqual(messages[0], messages[1])
 
@@ -491,6 +491,170 @@ class CliTests(unittest.TestCase):
         for command in ("run", "interpret"):
             self.assertEqual(int(self.call(command, EXAMPLES / "array_sum.dna", 2, 3).stdout), 392)
             self.assertIn("array index 8 out of bounds", self.call(command, EXAMPLES / "array_at.dna", 8, code=1).stderr)
+
+    def test_list_roundtrip_unicode_encodings_and_empty(self):
+        source = self.source("GENE main i32/2\nARRAY a 8\nREAD a r7\nWRITE a r7\nADD r0 r1\nRET r0 _\nEND _ _\n")
+        inputs = [b"", b"\xef\xbb\xbf", b"\n \t\r\n", b"-2147483648\n0\n2147483647",
+                  b"\xef\xbb\xbf  +7 \r\n\r\n\t-0\t\r\n00012\r\n"]
+        for index, content in enumerate(inputs):
+            path = self.root / "Список чисел.txt"
+            path.write_bytes(content)
+            expected = [int(line.strip()) for line in content.decode("utf-8-sig").splitlines() if line.strip()]
+            for command in ("run", "interpret"):
+                output = self.root / f"Результат {index} {command}.txt"
+                proc = self.call(command, source, 12, "--input", path, "--output", output, -5, "--json")
+                data = json.loads(proc.stdout)
+                self.assertEqual(data["result"], 7)
+                self.assertEqual(data["output_count"], len(expected))
+                self.assertEqual(data["output"], str(output))
+                self.assertEqual(output.read_bytes(), "".join(f"{n}\n" for n in expected).encode())
+                self.assertEqual(proc.stderr, "")
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_list_input_errors_have_locations(self):
+        source = self.source("GENE main i32\nARRAY a 8\nREAD a r0\nWRITE a r0\nRET r0 _\nEND _ _\n")
+        cases = [(b"7\nno\n", "decimal i32", 2), (b"2147483648\n", "decimal i32", 1),
+                 (b"-2147483649\n", "decimal i32", 1), (b"1,2\n", "decimal i32", 1),
+                 (b"1 2\n", "decimal i32", 1), (b"0x10\n", "decimal i32", 1),
+                 (b"1.5\n", "decimal i32", 1), (b"# comment\n", "decimal i32", 1),
+                 (b"7\n\xff\n", "valid UTF-8", 2), (b"7\x00\n", "NUL", 1),
+                 (b"0" * 512 + b"\n", "511 bytes", 1), (b"\n\xef\xbb\xbf7\n", "decimal i32", 2)]
+        path, output = self.root / "input.txt", self.root / "output.txt"
+        for content, message, line in cases:
+            path.write_bytes(content)
+            for command in ("run", "interpret"):
+                with self.subTest(content=content[:20], command=command):
+                    data = json.loads(self.call(command, source, "--input", path, "--output", output, "--json", code=1).stdout)
+                    self.assertEqual(data["error"]["stage"], "file")
+                    self.assertIn(f"{path}:{line}:", data["error"]["message"])
+                    self.assertIn(message, data["error"]["message"])
+                    self.assertFalse(output.exists())
+        path.write_bytes(b"0" * 511 + b"\n")
+        self.assertEqual(self.call("run", source, "--input", path, "--output", output).stdout.strip(), "1")
+        self.assertEqual(output.read_text(), "0\n")
+
+    def test_list_bounds_channels_and_failure_discards_output(self):
+        source = self.source("GENE main i32/1\nARRAY a 3\nREAD a r2\nWRITE a r0\n"
+                             "LOAD r1 0\nDIV r0 r1\nRET r0 _\nEND _ _\n")
+        path = self.source("7\n8\n9\n", "input.txt")
+        output = self.root / "output.txt"
+        for command in ("run", "interpret"):
+            for count in [-2147483648, -1, 4, 2147483647]:
+                data = json.loads(self.call(command, source, count, "--input", path, "--output", output, "--json", code=1).stdout)
+                self.assertEqual(data["error"]["stage"], "run")
+                self.assertIn(f"WRITE count {count} out of bounds: expected 0..3", data["error"]["message"])
+                self.assertFalse(output.exists())
+            self.assertIn("division by zero", self.call(command, source, 3, "--input", path, "--output", output, code=1).stderr)
+            self.assertFalse(output.exists())
+            self.assertIn("READ requires an input list", self.call(command, source, 3, "--output", output, code=1).stderr)
+            self.assertIn("WRITE requires an output list", self.call(command, source, 3, "--input", path, code=1).stderr)
+        path.write_text("1\n2\n3\n4\n")
+        for command in ("run", "interpret"):
+            self.assertIn("READ input has 4 numbers; array capacity is 3",
+                          self.call(command, source, 3, "--input", path, "--output", output, code=1).stderr)
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_list_output_preserves_existing_files_and_no_write(self):
+        source = self.source("GENE main i32\nARRAY a 3\nREAD a r0\nWRITE a r0\nRET r0 _\nEND _ _\n")
+        path = self.source("1\n2\n3\n", "input.txt")
+        existing = self.source("do not change", "existing.txt")
+        for command in ("run", "interpret"):
+            for output in [existing, path, source]:
+                before = output.read_bytes()
+                data = json.loads(self.call(command, source, "--input", path, "--output", output, "--json", code=1).stdout)
+                self.assertEqual(data["error"]["stage"], "file")
+                self.assertIn("already exists", data["error"]["message"])
+                self.assertEqual(output.read_bytes(), before)
+            self.call(command, source, "--input", path, "--output", self.root / "absent" / "out.txt", code=1)
+            self.call(command, source, "--input", path, "--output", str(existing) + ":stream", code=1)
+            self.assertEqual(existing.read_text(), "do not change")
+        without = self.source("GENE main i32\nLOAD r0 42\nRET r0 _\nEND _ _\n", "no-write.dna")
+        output = self.root / "output.txt"
+        self.assertIn("did not execute WRITE", self.call("run", without, "--output", output, code=1).stderr)
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_list_options_and_file_failures(self):
+        source = self.source("GENE main i32\nARRAY a 1\nREAD a r0\nRET r0 _\nEND _ _\n")
+        for flags in [("--input",), ("--output",), ("--input", "--json"),
+                      ("--input", "a", "--input", "b"), ("--output", "a", "--output", "b")]:
+            data = json.loads(self.call("run", source, *flags, "--json", code=2).stdout)
+            self.assertEqual(data["error"]["stage"], "arguments")
+        for command in ["check", "dump", "live", "new"]:
+            self.call(command, source, "--input", "a", code=2)
+        self.call("test", source, "a.csv", "--output", "b", code=2)
+        self.call("emit", source, "a.bin", "--input", "b", code=2)
+        for path in [self.root / "absent.txt", self.root, "NUL"]:
+            data = json.loads(self.call("run", source, "--input", path, "--json", code=1).stdout)
+            self.assertEqual(data["error"]["stage"], "file")
+
+    def test_list_limits_and_transfer_budget(self):
+        source = self.source("GENE main i32\nARRAY a 65536\nREAD a r0\nWRITE a r0\nRET r0 _\nEND _ _\n")
+        path = self.root / "input.txt"
+        path.write_bytes(b"-2147483648\n" * 65536)
+        for command in ("run", "interpret"):
+            output = self.root / f"{command}.txt"
+            self.assertEqual(self.call(command, source, "--input", path, "--output", output).stdout.strip(), "65536")
+            self.assertEqual(output.read_bytes(), path.read_bytes())
+        for content, message in [(b"0\n" * 65537, "65536 numbers"), (b"\n" * (1024 * 1024 + 1), "1 MiB")]:
+            path.write_bytes(content)
+            self.assertIn(message, self.call("run", source, "--input", path, code=1).stderr)
+        path.write_bytes(b"0\n" * 65536)
+        source = self.source("GENE main i32/1\nARRAY a 65536\nREAD a r1\nLOAD r2 1\nLABEL loop _\n"
+                             "WRITE a r1\nSUB r0 r2\nJNZ r0 loop\nRET r1 _\nEND _ _\n")
+        for command in ("run", "interpret"):
+            output = self.root / f"budget-{command}.txt"
+            self.assertIn("execution budget exhausted", self.call(command, source, 14, "--input", path, "--output", output, code=1).stderr)
+            self.assertFalse(output.exists())
+            self.assertEqual(self.call(command, source, 13, "--input", path, "--output", output).stdout.strip(), "65536")
+
+    def test_list_snapshots_repeated_read_write_and_dump(self):
+        source = self.source("GENE main i32\nVAR pad 99\nARRAY a 4\nREAD a r0\n"
+                             "LOAD r1 0\nLOAD r2 77\nASET a r1,r2\nWRITE a r0\n"
+                             "READ a r7\nLOAD r6 1\nWRITE a r6\nASET a r1,r2\nRET r7 _\nEND _ _\n")
+        normalized = self.source(self.call("dump", source).stdout, "normalized.dna")
+        path = self.source("-7\n8\n9\n", "input.txt")
+        for i, program in enumerate([source, normalized]):
+            for command in ("run", "interpret"):
+                output = self.root / f"{command}-{i}.txt"
+                self.assertEqual(self.call(command, program, "--input", path, "--output", output).stdout.strip(), "3")
+                self.assertEqual(output.read_text(), "-7\n")
+        self.assertIsNone(json.loads(self.call("check", source, "--json").stdout)["stats"]["execution_steps"])
+        # A skipped READ/WRITE does not require a file channel.
+        skipped = self.source("GENE main i32\nARRAY a 1\nJMP done _\nREAD a r0\nWRITE a r0\n"
+                              "LABEL done _\nLOAD r0 42\nRET r0 _\nEND _ _\n")
+        for command in ("run", "interpret"):
+            self.assertEqual(self.call(command, skipped).stdout.strip(), "42")
+
+    def test_list_generated_practical_programs(self):
+        rng = random.Random(707)
+        datasets = [[], [5], [7, -3, 0, 7, 12, -9, 4], [2147483647, -2147483648, 0], list(range(255, -1, -1))]
+        datasets += [[rng.randrange(-2**31, 2**31) for _ in range(rng.randrange(81))] for _ in range(40)]
+        for case, values in enumerate(datasets):
+            path = self.source("".join(f"{n}\n" for n in values), "input.txt")
+            threshold = rng.randrange(-2**31, 2**31)
+            for command in ("run", "interpret"):
+                with self.subTest(case=case, command=command):
+                    self.assertEqual(int(self.call(command, EXAMPLES / "list_sum.dna", "--input", path).stdout), i32(sum(values)))
+                    for name, args, expected in [("list_sort", [], sorted(values)),
+                                                  ("list_filter", [threshold], [n for n in values if n >= threshold])]:
+                        output = self.root / f"{case}-{command}-{name}.txt"
+                        proc = self.call(command, EXAMPLES / f"{name}.dna", *args, "--input", path, "--output", output)
+                        self.assertEqual(int(proc.stdout), len(expected))
+                        self.assertEqual([int(n) for n in output.read_text().splitlines()], expected)
+
+    def test_list_competing_writers_publish_one_complete_file(self):
+        source = self.source("GENE main i32\nARRAY a 65536\nREAD a r0\nWRITE a r0\nRET r0 _\nEND _ _\n")
+        inputs = [self.source((str(value) + "\n") * 65536, f"input-{value}.txt") for value in [7, -9]]
+        output = self.root / "result.txt"
+        processes = [subprocess.Popen([str(EXE), "run", str(source), "--input", str(path), "--output", str(output)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8") for path in inputs]
+        results = [p.communicate(timeout=10) for p in processes]
+        self.assertEqual(sorted(p.returncode for p in processes), [0, 1], results)
+        winner = next(i for i, p in enumerate(processes) if p.returncode == 0)
+        # Windows text fixtures use CRLF; exported lists deliberately use LF.
+        self.assertEqual(output.read_bytes(), inputs[winner].read_text(encoding="utf-8").encode("utf-8"))
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
 
     def test_csv_mismatches_do_not_stop_the_suite(self):
         source = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n")

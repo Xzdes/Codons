@@ -29,7 +29,7 @@ typedef enum {
     OP_EQ, OP_LT, OP_MIN, OP_MAX, OP_LABEL, OP_JMP, OP_JZ, OP_JNZ,
     OP_DIV, OP_MOD, OP_AND, OP_OR, OP_XOR, OP_NOT,
     OP_LAND, OP_LOR, OP_LXOR, OP_LNOT, OP_SHL, OP_SHR, OP_SAR,
-    OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN
+    OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN, OP_READ, OP_WRITE
 } BioOp;
 
 typedef struct CodonNode {
@@ -88,7 +88,9 @@ typedef struct {
 /* Each invocation owns one context; nested calls share it, parallel runs do not. */
 typedef enum {
     BIO_FAULT_NONE, BIO_FAULT_BUDGET, BIO_FAULT_DIV_ZERO,
-    BIO_FAULT_DIV_OVERFLOW, BIO_FAULT_SHIFT, BIO_FAULT_BOUNDS
+    BIO_FAULT_DIV_OVERFLOW, BIO_FAULT_SHIFT, BIO_FAULT_BOUNDS,
+    BIO_FAULT_INPUT, BIO_FAULT_OUTPUT, BIO_FAULT_READ_SIZE,
+    BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE
 } BioFault;
 
 typedef struct {
@@ -97,6 +99,13 @@ typedef struct {
     uint32_t fault;
     int32_t bad_index;
     uint32_t bound;
+    const int32_t *input;
+    uint32_t input_count;
+    uint32_t reserved;
+    int32_t *output;
+    uint32_t output_count;
+    uint32_t output_capacity;
+    uint32_t output_written;
 } BioExecution;
 
 _Static_assert(offsetof(BioExecution, remaining) == 0, "JIT budget offset");
@@ -104,6 +113,12 @@ _Static_assert(offsetof(BioExecution, failed_node) == 8, "JIT fault offset");
 _Static_assert(offsetof(BioExecution, fault) == 12, "JIT fault kind offset");
 _Static_assert(offsetof(BioExecution, bad_index) == 16, "JIT array index offset");
 _Static_assert(offsetof(BioExecution, bound) == 20, "JIT array bound offset");
+_Static_assert(offsetof(BioExecution, input) == 24, "JIT input pointer offset");
+_Static_assert(offsetof(BioExecution, input_count) == 32, "JIT input count offset");
+_Static_assert(offsetof(BioExecution, output) == 40, "JIT output pointer offset");
+_Static_assert(offsetof(BioExecution, output_count) == 48, "JIT output count offset");
+_Static_assert(offsetof(BioExecution, output_capacity) == 52, "JIT output capacity offset");
+_Static_assert(offsetof(BioExecution, output_written) == 56, "JIT output flag offset");
 
 struct BioProgram {
     volatile LONG references;

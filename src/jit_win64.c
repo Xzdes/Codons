@@ -103,6 +103,55 @@ static void guard_index(Emitter *b, const CodonNode *n, unsigned r, uint32_t cou
     require_condition(b, n, BIO_FAULT_BOUNDS, 0x72); /* unsigned jb rejects negative indices too */
 }
 
+static void emit_transfer(Emitter *b, const BioGene *g, const CodonNode *n) {
+    const BioLocal *local = &g->locals[n->arg1];
+    int reading = n->op_code == OP_READ;
+    size_t empty_patch, loop, distance;
+    /* R10=source, R11=destination, ECX=count. All are volatile under Windows x64. */
+    byte(b, 0x4d); byte(b, 0x8b); byte(b, reading ? 0x50 : 0x58); byte(b, reading ? 24 : 40);
+    byte(b, 0x4d); byte(b, 0x85); byte(b, reading ? 0xd2 : 0xdb);
+    require_condition(b, n, reading ? BIO_FAULT_INPUT : BIO_FAULT_OUTPUT, 0x75);
+    if (reading) { byte(b, 0x41); byte(b, 0x8b); byte(b, 0x48); byte(b, 32); }
+    else { byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2)); }
+    byte(b, 0x41); byte(b, 0x89); byte(b, 0x48); byte(b, 16); /* bad_index=ecx */
+    byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 20); word32(b, local->count);
+    byte(b, 0x81); byte(b, 0xf9); word32(b, local->count); /* cmp ecx,array capacity */
+    require_condition(b, n, reading ? BIO_FAULT_READ_SIZE : BIO_FAULT_WRITE_SIZE, 0x76);
+    if (!reading) {
+        byte(b, 0x41); byte(b, 0x8b); byte(b, 0x40); byte(b, 52); /* eax=output capacity */
+        byte(b, 0x41); byte(b, 0x89); byte(b, 0x40); byte(b, 20);
+        byte(b, 0x39); byte(b, 0xc1); /* cmp ecx,eax */
+        require_condition(b, n, BIO_FAULT_OUTPUT_SIZE, 0x76);
+    }
+    /* The opcode already consumed one step; reserve one more per copied cell. */
+    byte(b, 0x49); byte(b, 0x39); byte(b, 0x08); /* cmp [r8],rcx */
+    require_condition(b, n, BIO_FAULT_BUDGET, 0x73); /* jae */
+    byte(b, 0x49); byte(b, 0x29); byte(b, 0x08); /* sub [r8],rcx */
+    if (reading) {
+        byte(b, 0x89); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2));
+    } else {
+        byte(b, 0x41); byte(b, 0x89); byte(b, 0x48); byte(b, 48); /* output_count=ecx */
+        byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 56); word32(b, 1);
+    }
+    load_locals(b);
+    byte(b, 0x4d); byte(b, 0x8d); byte(b, reading ? 0x99 : 0x91); word32(b, local->offset * 4u);
+    byte(b, 0x85); byte(b, 0xc9); /* test ecx,ecx */
+    byte(b, 0x74); empty_patch = b->length; byte(b, 0);
+    loop = b->length;
+    byte(b, 0x41); byte(b, 0x8b); byte(b, 0x02); /* mov eax,[r10] */
+    byte(b, 0x41); byte(b, 0x89); byte(b, 0x03); /* mov [r11],eax */
+    byte(b, 0x49); byte(b, 0x83); byte(b, 0xc2); byte(b, 4);
+    byte(b, 0x49); byte(b, 0x83); byte(b, 0xc3); byte(b, 4);
+    byte(b, 0xff); byte(b, 0xc9);
+    byte(b, 0x75); distance = b->length + 1 - loop;
+    if (distance > 128) b->failed = 1;
+    byte(b, (unsigned)(0u - (unsigned)distance));
+    if (b->failed) return;
+    distance = b->length - (empty_patch + 1);
+    if (distance > 127) { b->failed = 1; return; }
+    b->data[empty_patch] = (unsigned char)distance;
+}
+
 static void emit_gene(Emitter *b, BioGene *g) {
     CodonNode *n;
     g->code_offset = (uint32_t)b->length;
@@ -123,6 +172,9 @@ static void emit_gene(Emitter *b, BioGene *g) {
         if (n->op_code == OP_LABEL || n->op_code == OP_VAR || n->op_code == OP_ARRAY) continue;
         guard_step(b, n);
         switch (n->op_code) {
+        case OP_READ: case OP_WRITE:
+            emit_transfer(b, g, n);
+            break;
         case OP_GET:
             load_locals(b);
             byte(b, 0x41); byte(b, 0x8b); byte(b, 0x81); word32(b, g->locals[n->arg2].offset * 4u);
@@ -267,8 +319,8 @@ int bio_jit(BioProgram *p, BioError *e) {
     uint32_t unwind_offset;
     DWORD old_protection;
     Emitter b = {0};
-    /* DIV includes three guards; every instruction fits in 160 bytes. */
-    p->allocation_size = (p->stats.nodes + p->gene_count) * 160u + 16u;
+    /* WRITE includes five guards and a bounded copy loop; every opcode fits in 256 bytes. */
+    p->allocation_size = (p->stats.nodes + p->gene_count) * 256u + 16u;
     p->code = VirtualAlloc(NULL, p->allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!p->code) { bio_error(e, "VirtualAlloc failed (%lu)", GetLastError()); return 0; }
     b.data = p->code; b.capacity = p->allocation_size;
