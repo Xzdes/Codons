@@ -36,6 +36,59 @@ static int symbol(BioProgram *p, const char *name) {
     return (int)p->symbol_count++;
 }
 
+/* String literals live once per program; SLOAD nodes carry the literal index. */
+static int hex_value(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* The field includes the surrounding quotes; escapes: \\, \", \n, \t, \xHH.
+   Errors go to e without a location; the caller wraps them in QUARANTINE. */
+static int add_literal(BioProgram *p, const char *field, uint32_t *index, BioError *e) {
+    size_t length = strlen(field), i = 1;
+    if (length < 2 || field[0] != '"' || field[length - 1] != '"') {
+        bio_error(e, "SLOAD requires a quoted literal: \"text\""); return 0;
+    }
+    if (p->literal_count == BIO_MAX_LITERALS) {
+        bio_error(e, "apoptosis: string literal budget exceeded (%u)", BIO_MAX_LITERALS); return 0;
+    }
+    if (!p->literals) {
+        p->literals = malloc(BIO_MAX_LITERALS * sizeof(*p->literals));
+        p->literal_pool = malloc(BIO_LITERAL_BYTES);
+        if (!p->literals || !p->literal_pool) { bio_error(e, "out of memory"); return 0; }
+    }
+    p->literals[p->literal_count].data = p->literal_pool + p->literal_pool_used;
+    while (i + 1 < length) {
+        unsigned char c = (unsigned char)field[i++];
+        if (c == '\\') {
+            int hi, lo;
+            if (i + 1 >= length) { bio_error(e, "escape at the end of a string literal"); return 0; }
+            c = (unsigned char)field[i++];
+            if (c == 'n') c = '\n';
+            else if (c == 't') c = '\t';
+            else if (c == '"' || c == '\\') {}
+            else if (c == 'x') {
+                if (i + 2 >= length || (hi = hex_value((unsigned char)field[i])) < 0 ||
+                    (lo = hex_value((unsigned char)field[i + 1])) < 0) {
+                    bio_error(e, "\\x escape requires two hex digits"); return 0;
+                }
+                c = (unsigned char)(hi * 16 + lo); i += 2;
+            } else { bio_error(e, "unknown escape \\%c; use \\\\, \\\", \\n, \\t or \\xHH", c); return 0; }
+        }
+        if (p->literal_pool_used == BIO_LITERAL_BYTES) {
+            bio_error(e, "apoptosis: string literal byte budget exceeded"); return 0;
+        }
+        p->literal_pool[p->literal_pool_used++] = c;
+    }
+    p->literals[p->literal_count].length = (uint32_t)(p->literal_pool_used -
+        (size_t)(p->literals[p->literal_count].data - p->literal_pool));
+    *index = p->literal_count++;
+    p->uses_strings = 1;
+    return 1;
+}
+
 /* Imports resolve against the importing file, never the process working directory. */
 static int resolve_path(const char *name, const char *parent, char *out, BioError *e) {
     char combined[BIO_PATH_SIZE];
@@ -131,14 +184,29 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (location.line == 1 && strlen(line) >= 3 &&
             (unsigned char)line[0] == 0xef && (unsigned char)line[1] == 0xbb &&
             (unsigned char)line[2] == 0xbf) cursor += 3;
-        comment = strchr(cursor, '#');
-        if (comment) *comment = '\0';
+        /* Comments stop the line, except inside a quoted string literal. */
+        for (comment = cursor; *comment; ++comment) {
+            if (*comment == '"') {
+                ++comment;
+                while (*comment && *comment != '"')
+                    comment += (*comment == '\\' && comment[1]) ? 2 : 1;
+                if (!*comment) break;
+            } else if (*comment == '#') { *comment = '\0'; break; }
+        }
         while (*cursor) {
             while (isspace((unsigned char)*cursor)) ++cursor;
             if (!*cursor) break;
             if (count == 4) break;
             fields[count++] = cursor;
-            while (*cursor && !isspace((unsigned char)*cursor)) ++cursor;
+            if (*cursor == '"') {
+                /* Quoted literals may contain spaces; the closing quote ends the field. */
+                ++cursor;
+                while (*cursor && *cursor != '"')
+                    cursor += (*cursor == '\\' && cursor[1]) ? 2 : 1;
+                if (*cursor) ++cursor;
+            } else {
+                while (*cursor && !isspace((unsigned char)*cursor)) ++cursor;
+            }
             if (*cursor) *cursor++ = '\0';
         }
         if (!count) continue;
@@ -356,6 +424,38 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             }
             n->op_code = OP_CALL; n->arg1 = (uint32_t)sym;
             n->arg2 = (argc << 16) | packed;
+            continue;
+        }
+        if (strcmp(fields[0], "SLOAD") == 0) {
+            BioError le = {{0}};
+            uint32_t lit = 0;
+            a = reg(fields[1]);
+            if (a < 0) QUARANTINE("SLOAD requires a register first field");
+            if (!add_literal(p, fields[2], &lit, &le)) QUARANTINE("%.300s", le.message);
+            n->op_code = OP_SLOAD; n->arg1 = (uint32_t)a; n->arg2 = lit;
+            continue;
+        }
+        if (!strcmp(fields[0], "SLEN") || !strcmp(fields[0], "SGET") ||
+            !strcmp(fields[0], "SCAT") || !strcmp(fields[0], "SEQ")) {
+            char *comma = strchr(fields[2], ',');
+            a = reg(fields[1]);
+            if (a < 0) QUARANTINE("%s requires a register first field", fields[0]);
+            if (!strcmp(fields[0], "SLEN")) {
+                b = reg(fields[2]);
+                if (b < 0) QUARANTINE("SLEN requires 'rN rM'");
+                n->op_code = OP_SLEN; n->arg1 = (uint32_t)a; n->arg2 = (uint32_t)b;
+            } else {
+                int first, second;
+                if (!comma) QUARANTINE("%s requires 'rN rM,rK'", fields[0]);
+                *comma++ = '\0';
+                first = reg(fields[2]); second = reg(comma);
+                if (first < 0 || second < 0) QUARANTINE("%s requires 'rN rM,rK'", fields[0]);
+                n->op_code = !strcmp(fields[0], "SGET") ? OP_SGET :
+                             !strcmp(fields[0], "SCAT") ? OP_SCAT : OP_SEQ;
+                n->arg1 = (uint32_t)a;
+                n->arg2 = (uint32_t)first | ((uint32_t)second << 8);
+            }
+            p->uses_strings = 1;
             continue;
         }
         a = reg(fields[1]);

@@ -79,6 +79,8 @@ void bio_program_release(BioProgram *p) {
     if (p->unwind_registered) RtlDeleteFunctionTable(p->unwind_table);
     if (p->code) VirtualFree(p->code, 0, MEM_RELEASE);
     free(p->unwind_table);
+    free(p->literals);
+    free(p->literal_pool);
     while (p->arena) {
         ArenaBlock *next = p->arena->next;
         free(p->arena);
@@ -188,6 +190,25 @@ static int execution_ok(const BioProgram *p, const BioExecution *execution, BioE
     case BIO_FAULT_ARGUMENT_SIZE:
         snprintf(detail, sizeof(detail), "CALL array length %ld out of bounds: expected 0..%u",
                  (long)execution->bad_index, execution->bound);
+        message = detail; break;
+    case BIO_FAULT_STRING_HANDLE:
+        snprintf(detail, sizeof(detail), "invalid string handle %ld (%u handles exist in this invocation)",
+                 (long)execution->bad_index, execution->bound);
+        message = detail; break;
+    case BIO_FAULT_STRING_BOUNDS:
+        if (execution->bound)
+            snprintf(detail, sizeof(detail), "string index %ld out of bounds: valid indices are 0..%u (length %u)",
+                     (long)execution->bad_index, execution->bound - 1u, execution->bound);
+        else snprintf(detail, sizeof(detail), "string index %ld out of bounds: the string is empty (length 0)",
+                      (long)execution->bad_index);
+        message = detail; break;
+    case BIO_FAULT_STRING_BUDGET:
+        snprintf(detail, sizeof(detail), "string memory exhausted: need %ld more bytes, %u left in the invocation pool",
+                 (long)execution->bad_index, execution->bound);
+        message = detail; break;
+    case BIO_FAULT_STRING_TABLE:
+        snprintf(detail, sizeof(detail), "string handle table full (%u entries per invocation)",
+                 execution->bound);
         message = detail; break;
     case BIO_FAULT_QUARANTINE:
         message = "quarantined repaired codon reached; inspect the repair report"; break;
@@ -343,6 +364,81 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
             if (execution->failed_node != UINT32_MAX) return 0;
             break;
         }
+        case OP_SLOAD: r[n->arg1] = n->arg2; break; /* Literal handle: its table index. */
+        case OP_SLEN: {
+            uint32_t h = r[n->arg2];
+            if (h >= execution->string_count) {
+                execution->bad_index = signed_value(h); execution->bound = execution->string_count;
+                return interpreter_fault(execution, n, BIO_FAULT_STRING_HANDLE);
+            }
+            r[n->arg1] = execution->strings[h].length;
+            break;
+        }
+        case OP_SGET: {
+            uint32_t h = r[n->arg2 & 255u], index;
+            const BioString *s;
+            if (h >= execution->string_count) {
+                execution->bad_index = signed_value(h); execution->bound = execution->string_count;
+                return interpreter_fault(execution, n, BIO_FAULT_STRING_HANDLE);
+            }
+            s = &execution->strings[h];
+            index = r[n->arg2 >> 8];
+            execution->bad_index = signed_value(index); execution->bound = s->length;
+            if (index >= s->length) return interpreter_fault(execution, n, BIO_FAULT_STRING_BOUNDS);
+            r[n->arg1] = s->data[index];
+            break;
+        }
+        case OP_SCAT: {
+            uint32_t ha = r[n->arg2 & 255u], hb = r[n->arg2 >> 8];
+            const BioString *sa, *sb;
+            uint32_t need;
+            if (ha >= execution->string_count || hb >= execution->string_count) {
+                execution->bad_index = signed_value(ha >= execution->string_count ? ha : hb);
+                execution->bound = execution->string_count;
+                return interpreter_fault(execution, n, BIO_FAULT_STRING_HANDLE);
+            }
+            sa = &execution->strings[ha]; sb = &execution->strings[hb];
+            need = sa->length + sb->length; /* Lengths are bounded by the pool; no overflow. */
+            if (execution->string_count == BIO_MAX_STRINGS) {
+                execution->bound = BIO_MAX_STRINGS;
+                return interpreter_fault(execution, n, BIO_FAULT_STRING_TABLE);
+            }
+            if (need > execution->pool_capacity - execution->pool_used) {
+                execution->bad_index = (int32_t)need;
+                execution->bound = execution->pool_capacity - execution->pool_used;
+                return interpreter_fault(execution, n, BIO_FAULT_STRING_BUDGET);
+            }
+            if (execution->remaining < need)
+                return interpreter_fault(execution, n, BIO_FAULT_BUDGET);
+            execution->remaining -= need;
+            if (need) {
+                memcpy(execution->string_pool + execution->pool_used, sa->data, sa->length);
+                memcpy(execution->string_pool + execution->pool_used + sa->length, sb->data, sb->length);
+            }
+            execution->strings[execution->string_count].data = execution->string_pool + execution->pool_used;
+            execution->strings[execution->string_count].length = need;
+            execution->pool_used += need;
+            r[n->arg1] = execution->string_count++;
+            break;
+        }
+        case OP_SEQ: {
+            uint32_t ha = r[n->arg2 & 255u], hb = r[n->arg2 >> 8];
+            const BioString *sa, *sb;
+            uint32_t charge;
+            if (ha >= execution->string_count || hb >= execution->string_count) {
+                execution->bad_index = signed_value(ha >= execution->string_count ? ha : hb);
+                execution->bound = execution->string_count;
+                return interpreter_fault(execution, n, BIO_FAULT_STRING_HANDLE);
+            }
+            sa = &execution->strings[ha]; sb = &execution->strings[hb];
+            charge = (sa->length < sb->length ? sa->length : sb->length) + 1u;
+            if (execution->remaining < charge)
+                return interpreter_fault(execution, n, BIO_FAULT_BUDGET);
+            execution->remaining -= charge;
+            r[n->arg1] = sa->length == sb->length &&
+                (!sa->length || !memcmp(sa->data, sb->data, sa->length));
+            break;
+        }
         case OP_RET: return r[n->arg1];
         case OP_QUARANTINE: return interpreter_fault(execution, n, BIO_FAULT_QUARANTINE);
         case OP_JMP: next = n->bond; break;
@@ -360,6 +456,8 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
     typedef int32_t (*Entry)(int32_t, int32_t, int32_t, int32_t, BioExecution *, uint32_t *);
     int32_t value;
     uint32_t *memory = NULL;
+    uint8_t *pool = NULL;
+    BioString *strings = NULL;
     BioExecution execution = {0};
     int ok;
     if (!validate_arguments(p, args, argc, result, e)) return 0;
@@ -382,6 +480,19 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
             execution.output = malloc((io->output_capacity ? io->output_capacity : 1u) * sizeof(*execution.output));
             if (!execution.output) { free(memory); bio_error(e, "out of memory staging output list"); return 0; }
         }
+    }
+    if (p->uses_strings) {
+        /* The JIT cannot allocate, so the table and pool exist before entry. */
+        strings = malloc(BIO_MAX_STRINGS * sizeof(*strings));
+        pool = malloc(BIO_STRING_BYTES);
+        if (!strings || !pool) {
+            free(strings); free(pool); free(execution.output); free(memory);
+            bio_error(e, "out of memory preparing string storage"); return 0;
+        }
+        if (p->literal_count)
+            memcpy(strings, p->literals, p->literal_count * sizeof(*strings));
+        execution.strings = strings; execution.string_count = p->literal_count;
+        execution.string_pool = pool; execution.pool_capacity = BIO_STRING_BYTES;
     }
     if (native) {
         Entry fn;
@@ -406,6 +517,8 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
     }
     free(execution.output);
     free(memory);
+    free(strings);
+    free(pool);
     return ok;
 }
 
@@ -434,7 +547,8 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
         "GENE", "LOAD", "MOV", "ADD", "SUB", "MUL", "CALL", "RET", "EQ", "LT", "MIN", "MAX",
         "LABEL", "JMP", "JZ", "JNZ", "DIV", "MOD", "AND", "OR", "XOR", "NOT",
         "LAND", "LOR", "LXOR", "LNOT", "SHL", "SHR", "SAR",
-        "VAR", "ARRAY", "GET", "SET", "AGET", "ASET", "LEN", "READ", "WRITE", "PARAM", "QUARANTINE"
+        "VAR", "ARRAY", "GET", "SET", "AGET", "ASET", "LEN", "READ", "WRITE", "PARAM", "QUARANTINE",
+        "SLOAD", "SLEN", "SGET", "SCAT", "SEQ"
     };
     unsigned i;
     for (i = 0; i < p->gene_count; ++i) {
@@ -463,6 +577,22 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
                 fprintf(out, "AGET r%u %s,r%u", n->arg1, p->symbols[g->locals[n->arg2 >> 8].symbol], n->arg2 & 255u);
             else if (n->op_code == OP_ASET)
                 fprintf(out, "ASET %s r%u,r%u", p->symbols[g->locals[n->arg1].symbol], n->arg2 & 255u, n->arg2 >> 8);
+            else if (n->op_code == OP_SLOAD) {
+                const BioString *s = &p->literals[n->arg2];
+                uint32_t k;
+                fprintf(out, "SLOAD r%u \"", n->arg1);
+                for (k = 0; k < s->length; ++k) {
+                    uint8_t c = s->data[k];
+                    if (c == '"' || c == '\\') fprintf(out, "\\%c", c);
+                    else if (c == '\n') fputs("\\n", out);
+                    else if (c == '\t') fputs("\\t", out);
+                    else if (c >= 32 && c < 127) fputc(c, out);
+                    else fprintf(out, "\\x%02x", c);
+                }
+                fputc('"', out);
+            }
+            else if (n->op_code == OP_SGET || n->op_code == OP_SCAT || n->op_code == OP_SEQ)
+                fprintf(out, "%s r%u r%u,r%u", names[n->op_code], n->arg1, n->arg2 & 255u, n->arg2 >> 8);
             else if (n->op_code == OP_LOAD)
                 fprintf(out, "LOAD r%u %ld", n->arg1, (long)signed_value(n->arg2));
             else if (n->op_code == OP_RET || n->op_code == OP_NOT || n->op_code == OP_LNOT)

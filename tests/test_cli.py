@@ -173,7 +173,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.11.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.12.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -259,6 +259,82 @@ class CliTests(unittest.TestCase):
         source = self.source("GENE main i32\nCALL helper _\nRET r0 _\nEND _ _\nGENE helper i32\nLOAD r7 -2147483648\nRET r7 _\nEND _ _\n")
         normalized = self.source(self.call("dump", source).stdout, "normalized.dna")
         self.assertEqual(self.call("run", normalized).stdout.strip(), "-2147483648")
+
+    def test_strings_operations_agree_across_engines(self):
+        source = self.source("GENE main i32\nSLOAD r1 \"hello\"\nSLOAD r2 \" world\"\nSCAT r3 r1,r2\n"
+                             "SLOAD r4 \"hello world\"\nSEQ r5 r3,r4\nSLEN r6 r3\nADD r6 r5\n"
+                             "LOAD r7 10\nSGET r0 r3,r7\nADD r6 r0\nRET r6 _\nEND _ _\n")
+        # 11 (length) + 1 (equal) + 100 ('d') = 112
+        for command in ("run", "interpret", "verify"):
+            with self.subTest(command=command):
+                data = json.loads(self.call(command, source, "--json").stdout)
+                self.assertTrue(data["ok"])
+                self.assertEqual(data["result"], 112)
+
+    def test_strings_escapes_and_dump_round_trip(self):
+        text = ("GENE main i32\nSLOAD r1 \"a\\n\\t\\\\\\\"\\x01# b\"\nSLOAD r2 \"plain\"\n"
+                "SCAT r3 r1,r2\nSLEN r4 r3\nLOAD r5 13\nSGET r6 r3,r5\nADD r4 r6\nRET r4 _\nEND _ _\n")
+        source = self.source(text)
+        for command in ("run", "interpret"):
+            self.assertEqual(int(self.call(command, source).stdout), 14 + ord("n"))
+        dumped = self.call("dump", source).stdout
+        self.assertIn('SLOAD r1 "a\\n\\t\\\\\\"\\x01# b"', dumped)
+        normalized = self.source(dumped, "normalized.dna")
+        self.assertEqual(self.call("dump", normalized).stdout, dumped)
+        for command in ("run", "interpret", "verify"):
+            self.assertEqual(int(self.call(command, normalized).stdout), 14 + ord("n"))
+
+    def test_strings_faults_match_across_engines(self):
+        cases = [
+            ("GENE main i32\nLOAD r1 99\nSLEN r2 r1\nRET r2 _\nEND _ _\n", 3,
+             "invalid string handle 99 (0 handles exist in this invocation)"),
+            ("GENE main i32\nSLOAD r1 \"ab\"\nLOAD r2 -1\nSLEN r3 r2\nRET r3 _\nEND _ _\n", 4,
+             "invalid string handle -1 (1 handles exist in this invocation)"),
+            ("GENE main i32\nSLOAD r1 \"ab\"\nLOAD r2 2\nSGET r3 r1,r2\nRET r3 _\nEND _ _\n", 4,
+             "string index 2 out of bounds: valid indices are 0..1 (length 2)"),
+            ("GENE main i32\nSLOAD r1 \"\"\nLOAD r2 0\nSGET r3 r1,r2\nRET r3 _\nEND _ _\n", 4,
+             "string index 0 out of bounds: the string is empty (length 0)"),
+            ("GENE main i32\nSLOAD r1 \"\"\nLOAD r3 1\nLOAD r4 5000\nLABEL loop _\n"
+             "SCAT r1 r1,r1\nSUB r4 r3\nJNZ r4 loop\nRET r1 _\nEND _ _\n", 6,
+             "string handle table full (4096 entries per invocation)"),
+            ("GENE main i32\nSLOAD r1 \"a\"\nLOAD r3 1\nLOAD r4 17\nLABEL grow _\n"
+             "SCAT r1 r1,r1\nSUB r4 r3\nJNZ r4 grow\nMOV r2 r1\nLOAD r4 8\nLABEL fill _\n"
+             "SCAT r2 r2,r1\nSUB r4 r3\nJNZ r4 fill\nSLEN r5 r2\nRET r5 _\nEND _ _\n", 12,
+             "string memory exhausted"),
+        ]
+        for text, line, message in cases:
+            with self.subTest(message=message):
+                source = self.source(text)
+                messages = []
+                for command in ("run", "interpret"):
+                    data = json.loads(self.call(command, source, "--json", code=1).stdout)
+                    self.assertEqual(data["error"]["stage"], "run")
+                    self.assertTrue(data["error"]["message"].startswith(f"{source}:{line}: "),
+                                    data["error"]["message"])
+                    self.assertIn(message, data["error"]["message"])
+                    messages.append(data["error"]["message"])
+                self.assertEqual(*messages)
+                verify = self.call("verify", source, code=1)
+                self.assertIn("verified: JIT and interpreter agree on the failure", verify.stderr)
+                self.assertIn(message, verify.stderr)
+
+    def test_strings_rejections(self):
+        cases = [
+            ("GENE main i32\nSLOAD r1 hello\nRET r1 _\nEND _ _\n", "requires a quoted literal", 2),
+            ("GENE main i32\nSLOAD r1 \"a\\qb\"\nRET r1 _\nEND _ _\n", "unknown escape", 2),
+            ("GENE main i32\nSLOAD r1 \"unterminated\nRET r1 _\nEND _ _\n", "requires a quoted literal", 2),
+            ("GENE main i32\nSLOAD r1 \"a\" extra\nRET r1 _\nEND _ _\n", "exactly 3 fields", 2),
+            ("GENE main i32\nSLEN r1 r2,r3\nRET r1 _\nEND _ _\n", "SLEN requires 'rN rM'", 2),
+            ("GENE main i32\nSCAT r1 r2\nRET r1 _\nEND _ _\n", "requires 'rN rM,rK'", 2),
+            ("GENE main i32\nSLOAD r1 \"x\"\nSLEN r2 r7\nRET r2 _\nEND _ _\n", "uninitialized register r7", 3),
+        ]
+        for text, message, line in cases:
+            with self.subTest(message=message):
+                source = self.source(text)
+                data = json.loads(self.call("check", source, "--json", code=1).stdout)
+                self.assertEqual(data["error"]["stage"], "compile")
+                self.assertIn(message, data["error"]["message"])
+                self.assertIn(f"{source}:{line}:", data["error"]["message"])
 
     def test_repair_is_explicit(self):
         source = self.source("GENE main i32\nLOAD r0 42\nRET r0\nEND _\n")

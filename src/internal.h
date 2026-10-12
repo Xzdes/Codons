@@ -24,6 +24,10 @@
 #define BIO_MAX_LOCAL_CELLS 65536u
 #define BIO_MEMORY_CELLS 262144u /* 1 MiB of i32 storage across an active call chain. */
 #define BIO_STACK_SIZE 104u
+#define BIO_MAX_LITERALS 1024u
+#define BIO_LITERAL_BYTES (256u * 1024u)
+#define BIO_MAX_STRINGS 4096u /* Handle table capacity: literals plus dynamic entries. */
+#define BIO_STRING_BYTES (512u * 1024u) /* Dynamic pool: below the step budget, so reachable. */
 
 typedef enum {
     OP_GENE, OP_LOAD, OP_MOV, OP_ADD, OP_SUB, OP_MUL, OP_CALL, OP_RET,
@@ -31,7 +35,8 @@ typedef enum {
     OP_DIV, OP_MOD, OP_AND, OP_OR, OP_XOR, OP_NOT,
     OP_LAND, OP_LOR, OP_LXOR, OP_LNOT, OP_SHL, OP_SHR, OP_SAR,
     OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN, OP_READ, OP_WRITE, OP_PARAM,
-    OP_QUARANTINE
+    OP_QUARANTINE,
+    OP_SLOAD, OP_SLEN, OP_SGET, OP_SCAT, OP_SEQ
 } BioOp;
 
 typedef struct CodonNode {
@@ -95,8 +100,18 @@ typedef enum {
     BIO_FAULT_NONE, BIO_FAULT_BUDGET, BIO_FAULT_DIV_ZERO,
     BIO_FAULT_DIV_OVERFLOW, BIO_FAULT_SHIFT, BIO_FAULT_BOUNDS,
     BIO_FAULT_INPUT, BIO_FAULT_OUTPUT, BIO_FAULT_READ_SIZE,
-    BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE, BIO_FAULT_ARGUMENT_SIZE, BIO_FAULT_QUARANTINE
+    BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE, BIO_FAULT_ARGUMENT_SIZE, BIO_FAULT_QUARANTINE,
+    BIO_FAULT_STRING_HANDLE, BIO_FAULT_STRING_BUDGET, BIO_FAULT_STRING_BOUNDS,
+    BIO_FAULT_STRING_TABLE
 } BioFault;
+
+/* Immutable byte string. Literals point into the program's literal pool;
+   SCAT results point into the invocation's bump pool. Registers hold handles
+   (i32 indices into the invocation's string table). */
+typedef struct {
+    const uint8_t *data;
+    uint32_t length;
+} BioString;
 
 typedef struct {
     uint32_t file;
@@ -118,6 +133,12 @@ typedef struct {
     uint32_t output_count;
     uint32_t output_capacity;
     uint32_t output_written;
+    BioString *strings;    /* Handle table: [0, literal_count) literals, then dynamic. */
+    uint32_t string_count;
+    uint32_t reserved2;
+    uint8_t *string_pool;  /* Bump allocator for SCAT results; never freed mid-run. */
+    uint32_t pool_used;
+    uint32_t pool_capacity;
 } BioExecution;
 
 _Static_assert(offsetof(BioExecution, remaining) == 0, "JIT budget offset");
@@ -131,6 +152,11 @@ _Static_assert(offsetof(BioExecution, output) == 40, "JIT output pointer offset"
 _Static_assert(offsetof(BioExecution, output_count) == 48, "JIT output count offset");
 _Static_assert(offsetof(BioExecution, output_capacity) == 52, "JIT output capacity offset");
 _Static_assert(offsetof(BioExecution, output_written) == 56, "JIT output flag offset");
+_Static_assert(offsetof(BioExecution, strings) == 64, "JIT string table offset");
+_Static_assert(offsetof(BioExecution, string_count) == 72, "JIT string count offset");
+_Static_assert(offsetof(BioExecution, string_pool) == 80, "JIT string pool offset");
+_Static_assert(offsetof(BioExecution, pool_used) == 88, "JIT pool used offset");
+_Static_assert(offsetof(BioExecution, pool_capacity) == 92, "JIT pool capacity offset");
 
 struct BioProgram {
     volatile LONG references;
@@ -147,6 +173,11 @@ struct BioProgram {
     size_t repair_count;
     BioRepairEntry repair_log[BIO_MAX_REPAIRS];
     BioStats stats;
+    BioString *literals;     /* Compile-time string literals (SLOAD). */
+    uint32_t literal_count;
+    uint8_t *literal_pool;
+    size_t literal_pool_used;
+    unsigned uses_strings;   /* Any string opcode or literal in the program. */
     unsigned char *code;
     size_t allocation_size;
     RUNTIME_FUNCTION *unwind_table;

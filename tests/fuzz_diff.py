@@ -24,6 +24,7 @@ RISKY_OPS = ("DIV", "MOD", "SHL", "SHR", "SAR")
 UN_OPS = ("NOT", "LNOT")
 FILLABLE_HEADS = ("RET", "END", "NOT", "LNOT", "LABEL", "JMP")
 REGS = tuple(f"r{i}" for i in range(8))
+STRING_CHARS = "abz AZ019._-#"
 
 
 class Gene:
@@ -46,6 +47,9 @@ class Gene:
         self.branches = 0
         self.loops = 0
         self.init = {f"r{i}" for i in range(arity)}
+        # Registers known to hold a live string handle; best-effort tracking so
+        # string ops mostly take their success path (faults would agree too).
+        self.strings = set()
 
     @property
     def has_param(self):
@@ -73,7 +77,21 @@ class Gene:
             value = self.rng.choice(I32_POOL) if self.rng.random() < 0.4 else self.rng.randint(-100, 100)
         self.emit(f"LOAD {reg} {value}")
         self.init.add(reg)
+        self.strings.discard(reg)
         return reg
+
+    def gen_literal(self):
+        rng = self.rng
+        out = []
+        for _ in range(rng.randint(0, 6)):
+            pick = rng.random()
+            if pick < 0.75:
+                out.append(rng.choice(STRING_CHARS))
+            elif pick < 0.85:
+                out.append(rng.choice(("\\n", "\\t", "\\\\", '\\"')))
+            else:
+                out.append(f"\\x{rng.randint(0, 255):02x}")
+        return '"' + "".join(out) + '"'
 
     def gen_decls(self):
         for i in range(self.rng.randint(0, 3)):
@@ -95,16 +113,21 @@ class Gene:
         else_label, end_label = self.new_label(), self.new_label()
         self.emit(f"{self.rng.choice(('JZ', 'JNZ'))} {cond} {else_label}")
         saved = set(self.init)
+        saved_strings = set(self.strings)
         self.branches += 1
         self.gen_statements(self.rng.randint(1, 3), forbidden)
         arm_a = set(self.init)
+        strings_a = set(self.strings)
         self.emit(f"JMP {end_label} _")
         self.emit(f"LABEL {else_label} _")
         self.init = set(saved)
+        self.strings = set(saved_strings)
         self.gen_statements(self.rng.randint(1, 3), forbidden)
         arm_b = set(self.init)
+        strings_b = set(self.strings)
         self.emit(f"LABEL {end_label} _")
         self.init = arm_a & arm_b
+        self.strings = strings_a & strings_b
 
     def gen_loop(self, forbidden):
         counter = self.load(value=self.rng.randint(1, 9), forbidden=forbidden)
@@ -114,7 +137,10 @@ class Gene:
         self.loops += 1
         # The loop head intersects entry and back edge: body definitions are not
         # visible at the label, but remain readable after the fall-through.
+        saved_strings = set(self.strings)
         self.gen_statements(self.rng.randint(0, 2), forbidden + (counter, step))
+        # A handle survives the body only if the body never overwrote it.
+        self.strings &= saved_strings
         self.emit(f"SUB {counter} {step}")
         self.emit(f"JNZ {counter} {label}")
 
@@ -123,9 +149,11 @@ class Gene:
         length_reg = self.dst_reg(forbidden)
         self.emit(f"LEN {length_reg} {self.param}")
         self.init.add(length_reg)
+        self.strings.discard(length_reg)
         skip = self.new_label()
         self.emit(f"JZ {length_reg} {skip}")
         saved = set(self.init)
+        saved_strings = set(self.strings)
         index = self.load(value=0, forbidden=forbidden)
         if self.rng.random() < 0.5:
             dst = self.dst_reg(forbidden)
@@ -135,6 +163,7 @@ class Gene:
         self.emit(f"LABEL {skip} _")
         # The index/dst registers are defined only on the taken path.
         self.init = saved
+        self.strings &= saved_strings
 
     def gen_call(self, forbidden):
         name, arity, has_param = self.rng.choice(self.callees)
@@ -181,40 +210,56 @@ class Gene:
         offer("call", 2, bool(self.callees) and "r0" not in forbidden)
         offer("branch", 1.5, bool(self.init) and self.branches < 3)
         offer("loop", 1, self.loops < 1)
+        offer("sload", 2)
+        if sorted(self.strings - set(forbidden)):
+            offer("slen", 1.5)
+            offer("sget", 1.5, bool(self.init))
+            offer("scat", 1.5)
+            offer("seq", 1.5)
         kind = rng.choices(kinds, weights)[0]
         if kind == "load":
             self.load(forbidden=forbidden)
         elif kind == "mov":
             dst = self.dst_reg(forbidden)
-            self.emit(f"MOV {dst} {self.init_reg()}")
+            src = self.init_reg()
+            self.emit(f"MOV {dst} {src}")
             self.init.add(dst)
+            (self.strings.add if src in self.strings else self.strings.discard)(dst)
         elif kind == "binop":
             # The first operand is overwritten; loop counters are off-limits.
-            self.emit(f"{rng.choice(BIN_OPS)} {rng.choice(writable)} {self.init_reg()}")
+            target = rng.choice(writable)
+            self.emit(f"{rng.choice(BIN_OPS)} {target} {self.init_reg()}")
+            self.strings.discard(target)
         elif kind == "risky":
             op = rng.choice(RISKY_OPS)
             target = rng.choice(writable)
+            self.strings.discard(target)
             if op in ("DIV", "MOD"):
                 value = 0 if rng.random() < 0.2 else rng.choice((-7, -2, -1, 1, 2, 3, 7, 100))
             else:
                 value = rng.choice((0, 1, 5, 31)) if rng.random() < 0.8 else rng.choice((32, -1, 100))
             self.emit(f"{op} {target} {self.load(value=value, forbidden=forbidden)}")
         elif kind == "unop":
-            self.emit(f"{rng.choice(UN_OPS)} {rng.choice(writable)} _")
+            target = rng.choice(writable)
+            self.emit(f"{rng.choice(UN_OPS)} {target} _")
+            self.strings.discard(target)
         elif kind == "get":
             dst = self.dst_reg(forbidden)
             self.emit(f"GET {dst} {rng.choice(self.vars)[0]}")
             self.init.add(dst)
+            self.strings.discard(dst)
         elif kind == "set":
             self.emit(f"SET {rng.choice(self.vars)[0]} {self.init_reg()}")
         elif kind == "len":
             dst = self.dst_reg(forbidden)
             self.emit(f"LEN {dst} {rng.choice(self.arrays)[0]}")
             self.init.add(dst)
+            self.strings.discard(dst)
         elif kind == "read":
             dst = self.dst_reg(forbidden)
             self.emit(f"READ {rng.choice(self.local_arrays())[0]} {dst}")
             self.init.add(dst)
+            self.strings.discard(dst)
         elif kind == "write":
             array, length = rng.choice(self.local_arrays())
             self.emit(f"WRITE {array} {self.load(value=rng.randint(0, length), forbidden=forbidden)}")
@@ -228,6 +273,7 @@ class Gene:
             dst = self.dst_reg(forbidden)
             self.emit(f"AGET {dst} {array},{index_reg}")
             self.init.add(dst)
+            self.strings.discard(dst)
         elif kind == "aset":
             array, length = rng.choice(self.local_arrays())
             if rng.random() < 0.8:
@@ -240,10 +286,42 @@ class Gene:
             self.gen_param_access(forbidden)
         elif kind == "call":
             self.gen_call(forbidden)
+            self.strings.discard("r0")
         elif kind == "branch":
             self.gen_branch(forbidden)
         elif kind == "loop":
             self.gen_loop(forbidden)
+        elif kind == "sload":
+            dst = self.dst_reg(forbidden)
+            self.emit(f"SLOAD {dst} {self.gen_literal()}")
+            self.init.add(dst)
+            self.strings.add(dst)
+        elif kind == "slen":
+            dst = self.dst_reg(forbidden)
+            self.emit(f"SLEN {dst} {rng.choice(sorted(self.strings - set(forbidden)))}")
+            self.init.add(dst)
+            self.strings.discard(dst)
+        elif kind == "sget":
+            dst = self.dst_reg(forbidden)
+            handle = rng.choice(sorted(self.strings - set(forbidden)))
+            # Mostly in range, sometimes past the end to hit the bounds fault.
+            index = rng.randint(0, 5) if rng.random() < 0.8 else rng.choice((-1, 64, 1000000))
+            index_reg = self.load(value=index, forbidden=forbidden + (dst, handle))
+            self.emit(f"SGET {dst} {handle},{index_reg}")
+            self.init.add(dst)
+            self.strings.discard(dst)
+        elif kind == "scat":
+            handles = sorted(self.strings - set(forbidden))
+            dst = self.dst_reg(forbidden)
+            self.emit(f"SCAT {dst} {rng.choice(handles)},{rng.choice(handles)}")
+            self.init.add(dst)
+            self.strings.add(dst)
+        elif kind == "seq":
+            handles = sorted(self.strings - set(forbidden))
+            dst = self.dst_reg(forbidden)
+            self.emit(f"SEQ {dst} {rng.choice(handles)},{rng.choice(handles)}")
+            self.init.add(dst)
+            self.strings.discard(dst)
 
     def gen_statements(self, count, forbidden=()):
         for _ in range(count):

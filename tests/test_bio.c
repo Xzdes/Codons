@@ -876,6 +876,89 @@ static void wide_call_tests(void) {
     bio_program_release(p);
 }
 
+/* Both backends must fail with the identical message. */
+static void expect_run_failure(const char *source, const char *message) {
+    BioError e = {{0}}, ie = {{0}};
+    BioProgram *p;
+    int32_t result = 77;
+    write_source("sfail.dna", source);
+    p = compile_name("sfail.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(!bio_program_run(p, NULL, 0, &result, &e));
+    REQUIRE(strstr(e.message, message) != NULL);
+    REQUIRE(!bio_program_interpret(p, NULL, 0, &result, &ie));
+    REQUIRE(strstr(ie.message, message) != NULL);
+    REQUIRE(!strcmp(e.message, ie.message));
+    bio_program_release(p);
+}
+
+static void string_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    int32_t result;
+    char path[256];
+    FILE *dump;
+    /* Literals, escapes, length, equality. */
+    expect_value("GENE main i32\nSLOAD r1 \"hello\"\nSLEN r2 r1\nRET r2 _\nEND _ _\n", 5);
+    expect_value("GENE main i32\nSLOAD r1 \"a\\n\\t\\\\\\\"\\x41b\"\nSLEN r2 r1\nRET r2 _\nEND _ _\n", 7);
+    expect_value("GENE main i32\nSLOAD r1 \"\"\nSLEN r2 r1\nRET r2 _\nEND _ _\n", 0);
+    expect_value("GENE main i32\nSLOAD r1 \"x\"\nSLOAD r2 \"x\"\nSEQ r3 r1,r2\nRET r3 _\nEND _ _\n", 1);
+    expect_value("GENE main i32\nSLOAD r1 \"ab\"\nSLOAD r2 \"abc\"\nSEQ r3 r1,r2\nRET r3 _\nEND _ _\n", 0);
+    expect_value("GENE main i32\nSLOAD r1 \"abc\"\nLOAD r2 1\nSGET r3 r1,r2\nRET r3 _\nEND _ _\n", 'b');
+    /* Quotes protect spaces and '#'; comment stripping respects them. */
+    expect_value("GENE main i32\nSLOAD r1 \"a b#c\" # \"quoted comment\"\nSLEN r2 r1\nRET r2 _\nEND _ _\n", 5);
+    /* Concatenation, including a string concatenated with itself. */
+    expect_value("GENE main i32\nSLOAD r1 \"hello\"\nSLOAD r2 \" world\"\nSCAT r3 r1,r2\n"
+                 "SLOAD r4 \"hello world\"\nSEQ r5 r3,r4\nSLEN r6 r3\nADD r6 r5\nRET r6 _\nEND _ _\n", 12);
+    expect_value("GENE main i32\nSLOAD r1 \"ab\"\nSCAT r2 r1,r1\nSLOAD r3 \"abab\"\nSEQ r4 r2,r3\nRET r4 _\nEND _ _\n", 1);
+    expect_value("GENE main i32\nSLOAD r1 \"x\"\nSLOAD r2 \"\"\nSCAT r3 r1,r2\nSLEN r4 r3\nRET r4 _\nEND _ _\n", 1);
+    /* Doubling loop: 10 SCATs of "a" give 1024 bytes; both backends agree. */
+    expect_value("GENE main i32\nSLOAD r1 \"a\"\nLOAD r3 1\nLOAD r4 10\nLABEL grow _\n"
+                 "SCAT r1 r1,r1\nSUB r4 r3\nJNZ r4 grow\nSLEN r2 r1\nRET r2 _\nEND _ _\n", 1024);
+    /* Faults: identical in both backends. */
+    expect_run_failure("GENE main i32\nLOAD r1 99\nSLEN r2 r1\nRET r2 _\nEND _ _\n", "invalid string handle 99");
+    expect_run_failure("GENE main i32\nSLOAD r1 \"ab\"\nLOAD r2 -1\nSLEN r3 r2\nRET r3 _\nEND _ _\n",
+                       "invalid string handle -1");
+    expect_run_failure("GENE main i32\nSLOAD r1 \"ab\"\nLOAD r2 2\nSGET r3 r1,r2\nRET r3 _\nEND _ _\n",
+                       "string index 2 out of bounds: valid indices are 0..1 (length 2)");
+    expect_run_failure("GENE main i32\nSLOAD r1 \"\"\nLOAD r2 0\nSGET r3 r1,r2\nRET r3 _\nEND _ _\n",
+                       "the string is empty");
+    /* The handle table fills after 4096 entries: empty concatenations cost no
+       bytes and no extra steps, so the loop reaches the table limit. */
+    expect_run_failure("GENE main i32\nSLOAD r1 \"\"\nLOAD r3 1\nLOAD r4 5000\nLABEL loop _\n"
+                       "SCAT r1 r1,r1\nSUB r4 r3\nJNZ r4 loop\nRET r1 _\nEND _ _\n",
+                       "string handle table full (4096 entries");
+    /* A 128 KiB string built by doubling, then appended: the 512 KiB pool runs
+       out before the step budget does. */
+    expect_run_failure("GENE main i32\nSLOAD r1 \"a\"\nLOAD r3 1\nLOAD r4 17\nLABEL grow _\n"
+                       "SCAT r1 r1,r1\nSUB r4 r3\nJNZ r4 grow\nMOV r2 r1\nLOAD r4 8\nLABEL fill _\n"
+                       "SCAT r2 r2,r1\nSUB r4 r3\nJNZ r4 fill\nSLEN r5 r2\nRET r5 _\nEND _ _\n",
+                       "string memory exhausted");
+    /* Parse and analysis errors. */
+    expect_error("GENE main i32\nSLOAD r1 hello\nRET r1 _\nEND _ _\n", "requires a quoted literal");
+    expect_error("GENE main i32\nSLOAD r1 \"a\\qb\"\nRET r1 _\nEND _ _\n", "unknown escape");
+    expect_error("GENE main i32\nSLOAD r1 \"unterminated\nRET r1 _\nEND _ _\n", "requires a quoted literal");
+    expect_error("GENE main i32\nSLEN r1 r2,r3\nRET r1 _\nEND _ _\n", "SLEN requires");
+    expect_error("GENE main i32\nSCAT r1 r2\nRET r1 _\nEND _ _\n", "requires 'rN rM,rK'");
+    expect_error("GENE main i32\nSLOAD r1 \"x\"\nSLEN r2 r7\nRET r2 _\nEND _ _\n", "uninitialized register r7");
+    /* The dump escapes literals; a reparse reproduces them byte for byte. */
+    write_source("str.dna",
+        "GENE main i32\nSLOAD r1 \"a\\n\\t\\\\\\\"\\x01# b\"\nSLOAD r2 \"plain\"\n"
+        "SCAT r3 r1,r2\nSLEN r4 r3\nLOAD r5 13\nSGET r6 r3,r5\nADD r4 r6\nRET r4 _\nEND _ _\n");
+    p = compile_name("str.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, NULL, 0, &result, &e) && result == 14 + 'n');
+    path_for(path, sizeof(path), "str-normalized.dna");
+    dump = fopen(path, "wb"); REQUIRE(dump != NULL);
+    bio_program_dump(p, dump); REQUIRE(fclose(dump) == 0);
+    bio_program_release(p);
+    p = bio_load(path, 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_interpret(p, NULL, 0, &result, &e) && result == 14 + 'n');
+    bio_program_release(p);
+    /* The dumped file also compiles to native code with identical behavior. */
+    p = compile_name("str-normalized.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, NULL, 0, &result, &e) && result == 14 + 'n');
+    bio_program_release(p);
+}
+
 static void flow_tests(void) {
     expect_value("GENE main i32\nLOAD r0 0\nJZ r0 yes\nLOAD r1 8\nJMP done _\nLABEL yes _\nLOAD r1 42\nLABEL done _\nRET r1 _\nEND _ _\n", 42);
     expect_value("GENE main i32\nLOAD r0 -1\nJNZ r0 yes\nLOAD r1 8\nRET r1 _\nLABEL yes _\nLOAD r1 42\nRET r1 _\nEND _ _\n", 42);
@@ -1209,6 +1292,7 @@ int main(void) {
     differential_tests();
     argument_tests();
     wide_call_tests();
+    string_tests();
     flow_tests();
     loop_budget_tests();
     loop_runtime_tests();

@@ -146,6 +146,143 @@ static void guard_index(Emitter *b, const CodonNode *n, unsigned r, const BioLoc
     require_condition(b, n, BIO_FAULT_BOUNDS, 0x72); /* unsigned jb rejects negative indices too */
 }
 
+/* EAX holds a string handle; validate 0 <= handle < string_count (unsigned catch). */
+static void guard_handle(Emitter *b, const CodonNode *n) {
+    byte(b, 0x89); byte(b, 0x43); byte(b, 16); /* mov [rbx+16],eax: bad_index */
+    byte(b, 0x8b); byte(b, 0x4b); byte(b, 72); /* mov ecx,[rbx+72]: count */
+    byte(b, 0x89); byte(b, 0x4b); byte(b, 20); /* mov [rbx+20],ecx: bound */
+    byte(b, 0x3b); byte(b, 0x43); byte(b, 72); /* cmp eax,[rbx+72] */
+    require_condition(b, n, BIO_FAULT_STRING_HANDLE, 0x72); /* jb: valid */
+}
+
+/* Loads string A (arg2 & 255) into R10/R11D and string B (arg2 >> 8) into R8/R9D. */
+static void load_string_pair(Emitter *b, const CodonNode *n) {
+    emit_load(b, n->arg2 & 255u);
+    guard_handle(b, n);
+    byte(b, 0x48); byte(b, 0x8b); byte(b, 0x53); byte(b, 64); /* mov rdx,[rbx+64]: table */
+    byte(b, 0xc1); byte(b, 0xe0); byte(b, 4); /* shl eax,4: 16 bytes per entry */
+    byte(b, 0x4c); byte(b, 0x8b); byte(b, 0x14); byte(b, 2); /* mov r10,[rdx+rax] */
+    byte(b, 0x44); byte(b, 0x8b); byte(b, 0x5c); byte(b, 2); byte(b, 8); /* mov r11d,[rdx+rax+8] */
+    b->cached = -1; /* EAX was shifted; it no longer names a register */
+    emit_load(b, n->arg2 >> 8);
+    guard_handle(b, n);
+    byte(b, 0xc1); byte(b, 0xe0); byte(b, 4);
+    byte(b, 0x4c); byte(b, 0x8b); byte(b, 4); byte(b, 2); /* mov r8,[rdx+rax] */
+    byte(b, 0x44); byte(b, 0x8b); byte(b, 0x4c); byte(b, 2); byte(b, 8); /* mov r9d,[rdx+rax+8] */
+    b->cached = -1;
+}
+
+/* A backward rel8 jump to `loop`, computing its own displacement. */
+static void jump_back(Emitter *b, unsigned opcode, size_t loop) {
+    size_t distance;
+    byte(b, opcode);
+    distance = b->length + 1 - loop;
+    if (distance > 128) b->failed = 1;
+    byte(b, (unsigned)(0u - (unsigned)distance));
+}
+
+/* A forward rel8 jump; returns the patch offset. */
+static size_t jump_ahead(Emitter *b, unsigned opcode) {
+    size_t patch;
+    byte(b, opcode); patch = b->length; byte(b, 0);
+    return patch;
+}
+
+static void patch_forward(Emitter *b, size_t patch) {
+    size_t distance = b->length - (patch + 1);
+    if (distance > 127) { b->failed = 1; return; }
+    b->data[patch] = (unsigned char)distance;
+}
+
+/* SCAT: validated parts are R10/R11D and R8/R9D. Charges one step per byte. */
+static void emit_scat(Emitter *b, const CodonNode *n) {
+    size_t loop1, loop2, skip1, skip2;
+    load_string_pair(b, n);
+    byte(b, 0x44); byte(b, 0x89); byte(b, 0xd9); /* mov ecx,r11d */
+    byte(b, 0x44); byte(b, 0x01); byte(b, 0xc9); /* add ecx,r9d: total bytes */
+    byte(b, 0x8b); byte(b, 0x43); byte(b, 72); /* mov eax,[rbx+72]: count */
+    byte(b, 0x3d); word32(b, BIO_MAX_STRINGS); /* cmp eax,BIO_MAX_STRINGS */
+    byte(b, 0xc7); byte(b, 0x43); byte(b, 20); word32(b, BIO_MAX_STRINGS); /* bound = capacity */
+    require_condition(b, n, BIO_FAULT_STRING_TABLE, 0x72); /* jb: table has room */
+    byte(b, 0x8b); byte(b, 0x43); byte(b, 92); /* mov eax,[rbx+92]: capacity */
+    byte(b, 0x2b); byte(b, 0x43); byte(b, 88); /* sub eax,[rbx+88]: remaining */
+    byte(b, 0x89); byte(b, 0x4b); byte(b, 16); /* bad_index = needed */
+    byte(b, 0x89); byte(b, 0x43); byte(b, 20); /* bound = remaining */
+    byte(b, 0x39); byte(b, 0xc1); /* cmp ecx,eax */
+    require_condition(b, n, BIO_FAULT_STRING_BUDGET, 0x76); /* jbe: pool has room */
+    byte(b, 0x48); byte(b, 0x39); byte(b, 0x0b); /* cmp [rbx],rcx */
+    require_condition(b, n, BIO_FAULT_BUDGET, 0x73); /* jae: steps remain */
+    byte(b, 0x48); byte(b, 0x29); byte(b, 0x0b); /* sub [rbx],rcx */
+    byte(b, 0x48); byte(b, 0x8b); byte(b, 0x53); byte(b, 80); /* mov rdx,[rbx+80]: pool */
+    byte(b, 0x8b); byte(b, 0x43); byte(b, 88); /* mov eax,[rbx+88]: used */
+    byte(b, 0x48); byte(b, 0x8d); byte(b, 0x14); byte(b, 2); /* lea rdx,[rdx+rax]: bump cursor */
+    byte(b, 0x01); byte(b, 0x4b); byte(b, 88); /* add [rbx+88],ecx */
+    byte(b, 0x8b); byte(b, 0x43); byte(b, 72); /* mov eax,[rbx+72]: handle = old count */
+    store_eax(b, n->arg1); /* EAX survives; the handle is the result */
+    byte(b, 0x83); byte(b, 0x43); byte(b, 72); byte(b, 1); /* add dword [rbx+72],1 */
+    byte(b, 0xc1); byte(b, 0xe0); byte(b, 4); /* shl eax,4 */
+    /* RDI is callee-saved in Win64: the entry address must live in volatile RAX. */
+    byte(b, 0x48); byte(b, 0x03); byte(b, 0x43); byte(b, 64); /* add rax,[rbx+64]: &entry */
+    byte(b, 0x48); byte(b, 0x89); byte(b, 0x10); /* mov [rax],rdx */
+    byte(b, 0x89); byte(b, 0x48); byte(b, 8); /* mov [rax+8],ecx */
+    b->cached = -1; /* The copy loops clobber EAX. */
+    byte(b, 0x45); byte(b, 0x85); byte(b, 0xdb); /* test r11d,r11d */
+    skip1 = jump_ahead(b, 0x74);
+    byte(b, 0x31); byte(b, 0xc9); /* xor ecx,ecx */
+    loop1 = b->length;
+    byte(b, 0x41); byte(b, 0x8a); byte(b, 4); byte(b, 0x0a); /* mov al,[r10+rcx] */
+    byte(b, 0x88); byte(b, 4); byte(b, 0x0a); /* mov [rdx+rcx],al */
+    byte(b, 0x48); byte(b, 0xff); byte(b, 0xc1); /* inc rcx */
+    byte(b, 0x4c); byte(b, 0x39); byte(b, 0xd9); /* cmp rcx,r11 */
+    jump_back(b, 0x72, loop1); /* jb */
+    patch_forward(b, skip1);
+    byte(b, 0x4c); byte(b, 0x01); byte(b, 0xda); /* add rdx,r11: second part follows */
+    byte(b, 0x45); byte(b, 0x85); byte(b, 0xc9); /* test r9d,r9d */
+    skip2 = jump_ahead(b, 0x74);
+    byte(b, 0x31); byte(b, 0xc9); /* xor ecx,ecx */
+    loop2 = b->length;
+    byte(b, 0x41); byte(b, 0x8a); byte(b, 4); byte(b, 8); /* mov al,[r8+rcx] */
+    byte(b, 0x88); byte(b, 4); byte(b, 0x0a); /* mov [rdx+rcx],al */
+    byte(b, 0x48); byte(b, 0xff); byte(b, 0xc1); /* inc rcx */
+    byte(b, 0x4c); byte(b, 0x39); byte(b, 0xc9); /* cmp rcx,r9 */
+    jump_back(b, 0x72, loop2); /* jb */
+    patch_forward(b, skip2);
+}
+
+/* SEQ: validated parts are R10/R11D and R8/R9D. Charges min(length)+1 steps. */
+static void emit_seq(Emitter *b, const CodonNode *n) {
+    size_t skip_min, loop, eq, ne1, ne2, done;
+    load_string_pair(b, n);
+    byte(b, 0x44); byte(b, 0x89); byte(b, 0xd9); /* mov ecx,r11d */
+    byte(b, 0x44); byte(b, 0x39); byte(b, 0xc9); /* cmp ecx,r9d */
+    skip_min = jump_ahead(b, 0x76); /* jbe: r11d is the minimum */
+    byte(b, 0x44); byte(b, 0x89); byte(b, 0xc9); /* mov ecx,r9d */
+    patch_forward(b, skip_min);
+    byte(b, 0xff); byte(b, 0xc1); /* inc ecx: compare the common prefix plus one */
+    byte(b, 0x48); byte(b, 0x39); byte(b, 0x0b); /* cmp [rbx],rcx */
+    require_condition(b, n, BIO_FAULT_BUDGET, 0x73); /* jae */
+    byte(b, 0x48); byte(b, 0x29); byte(b, 0x0b); /* sub [rbx],rcx */
+    byte(b, 0x45); byte(b, 0x39); byte(b, 0xcb); /* cmp r11d,r9d: equal lengths first */
+    ne1 = jump_ahead(b, 0x75); /* jne: unequal */
+    byte(b, 0x31); byte(b, 0xc9); /* xor ecx,ecx */
+    loop = b->length;
+    byte(b, 0x4c); byte(b, 0x39); byte(b, 0xd9); /* cmp rcx,r11 */
+    eq = jump_ahead(b, 0x73); /* jae: whole prefix matched */
+    byte(b, 0x41); byte(b, 0x8a); byte(b, 4); byte(b, 0x0a); /* mov al,[r10+rcx] */
+    byte(b, 0x41); byte(b, 0x3a); byte(b, 4); byte(b, 8); /* cmp al,[r8+rcx] */
+    ne2 = jump_ahead(b, 0x75); /* jne */
+    byte(b, 0x48); byte(b, 0xff); byte(b, 0xc1); /* inc rcx */
+    jump_back(b, 0xeb, loop); /* jmp */
+    patch_forward(b, eq);
+    byte(b, 0xb8); word32(b, 1); /* mov eax,1 */
+    store_eax(b, n->arg1);
+    done = jump_ahead(b, 0xeb);
+    patch_forward(b, ne1); patch_forward(b, ne2);
+    byte(b, 0x31); byte(b, 0xc0); /* xor eax,eax */
+    store_eax(b, n->arg1);
+    patch_forward(b, done);
+}
+
 static void emit_transfer(Emitter *b, const BioGene *g, const CodonNode *n) {
     const BioLocal *local = &g->locals[n->arg1];
     int reading = n->op_code == OP_READ;
@@ -245,6 +382,35 @@ static void emit_gene(Emitter *b, BioGene *g) {
             byte(b, 0x8b); byte(b, 0x86); word32(b, g->locals[n->arg2].offset * 4u); /* mov eax,[rsi+off] */
             store_eax(b, n->arg1);
             break;
+        case OP_SLOAD:
+            byte(b, 0xb8); word32(b, n->arg2); /* mov eax,literal index */
+            store_eax(b, n->arg1);
+            break;
+        case OP_SLEN:
+            emit_load(b, n->arg2);
+            guard_handle(b, n);
+            byte(b, 0x48); byte(b, 0x8b); byte(b, 0x53); byte(b, 64); /* mov rdx,[rbx+64] */
+            byte(b, 0xc1); byte(b, 0xe0); byte(b, 4); /* shl eax,4 */
+            byte(b, 0x8b); byte(b, 0x44); byte(b, 2); byte(b, 8); /* mov eax,[rdx+rax+8] */
+            store_eax(b, n->arg1);
+            break;
+        case OP_SGET:
+            emit_load(b, n->arg2 & 255u);
+            guard_handle(b, n);
+            byte(b, 0x48); byte(b, 0x8b); byte(b, 0x53); byte(b, 64); /* mov rdx,[rbx+64] */
+            byte(b, 0xc1); byte(b, 0xe0); byte(b, 4); /* shl eax,4 */
+            byte(b, 0x4c); byte(b, 0x8b); byte(b, 0x14); byte(b, 2); /* mov r10,[rdx+rax]: data */
+            byte(b, 0x44); byte(b, 0x8b); byte(b, 0x5c); byte(b, 2); byte(b, 8); /* mov r11d,[rdx+rax+8]: length */
+            byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2 >> 8)); /* mov ecx,[rsp+slot]: index */
+            byte(b, 0x89); byte(b, 0x4b); byte(b, 16); /* bad_index = index */
+            byte(b, 0x44); byte(b, 0x89); byte(b, 0x5b); byte(b, 20); /* bound = length */
+            byte(b, 0x44); byte(b, 0x39); byte(b, 0xd9); /* cmp ecx,r11d */
+            require_condition(b, n, BIO_FAULT_STRING_BOUNDS, 0x72); /* jb: unsigned rejects negatives too */
+            byte(b, 0x41); byte(b, 0x0f); byte(b, 0xb6); byte(b, 4); byte(b, 0x0a); /* movzx eax,byte [r10+rcx] */
+            store_eax(b, n->arg1);
+            break;
+        case OP_SCAT: emit_scat(b, n); break;
+        case OP_SEQ: emit_seq(b, n); break;
         case OP_SET:
             emit_load(b, n->arg2);
             byte(b, 0x89); byte(b, 0x86); word32(b, g->locals[n->arg1].offset * 4u); /* mov [rsi+off],eax */
