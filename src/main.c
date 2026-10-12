@@ -29,6 +29,7 @@ static void usage(void) {
          "  test <file.dna> <cases.csv>     Compare CSV examples, including file lists\n"
          "  check <file.dna>               Validate without running or preparing JIT\n"
          "  interpret <file.dna> [number ...]  Run the reference interpreter\n"
+         "  verify <file.dna> [number ...]    Run JIT and interpreter; require identical results\n"
          "  dump <file.dna>                Show the normalized program\n"
          "  live <file.dna>                Run and reload in one process\n"
          "  emit <file.dna> <code.bin>     Export raw machine code (not an .exe)\n"
@@ -40,7 +41,7 @@ static void usage(void) {
          "CSV header: expected | arg1,expected | arg1,arg2,expected\n"
          "CSV with lists: add input before expected and expected_output after it\n"
          "List paths are relative to CSV; test compares in memory without writing files\n"
-         "Live commands: run [number ...] | reload <file.dna> | quit\n"
+         "Live commands: run [number ...] | reload <file.dna> [--gate cases.csv] | quit\n"
          "Every run shares a 1000000-step budget across loops, calls, initialization and list copies.\n"
          "Exit codes: 0 success, 1 failed tests or program/file error, 2 invalid command or arguments");
 }
@@ -86,7 +87,7 @@ static int options(int argc, char **argv, Options *o, BioError *e) {
     is_emit = !strcmp(o->command, "emit");
     is_test = !strcmp(o->command, "test");
     if (strcmp(o->command, "new") && strcmp(o->command, "run") && strcmp(o->command, "check") &&
-        strcmp(o->command, "interpret") && strcmp(o->command, "dump") &&
+        strcmp(o->command, "interpret") && strcmp(o->command, "verify") && strcmp(o->command, "dump") &&
         strcmp(o->command, "live") && !is_emit && !is_test) {
         bio_error(e, "unknown command '%s'; use --help", o->command); return 0;
     }
@@ -101,18 +102,19 @@ static int options(int argc, char **argv, Options *o, BioError *e) {
         else if (!strcmp(argv[i], "--json")) o->json = 1;
         else if (!strcmp(argv[i], "--input") || !strcmp(argv[i], "--output")) {
             const char **target = !strcmp(argv[i], "--input") ? &o->input_list : &o->output_list;
-            if (strcmp(o->command, "run") && strcmp(o->command, "interpret")) {
-                bio_error(e, "%s is supported only for run and interpret", argv[i]); return 0;
+            if (strcmp(o->command, "run") && strcmp(o->command, "interpret") && strcmp(o->command, "verify")) {
+                bio_error(e, "%s is supported only for run, interpret and verify", argv[i]); return 0;
             }
             if (*target || i + 1 == argc || !argv[i + 1][0] || !strncmp(argv[i + 1], "--", 2)) {
                 bio_error(e, "%s requires exactly one file path and cannot be repeated", argv[i]); return 0;
             }
             *target = argv[++i];
-        } else if ((!strcmp(o->command, "run") || !strcmp(o->command, "interpret")) &&
+        } else if ((!strcmp(o->command, "run") || !strcmp(o->command, "interpret") ||
+                    !strcmp(o->command, "verify")) &&
                  o->argument_count < 2 && cli_parse_i32(argv[i], &o->arguments[o->argument_count]))
             ++o->argument_count;
         else {
-            if (!strcmp(o->command, "run") || !strcmp(o->command, "interpret"))
+            if (!strcmp(o->command, "run") || !strcmp(o->command, "interpret") || !strcmp(o->command, "verify"))
                 bio_error(e, "unexpected argument '%s'; inputs must be at most two decimal i32 values", argv[i]);
             else bio_error(e, "unexpected argument '%s' for %s; use --help", argv[i], o->command);
             return 0;
@@ -194,12 +196,110 @@ static int create_source(const char *path, BioError *e) {
     return ok;
 }
 
+/* One backend outcome in a verify report. */
+static void verify_outcome_json(int index, int ok, int32_t result, const BioError *error) {
+    printf(",\"%s\":", index ? "interpret" : "run");
+    if (ok) printf("{\"ok\":true,\"result\":%" PRId32 "}", result);
+    else { fputs("{\"ok\":false,\"error\":", stdout); cli_json_string(error->message); putchar('}'); }
+}
+
+/* Run the JIT and the reference interpreter on identical input and require
+   identical observable behavior: result, output list, or the same fault. */
+static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
+    BioStats s = bio_program_stats(p);
+    BioIO io[2] = {{0}, {0}};
+    BioError errors[2] = {{{0}}, {{0}}};
+    int32_t *input = NULL, *outputs[2] = {NULL, NULL};
+    int32_t results[2] = {0, 0};
+    size_t input_count = 0, i;
+    int ok[2], agree, code = 1;
+    if (o->argument_count != s.arity) {
+        bio_error(e, "main expects %u arguments, got %zu", s.arity, o->argument_count);
+        return failure(o->json, "arguments", e->message, 2);
+    }
+    if (o->input_list && !cli_read_list(o->input_list, &input, &input_count, e))
+        return failure(o->json, "file", e->message, 1);
+    if (o->output_list) {
+        outputs[0] = malloc(BIO_LIST_LIMIT * sizeof(*outputs[0]));
+        outputs[1] = malloc(BIO_LIST_LIMIT * sizeof(*outputs[1]));
+        if (!outputs[0] || !outputs[1]) {
+            bio_error(e, "out of memory preparing output lists");
+            free(input); free(outputs[0]); free(outputs[1]);
+            return failure(o->json, "file", e->message, 1);
+        }
+    }
+    for (i = 0; i < 2; ++i) {
+        io[i].input = input; io[i].input_count = input_count;
+        io[i].output = outputs[i];
+        io[i].output_capacity = outputs[i] ? BIO_LIST_LIMIT : 0;
+    }
+    ok[0] = bio_program_run_io(p, o->arguments, o->argument_count, &io[0], &results[0], &errors[0]);
+    ok[1] = bio_program_interpret_io(p, o->arguments, o->argument_count, &io[1], &results[1], &errors[1]);
+    agree = ok[0] == ok[1];
+    if (agree && ok[0]) {
+        agree = results[0] == results[1] &&
+            io[0].output_written == io[1].output_written &&
+            io[0].output_count == io[1].output_count;
+        for (i = 0; agree && i < io[0].output_count; ++i)
+            agree = outputs[0][i] == outputs[1][i];
+    }
+    if (agree && !ok[0])
+        agree = !strcmp(errors[0].message, errors[1].message);
+    if (!agree) {
+        if (o->json) {
+            fputs("{\"ok\":false,\"verified\":false", stdout);
+            for (i = 0; i < 2; ++i) verify_outcome_json((int)i, ok[i], results[i], &errors[i]);
+            puts("}");
+        } else {
+            fputs("verify: DIVERGENCE between JIT and interpreter\n", stderr);
+            for (i = 0; i < 2; ++i) {
+                fprintf(stderr, "  %s: ", i ? "interpret" : "run");
+                if (ok[i]) fprintf(stderr, "result=%" PRId32 "\n", results[i]);
+                else fprintf(stderr, "%s\n", errors[i].message);
+            }
+        }
+        goto done;
+    }
+    if (!ok[0]) {
+        if (o->json) {
+            fputs("{\"ok\":false,\"verified\":true,\"error\":{\"stage\":\"run\",\"message\":", stdout);
+            cli_json_string(errors[0].message); puts("}}");
+        } else fprintf(stderr, "verified: JIT and interpreter agree on the failure\n%s\n", errors[0].message);
+        goto done;
+    }
+    if (o->output_list) {
+        if (!io[0].output_written) {
+            bio_error(e, "program did not execute WRITE; output file was not created");
+            code = failure(o->json, "file", e->message, 1); goto done;
+        }
+        if (!cli_write_list(o->output_list, outputs[0], io[0].output_count, e)) {
+            code = failure(o->json, "file", e->message, 1); goto done;
+        }
+    }
+    if (o->json) {
+        printf("{\"ok\":true,\"verified\":true,\"result\":%" PRId32 ",", results[0]); stats(s, 1);
+        if (o->output_list) {
+            fputs(",\"output\":", stdout); cli_json_string(o->output_list);
+            printf(",\"output_count\":%zu", io[0].output_count);
+        }
+        repair_report(p, 1);
+        puts("}");
+    } else {
+        printf("%" PRId32 "\n", results[0]);
+        fputs("verified: JIT and interpreter agree\n", stderr);
+    }
+    code = 0;
+done:
+    free(input); free(outputs[0]); free(outputs[1]);
+    return code;
+}
+
 static int live(BioProgram *p, int repair, BioError *e) {
     BioRuntime *runtime = bio_runtime_create(p, e);
     char line[1200];
     bio_program_release(p); /* Transfer CLI ownership to the runtime, including on failure. */
     if (!runtime) return failure(0, "runtime", e->message, 1);
-    puts("Ready. Commands: run [number ...] | reload <file.dna> | quit");
+    puts("Ready. Commands: run [number ...] | reload <file.dna> [--gate cases.csv] | quit");
     fflush(stdout);
     while (fgets(line, sizeof(line), stdin)) {
         size_t n = strlen(line);
@@ -224,9 +324,34 @@ static int live(BioProgram *p, int repair, BioError *e) {
             else if (bio_runtime_run(runtime, args, argc, &result, e)) printf("result=%" PRId32 "\n", result);
             else fprintf(stderr, "%s\n", e->message);
         } else if (!strncmp(line, "reload ", 7) && line[7]) {
-            if (bio_runtime_reload(runtime, line + 7, repair, e)) puts("updated");
-            else fprintf(stderr, "%s\nUpdate rejected; previous version is still active.\n", e->message);
-        } else puts("expected: run [number ...] | reload <file.dna> | quit");
+            char *path = strtok(line + 7, " \t");
+            char *flag = strtok(NULL, " \t");
+            const char *gate = NULL;
+            int malformed = 0;
+            if (flag) {
+                if (!strcmp(flag, "--gate")) {
+                    gate = strtok(NULL, " \t");
+                    malformed = !gate || strtok(NULL, " \t") != NULL;
+                } else malformed = 1;
+            }
+            if (malformed) fputs("expected: reload <file.dna> [--gate <cases.csv>]\n", stderr);
+            else if (!gate) {
+                if (bio_runtime_reload(runtime, path, repair, e)) puts("updated");
+                else fprintf(stderr, "%s\nUpdate rejected; previous version is still active.\n", e->message);
+            } else {
+                /* Compile, prove the candidate against the CSV gate, then publish. */
+                BioProgram *candidate = bio_compile(path, repair, e);
+                if (!candidate)
+                    fprintf(stderr, "%s\nUpdate rejected; previous version is still active.\n", e->message);
+                else {
+                    if (cli_test(candidate, gate, 0) != 0)
+                        fputs("Gate rejected the update; previous version is still active.\n", stderr);
+                    else if (bio_runtime_publish(runtime, candidate, e)) puts("updated (gate passed)");
+                    else fprintf(stderr, "%s\nUpdate rejected; previous version is still active.\n", e->message);
+                    bio_program_release(candidate);
+                }
+            }
+        } else puts("expected: run [number ...] | reload <file.dna> [--gate cases.csv] | quit");
         fflush(stdout);
     }
     bio_runtime_destroy(runtime);
@@ -298,7 +423,8 @@ static int cli(int argc, char **argv) {
             } else printf("%" PRId32 "\n", result);
             free(input); free(output);
         }
-    } else if (!strcmp(o.command, "check")) {
+    } else if (!strcmp(o.command, "verify")) code = cli_verify(p, &o, &e);
+    else if (!strcmp(o.command, "check")) {
         if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); repair_report(p, 1); puts("}"); }
         else stats(s, 0);
     } else if (!strcmp(o.command, "test")) code = cli_test(p, o.output, o.json);

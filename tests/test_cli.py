@@ -170,7 +170,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.10.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.11.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -286,6 +286,51 @@ class CliTests(unittest.TestCase):
                          ["result=30", "result=200", "result=200"])
         self.assertIn("incompatible signature", proc.stderr)
         self.assertIn("expects 2 arguments", proc.stderr)
+
+    def test_verify_agrees(self):
+        source = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n")
+        proc = self.call("verify", source, 10, 20)
+        self.assertEqual(proc.stdout.strip(), "30")
+        self.assertIn("verified: JIT and interpreter agree", proc.stderr)
+
+    def test_verify_identical_failure(self):
+        source = self.source("GENE main i32\nARRAY a 2\nLOAD r0 5\nAGET r1 a,r0\nRET r1 _\nEND _ _\n")
+        proc = self.call("verify", source, code=1)
+        self.assertIn("verified: JIT and interpreter agree on the failure", proc.stderr)
+        self.assertIn("array index 5 out of bounds", proc.stderr)
+        self.assertNotIn("DIVERGENCE", proc.stderr)
+
+    def test_verify_json(self):
+        source = self.source("GENE main i32/1\nMUL r0 r0\nRET r0 _\nEND _ _\n")
+        data = json.loads(self.call("verify", source, 7, "--json").stdout)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["verified"])
+        self.assertEqual(data["result"], 49)
+
+    def test_verify_lists(self):
+        source = self.source("GENE main i32\nARRAY items 8\nREAD items r0\nWRITE items r0\nRET r0 _\nEND _ _\n")
+        list_in = self.source("3\n-1\n4\n", "in.txt")
+        out = self.root / "out.txt"
+        proc = self.call("verify", source, "--input", list_in, "--output", out)
+        self.assertEqual(proc.stdout.strip(), "3")
+        self.assertEqual(out.read_text(encoding="utf-8").split(), ["3", "-1", "4"])
+        self.assertIn("verified", proc.stderr)
+
+    def test_live_gated_reload(self):
+        old = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n", "old.dna")
+        new = self.source("GENE main i32/2\nMUL r0 r1\nRET r0 _\nEND _ _\n", "new.dna")
+        bad = self.source("GENE main i32/2\nSUB r0 r1\nRET r0 _\nEND _ _\n", "bad.dna")
+        gate = self.source("arg1,arg2,expected\n10,20,200\n", "gate.csv")
+        proc = self.call("live", old, input=(
+            f"run 10 20\nreload {new} --gate {gate}\nrun 10 20\n"
+            f"reload {bad} --gate {gate}\nrun 10 20\nreload {new} --gate\nquit\n"))
+        results = [x for x in proc.stdout.splitlines() if x.startswith("result=")]
+        self.assertEqual(results, ["result=30", "result=200", "result=200"])
+        self.assertIn("updated (gate passed)", proc.stdout)
+        self.assertIn("PASS", proc.stdout)
+        self.assertIn("FAIL", proc.stdout)
+        self.assertIn("Gate rejected the update; previous version is still active.", proc.stderr)
+        self.assertIn("expected: reload <file.dna> [--gate <cases.csv>]", proc.stderr)
 
     def test_emit_utf8_path(self):
         source = self.source("GENE main i32\nLOAD r0 5\nRET r0 _\nEND _ _\n")
