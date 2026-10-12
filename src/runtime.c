@@ -37,13 +37,12 @@ int bio_runtime_run_io(BioRuntime *runtime, const int32_t *arguments, size_t arg
     return ok;
 }
 
-int bio_runtime_reload(BioRuntime *runtime, const char *path, int repair, BioError *e) {
+int bio_runtime_publish(BioRuntime *runtime, BioProgram *candidate, BioError *e) {
     BioProgram *old;
-    BioProgram *candidate;
     unsigned i;
-    if (!runtime) { bio_error(e, "runtime is required"); return 0; }
-    candidate = bio_compile(path, repair, e);
-    if (!candidate) return 0;
+    if (!runtime || !candidate || !candidate->code) {
+        bio_error(e, "runtime and a compiled candidate program are required"); return 0;
+    }
     AcquireSRWLockExclusive(&runtime->lock);
     old = runtime->active;
     /* Compare against the currently published version, even with concurrent writers. */
@@ -53,15 +52,26 @@ int bio_runtime_reload(BioRuntime *runtime, const char *path, int repair, BioErr
             candidate->genes[found].has_array != old->genes[i].has_array) {
             bio_error(e, "repair rejected: incompatible signature or removed gene %s", old->genes[i].name);
             ReleaseSRWLockExclusive(&runtime->lock);
-            bio_program_release(candidate);
             return 0;
         }
     }
+    bio_program_retain(candidate);
     runtime->active = candidate;
     ReleaseSRWLockExclusive(&runtime->lock);
     /* Existing calls hold references; reclamation happens after their last return. */
     bio_program_release(old);
     return 1;
+}
+
+int bio_runtime_reload(BioRuntime *runtime, const char *path, int repair, BioError *e) {
+    BioProgram *candidate;
+    int ok;
+    if (!runtime) { bio_error(e, "runtime is required"); return 0; }
+    candidate = bio_compile(path, repair, e);
+    if (!candidate) return 0;
+    ok = bio_runtime_publish(runtime, candidate, e);
+    bio_program_release(candidate);
+    return ok;
 }
 
 void bio_runtime_destroy(BioRuntime *runtime) {

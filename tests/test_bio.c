@@ -1072,6 +1072,37 @@ static DWORD WINAPI reader(LPVOID arg) {
     return 0;
 }
 
+static void publish_tests(void) {
+    BioError e = {{0}};
+    BioProgram *initial, *candidate;
+    BioRuntime *runtime;
+    char path[256];
+    write_source("pub-old.dna", "GENE main i32\nLOAD r0 30\nRET r0 _\nEND _ _\n");
+    write_source("pub-new.dna", "GENE main i32\nLOAD r0 42\nRET r0 _\nEND _ _\n");
+    write_source("pub-bad.dna", "GENE main i32/1\nRET r0 _\nEND _ _\n");
+    initial = compile_name("pub-old.dna", 0, &e); REQUIRE(initial != NULL);
+    runtime = bio_runtime_create(initial, &e); REQUIRE(runtime != NULL);
+    /* The caller verifies the candidate itself, then publishes it. */
+    candidate = compile_name("pub-new.dna", 0, &e); REQUIRE(candidate != NULL);
+    REQUIRE(bio_runtime_publish(runtime, candidate, &e));
+    REQUIRE(runtime0(runtime) == 42);
+    /* Publication retained its own reference; the caller's release is safe. */
+    bio_program_release(candidate);
+    REQUIRE(runtime0(runtime) == 42);
+    /* Incompatible and load-only (no native code) candidates are rejected. */
+    candidate = compile_name("pub-bad.dna", 0, &e); REQUIRE(candidate != NULL);
+    REQUIRE(!bio_runtime_publish(runtime, candidate, &e));
+    REQUIRE(strstr(e.message, "incompatible signature") != NULL);
+    bio_program_release(candidate);
+    path_for(path, sizeof(path), "pub-old.dna");
+    candidate = bio_load(path, 0, &e); REQUIRE(candidate != NULL);
+    REQUIRE(!bio_runtime_publish(runtime, candidate, &e));
+    bio_program_release(candidate);
+    REQUIRE(runtime0(runtime) == 42);
+    bio_runtime_destroy(runtime);
+    bio_program_release(initial);
+}
+
 static void runtime_tests(void) {
     BioError e = {{0}};
     BioProgram *initial;
@@ -1144,6 +1175,7 @@ int main(void) {
     loop_runtime_tests();
     execution_budget_tests();
     budget_tests();
+    publish_tests();
     runtime_tests();
     printf("PASS: %u checks; 250 generated programs matched JIT, interpreter and reference.\n", checks);
     return 0;

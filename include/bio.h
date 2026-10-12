@@ -89,6 +89,11 @@ int bio_runtime_run(BioRuntime *runtime, const int32_t *arguments, size_t argume
 int bio_runtime_run_io(BioRuntime *runtime, const int32_t *arguments, size_t argument_count,
                        BioIO *io, int32_t *result, BioError *error);
 int bio_runtime_reload(BioRuntime *runtime, const char *path, int repair, BioError *error);
+/* Publish an already-compiled candidate after the caller's own verification
+   (for example a test-suite gate). Same signature compatibility contract as
+   bio_runtime_reload. On success the runtime retains its own reference; the
+   caller keeps theirs and must release it. */
+int bio_runtime_publish(BioRuntime *runtime, BioProgram *candidate, BioError *error);
 void bio_runtime_destroy(BioRuntime *runtime);
 
 #endif
