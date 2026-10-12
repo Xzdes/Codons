@@ -33,6 +33,8 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
   add_test(NAME cli_tests COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.py" "$<TARGET_FILE:codons>")
   set_tests_properties(cli_tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 60)
+  add_test(NAME fuzz_diff COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_diff.py" "$<TARGET_FILE:codons>" --count 150 --seed 7)
+  set_tests_properties(fuzz_diff PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 240)
 endif()
 
 install(TARGETS codons RUNTIME DESTINATION .)
