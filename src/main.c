@@ -12,7 +12,7 @@ typedef struct {
     const char *output;
     const char *input_list;
     const char *output_list;
-    int32_t arguments[2];
+    int32_t arguments[4];
     size_t argument_count;
     int repair;
     int json;
@@ -25,7 +25,7 @@ static void usage(void) {
          "  codons run hello.dna 10 20\n"
          "\nCommands:\n"
          "  new <file.dna>                 Create an example; never overwrite a file\n"
-         "  run <file.dna> [number ...]     Compile and run with 0, 1 or 2 i32 inputs\n"
+         "  run <file.dna> [number ...]     Compile and run with 0 to 4 i32 inputs\n"
          "  test <file.dna> <cases.csv>     Compare CSV examples, including file lists\n"
          "  check <file.dna>               Validate without running or preparing JIT\n"
          "  interpret <file.dna> [number ...]  Run the reference interpreter\n"
@@ -111,11 +111,11 @@ static int options(int argc, char **argv, Options *o, BioError *e) {
             *target = argv[++i];
         } else if ((!strcmp(o->command, "run") || !strcmp(o->command, "interpret") ||
                     !strcmp(o->command, "verify")) &&
-                 o->argument_count < 2 && cli_parse_i32(argv[i], &o->arguments[o->argument_count]))
+                 o->argument_count < 4 && cli_parse_i32(argv[i], &o->arguments[o->argument_count]))
             ++o->argument_count;
         else {
             if (!strcmp(o->command, "run") || !strcmp(o->command, "interpret") || !strcmp(o->command, "verify"))
-                bio_error(e, "unexpected argument '%s'; inputs must be at most two decimal i32 values", argv[i]);
+                bio_error(e, "unexpected argument '%s'; inputs must be at most four decimal i32 values", argv[i]);
             else bio_error(e, "unexpected argument '%s' for %s; use --help", argv[i], o->command);
             return 0;
         }
@@ -312,15 +312,15 @@ static int live(BioProgram *p, int repair, BioError *e) {
         line[strcspn(line, "\r\n")] = '\0';
         if (!strcmp(line, "quit")) break;
         if (!strncmp(line, "run", 3) && (!line[3] || isspace((unsigned char)line[3]))) {
-            int32_t args[2], result;
+            int32_t args[4], result;
             size_t argc = 0;
             char *part = strtok(line + 3, " \t");
             int valid = 1;
             while (part) {
-                if (argc == 2 || !cli_parse_i32(part, &args[argc])) { valid = 0; break; }
+                if (argc == 4 || !cli_parse_i32(part, &args[argc])) { valid = 0; break; }
                 ++argc; part = strtok(NULL, " \t");
             }
-            if (!valid) fputs("run accepts at most two decimal i32 inputs\n", stderr);
+            if (!valid) fputs("run accepts at most four decimal i32 inputs\n", stderr);
             else if (bio_runtime_run(runtime, args, argc, &result, e)) printf("result=%" PRId32 "\n", result);
             else fprintf(stderr, "%s\n", e->message);
         } else if (!strncmp(line, "reload ", 7) && line[7]) {

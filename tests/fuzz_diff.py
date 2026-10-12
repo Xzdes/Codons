@@ -45,9 +45,7 @@ class Gene:
             self.arrays.append(("xs", None))
         self.branches = 0
         self.loops = 0
-        self.init = {"r0"} if arity >= 1 else set()
-        if arity >= 2:
-            self.init.add("r1")
+        self.init = {f"r{i}" for i in range(arity)}
 
     @property
     def has_param(self):
@@ -140,25 +138,20 @@ class Gene:
 
     def gen_call(self, forbidden):
         name, arity, has_param = self.rng.choice(self.callees)
+        used, parts = [], []
         if has_param:
             array, length = self.rng.choice(self.local_arrays())
             bad = self.rng.random() < 0.15
             length_reg = self.load(value=length + 1 if bad else self.rng.randint(1, length),
                                    forbidden=forbidden)
-            if arity == 1:
-                self.emit(f"CALL {name} {array},{length_reg}")
-            else:
-                extra = self.load(forbidden=forbidden + (length_reg,))
-                self.emit(f"CALL {name} {array},{length_reg},{extra}")
-        else:
-            if arity == 0:
-                self.emit(f"CALL {name} _")
-            elif arity == 1:
-                self.emit(f"CALL {name} {self.load(forbidden=forbidden)}")
-            else:
-                first = self.load(forbidden=forbidden)
-                second = self.load(forbidden=forbidden + (first,))
-                self.emit(f"CALL {name} {first},{second}")
+            used.append(length_reg)
+            parts += [array, length_reg]
+        # The array name is not an argument; arity counts the length register too.
+        while len(parts) - (1 if has_param else 0) < arity:
+            reg = self.load(forbidden=forbidden + tuple(used))
+            used.append(reg)
+            parts.append(reg)
+        self.emit(f"CALL {name} {','.join(parts) if parts else '_'}")
         self.init.add("r0")
 
     def gen_statement(self, forbidden=()):
@@ -273,10 +266,10 @@ class Gene:
 def gen_program(rng):
     parts, callees = [], []
     for i in range(rng.randint(0, 2)):
-        gene = Gene(rng, f"f{i}", rng.randint(0, 2), callees, allow_param=True)
+        gene = Gene(rng, f"f{i}", rng.randint(0, 4), callees, allow_param=True)
         parts.append(gene.generate())
         callees.append((gene.name, gene.arity, gene.has_param))
-    main = Gene(rng, "main", rng.randint(0, 2), callees, allow_param=False)
+    main = Gene(rng, "main", rng.randint(0, 4), callees, allow_param=False)
     parts.append(main.generate())
     args = [rng.choice(I32_POOL) for _ in range(main.arity)]
     return "\n\n".join(parts) + "\n", args

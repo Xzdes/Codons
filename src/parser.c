@@ -174,9 +174,10 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             if (!identifier(fields[1])) FAIL("invalid gene identifier");
             if (bio_find_gene(p, fields[1]) >= 0) FAIL("duplicate gene: %s", fields[1]);
             if (strcmp(fields[2], "i32") == 0 || strcmp(fields[2], "i32/0") == 0) arity = 0;
-            else if (strcmp(fields[2], "i32/1") == 0) arity = 1;
-            else if (strcmp(fields[2], "i32/2") == 0) arity = 2;
-            else FAIL("signature must be i32, i32/0, i32/1 or i32/2");
+            else if (fields[2][0] == 'i' && fields[2][1] == '3' && fields[2][2] == '2' &&
+                     fields[2][3] == '/' && fields[2][4] >= '1' && fields[2][4] <= '4' && !fields[2][5])
+                arity = (unsigned)(fields[2][4] - '0');
+            else FAIL("signature must be i32, i32/0 or i32/N with N in 1..4");
             if (p->gene_count == BIO_MAX_GENES) FAIL("apoptosis: gene budget exceeded");
             current = &p->genes[p->gene_count++];
             strcpy(current->name, fields[1]);
@@ -230,7 +231,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             if (parameter) {
                 if (strcmp(fields[2], "r0")) QUARANTINE("PARAM requires '<name> r0'; r0 is the array length");
                 if (!strcmp(current->name, "main")) QUARANTINE("main cannot declare PARAM");
-                if (!current->arity) QUARANTINE("PARAM requires i32/1 or i32/2; r0 supplies the array length");
+                if (!current->arity) QUARANTINE("PARAM requires i32/N with N in 1..4; r0 supplies the array length");
                 if (current->has_array) QUARANTINE("only one PARAM array is allowed per gene");
                 value = 0;
             } else {
@@ -319,34 +320,42 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             continue;
         }
         if (strcmp(fields[0], "CALL") == 0) {
-            char *comma, *arguments = fields[2];
-            unsigned argc = 0;
-            int sym;
+            char *comma, *parts[6], *arguments = fields[2];
+            unsigned argc = 0, count = 0, first = 0, packed = 0, i;
+            int sym, regs[4] = {0, 0, 0, 0};
             if (!identifier(fields[1])) QUARANTINE("invalid CALL target name");
             sym = symbol(p, fields[1]);
             if (sym < 0) QUARANTINE("symbol budget exceeded");
             a = b = 0;
             if (strcmp(arguments, "_") != 0) {
-                comma = strchr(arguments, ',');
-                if (comma) *comma = '\0';
-                if (reg(arguments) < 0) {
+                for (;;) {
+                    comma = strchr(arguments, ',');
+                    if (comma) *comma = '\0';
+                    if (count == 6) QUARANTINE("CALL accepts an array plus at most four registers");
+                    parts[count++] = arguments;
+                    if (!comma) break;
+                    arguments = comma + 1;
+                }
+                if (reg(parts[0]) < 0) {
+                    /* Array form: the first operand is a local array name. */
                     int array_symbol;
-                    if (!identifier(arguments) || !strcmp(arguments, "_") || !comma)
+                    if (!identifier(parts[0]) || !strcmp(parts[0], "_") || count < 2)
                         QUARANTINE("invalid CALL operands");
-                    array_symbol = symbol(p, arguments);
+                    array_symbol = symbol(p, parts[0]);
                     if (array_symbol < 0) QUARANTINE("symbol budget exceeded");
                     n->call_array = (uint32_t)array_symbol + 1u;
-                    arguments = comma + 1;
-                    comma = strchr(arguments, ',');
+                    first = 1;
                 }
-                if (comma) {
-                    *comma++ = '\0'; b = reg(comma); argc = 2;
-                } else argc = 1;
-                a = reg(arguments);
-                if (a < 0 || b < 0) QUARANTINE("invalid CALL operands");
+                argc = count - first;
+                if (argc > 4) QUARANTINE("CALL accepts at most four register arguments");
+                for (i = 0; i < argc; ++i) {
+                    regs[i] = reg(parts[first + i]);
+                    if (regs[i] < 0) QUARANTINE("invalid CALL operands");
+                }
+                for (i = 0; i < argc; ++i) packed |= (unsigned)regs[i] << (3 * i);
             }
             n->op_code = OP_CALL; n->arg1 = (uint32_t)sym;
-            n->arg2 = (argc << 16) | ((unsigned)b << 8) | (unsigned)a;
+            n->arg2 = (argc << 16) | packed;
             continue;
         }
         a = reg(fields[1]);

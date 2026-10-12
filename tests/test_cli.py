@@ -73,7 +73,7 @@ class CliTests(unittest.TestCase):
             (program("ARRAY a 1\nLOAD r0 1\nCALL f a,r0,r7\n", arity=2), "uninitialized register r7"),
             (program("ARRAY a 1\nLOAD r0 1\nCALL f a,r0\n", arity=2), "expects 2 arguments"),
             (program("PARAM a r0\nLOAD r0 0\n"), "main cannot declare PARAM"),
-            (program("LOAD r0 0\n", arity=0), "PARAM requires i32/1 or i32/2"),
+            (program("LOAD r0 0\n", arity=0), "PARAM requires i32/N with N in 1..4"),
             (program("LOAD r0 0\n", "PARAM p r1\nRET r0 _\n", 2), "PARAM requires '<name> r0'"),
             (program("LOAD r0 0\n", "PARAM r0 r0\nRET r0 _\n"), "invalid local name"),
             (program("LOAD r0 0\n", "PARAM _ r0\nRET r0 _\n"), "invalid local name"),
@@ -88,9 +88,12 @@ class CliTests(unittest.TestCase):
             (program("LOAD r0 0\n", "PARAM p r0\nCALL f p,r0\nRET r0 _\n"), "recursive call cycle"),
             (program("LOAD r0 0\n", "PARAM p r0\n" + "VAR v 0\n"), "must end with RET"),
         ]
-        for operands in ("a", "a,", "a,_", "a,r0,", "a,r0,r1,r2", "r0,r1,r2", "a,b,r0", "_,r0"):
+        for operands in ("a", "a,", "a,_", "a,r0,", "a,b,r0", "_,r0"):
             cases.append((program(f"ARRAY a 1\nLOAD r0 1\nCALL f {operands}\n"), "CALL operands"))
         cases.append((program("ARRAY a 1\nLOAD r0 1\nCALL f a, r0\n"), "exactly 3 fields"))
+        cases.append((program("ARRAY a 1\nLOAD r0 1\nCALL f r0,r1,r2,r3,r4\n"), "at most four register arguments"))
+        cases.append((program("ARRAY a 1\nLOAD r0 1\nCALL f a,r0,r1,r2,r3,r4\n"), "at most four register arguments"))
+        cases.append((program("ARRAY a 1\nLOAD r0 1\nCALL f a,r0,r1,r2\n"), "expects 1 arguments, got 3"))
         for source, message in cases:
             with self.subTest(message=message, source=source):
                 data = json.loads(self.call("check", self.source(source), "--json", code=1).stdout)
@@ -315,6 +318,16 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "3")
         self.assertEqual(out.read_text(encoding="utf-8").split(), ["3", "-1", "4"])
         self.assertIn("verified", proc.stderr)
+
+    def test_four_arguments_and_inline_output_list(self):
+        source = self.source("GENE main i32/4\nADD r0 r1\nADD r0 r2\nADD r0 r3\nRET r0 _\nEND _ _\n")
+        for command in ("run", "interpret", "verify"):
+            with self.subTest(command=command):
+                self.assertEqual(self.call(command, source, 1, 2, 3, 4).stdout.strip(), "10")
+        self.call("run", source, 1, 2, 3, 4, 5, code=2)  # five inputs are rejected
+        csv = self.source("arg1,arg2,arg3,arg4,expected\n1,2,3,4,10\n-1,-2,-3,-4,-10\n0,0,0,0,0\n", "four.csv")
+        proc = self.call("test", source, csv)
+        self.assertIn("Tests: 3 total, 3 passed", proc.stdout)
 
     def test_live_gated_reload(self):
         old = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n", "old.dna")

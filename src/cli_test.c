@@ -10,7 +10,7 @@
 
 typedef struct {
     size_t line;
-    int32_t arguments[2];
+    int32_t arguments[4];
     int32_t expected;
     char input[CSV_LINE_SIZE];
     char expected_output[CSV_LINE_SIZE];
@@ -103,10 +103,15 @@ static int split_row(char *line, char **fields, unsigned wanted, unsigned *found
     return 1;
 }
 
-static const char *scalar_headers[] = {"expected", "arg1,expected", "arg1,arg2,expected"};
+static const char *arg_names[] = {"arg1", "arg2", "arg3", "arg4"};
+static const char *scalar_headers[] = {
+    "expected", "arg1,expected", "arg1,arg2,expected",
+    "arg1,arg2,arg3,expected", "arg1,arg2,arg3,arg4,expected"
+};
 static const char *file_headers[] = {
     "input,expected,expected_output", "arg1,input,expected,expected_output",
-    "arg1,arg2,input,expected,expected_output"
+    "arg1,arg2,input,expected,expected_output", "arg1,arg2,arg3,input,expected,expected_output",
+    "arg1,arg2,arg3,arg4,input,expected,expected_output"
 };
 
 static int bad_header(unsigned arity, CsvError *e) {
@@ -122,7 +127,7 @@ static int load_cases(FILE *file, unsigned arity, TestCase *cases, size_t *count
     int status, have_header = 0;
     unsigned columns = arity + 1;
     for (;;) {
-        char *fields[5], *row;
+        char *fields[8], *row;
         unsigned i, found = 0;
         ++e->line;
         status = read_line(file, line, &bytes, e);
@@ -144,7 +149,7 @@ static int load_cases(FILE *file, unsigned arity, TestCase *cases, size_t *count
                 return bad_header(arity, e);
             }
             for (i = 0; i < columns; ++i) {
-                const char *name = i < arity ? (i == 0 ? "arg1" : "arg2") :
+                const char *name = i < arity ? arg_names[i] :
                     *file_mode ? (i == arity ? "input" : i == arity + 1 ? "expected" : "expected_output") : "expected";
                 if (!strcmp(fields[i], name)) continue;
                 csv_error(e, "header", i + 1, "");
@@ -169,7 +174,7 @@ static int load_cases(FILE *file, unsigned arity, TestCase *cases, size_t *count
                 if (cli_parse_i32(fields[i], value)) continue;
                 csv_error(e, "integer", i + 1, "");
                 bio_error(&e->detail, "%s must be a decimal i32 (-2147483648..2147483647); empty cells are not allowed",
-                          i < arity ? (i == 0 ? "arg1" : "arg2") : "expected");
+                          i < arity ? arg_names[i] : "expected");
                 return 0;
             }
         }

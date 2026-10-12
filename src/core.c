@@ -216,14 +216,14 @@ static uint32_t interpreter_fault(BioExecution *execution, const CodonNode *n, B
     return 0;
 }
 
-static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, uint32_t b,
+static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_t *args,
                                BioExecution *execution, uint32_t *memory,
                                uint32_t *array, uint32_t array_count) {
     uint32_t r[8] = {0};
     const BioGene *g = &p->genes[gene];
     unsigned i;
     const CodonNode *n;
-    r[0] = a; r[1] = b;
+    for (i = 0; i < g->arity; ++i) r[i] = args[i];
     for (i = 0; i < g->local_cells; ++i) {
         if (!execution->remaining) return interpreter_fault(execution, g->head, BIO_FAULT_BUDGET);
         --execution->remaining;
@@ -324,21 +324,22 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, u
             if (signed_value(r[n->arg1]) < signed_value(r[n->arg2])) r[n->arg1] = r[n->arg2];
             break;
         case OP_CALL: {
-            unsigned argc = n->arg2 >> 16;
-            uint32_t x = argc > 0 ? r[n->arg2 & 255u] : 0;
-            uint32_t y = argc > 1 ? r[(n->arg2 >> 8) & 255u] : 0;
+            unsigned argc = n->arg2 >> 16, i;
+            uint32_t passed_args[4] = {0, 0, 0, 0};
             uint32_t *passed = NULL;
+            for (i = 0; i < argc; ++i) passed_args[i] = r[(n->arg2 >> (3 * i)) & 7u];
             if (n->call_array) {
                 const BioLocal *local = &g->locals[n->call_array - 1u];
                 uint32_t capacity = local->is_parameter ? array_count : local->count;
-                if (x > capacity) {
-                    execution->bad_index = signed_value(x); execution->bound = capacity;
+                if (passed_args[0] > capacity) {
+                    execution->bad_index = signed_value(passed_args[0]); execution->bound = capacity;
                     return interpreter_fault(execution, n, BIO_FAULT_ARGUMENT_SIZE);
                 }
                 passed = local->is_parameter ? array : memory + local->offset;
             }
-            r[0] = interpret_gene(p, n->arg1, x, y, execution,
-                                  g->local_cells ? memory + g->local_cells : memory, passed, n->call_array ? x : 0);
+            r[0] = interpret_gene(p, n->arg1, passed_args, execution,
+                                  g->local_cells ? memory + g->local_cells : memory,
+                                  passed, n->call_array ? passed_args[0] : 0);
             if (execution->failed_node != UINT32_MAX) return 0;
             break;
         }
@@ -356,7 +357,7 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, uint32_t a, u
 
 static int execute(const BioProgram *p, const int32_t *args, size_t argc,
                    BioIO *io, int32_t *result, BioError *e, int native) {
-    typedef int32_t (*Entry)(int32_t, int32_t, BioExecution *, uint32_t *);
+    typedef int32_t (*Entry)(int32_t, int32_t, int32_t, int32_t, BioExecution *, uint32_t *);
     int32_t value;
     uint32_t *memory = NULL;
     BioExecution execution = {0};
@@ -387,9 +388,14 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
         unsigned char *address = p->code + p->genes[p->main_gene].code_offset;
         _Static_assert(sizeof(fn) == sizeof(address), "Windows x64 function pointer size");
         memcpy(&fn, &address, sizeof(fn));
-        value = fn(argc > 0 ? args[0] : 0, argc > 1 ? args[1] : 0, &execution, memory);
-    } else value = signed_value(interpret_gene(p, p->main_gene, argc > 0 ? (uint32_t)args[0] : 0,
-                                              argc > 1 ? (uint32_t)args[1] : 0, &execution, memory, NULL, 0));
+        value = fn(argc > 0 ? args[0] : 0, argc > 1 ? args[1] : 0,
+                   argc > 2 ? args[2] : 0, argc > 3 ? args[3] : 0, &execution, memory);
+    } else {
+        uint32_t entry_args[4] = {0, 0, 0, 0};
+        size_t i;
+        for (i = 0; i < argc; ++i) entry_args[i] = (uint32_t)args[i];
+        value = signed_value(interpret_gene(p, p->main_gene, entry_args, &execution, memory, NULL, 0));
+    }
     ok = execution_ok(p, &execution, e);
     if (ok) {
         if (io) {
@@ -439,14 +445,12 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
             if (n->op_code == OP_QUARANTINE)
                 fputs("QUARANTINE _ _", out);
             else if (n->op_code == OP_CALL) {
-                unsigned argc = n->arg2 >> 16;
+                unsigned argc = n->arg2 >> 16, k;
                 fprintf(out, "CALL %s ", p->genes[n->arg1].name);
                 if (n->call_array) fprintf(out, "%s,", p->symbols[g->locals[n->call_array - 1u].symbol]);
                 if (!argc) fputc('_', out);
-                else {
-                    fprintf(out, "r%u", n->arg2 & 255u);
-                    if (argc == 2) fprintf(out, ",r%u", (n->arg2 >> 8) & 255u);
-                }
+                else for (k = 0; k < argc; ++k)
+                    fprintf(out, "%sr%u", k ? "," : "", (n->arg2 >> (3 * k)) & 7u);
             } else if (n->op_code == OP_PARAM)
                 fprintf(out, "PARAM %s r0", p->symbols[n->arg1]);
             else if (n->op_code == OP_VAR || n->op_code == OP_ARRAY)

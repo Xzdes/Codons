@@ -128,7 +128,7 @@ static void language_tests(void) {
     expect_error("GENE main i32\nLOAD r0 1\nRET r0 _\nEND _ _\nGENE main i32\n", "duplicate gene");
     expect_error("GENE main i32\nGENE f i32\n", "nested GENE");
     expect_error("GENE main i32\nLOAD r0 1\nRET r0 0\n", "unused '_'");
-    expect_error("GENE main i32\nCALL f r0,r1,r2\n", "CALL operands");
+    expect_error("GENE main i32\nCALL f r0,r1,r2,r3,r4\n", "at most four register arguments");
     expect_error("GENE main i32\nMOV r0 r1\nRET r0 _\nEND _ _\n", "uninitialized register");
     expect_error("GENE main i32\nIMPORT f.dna _\n", "outside a GENE");
 }
@@ -840,6 +840,42 @@ static void argument_tests(void) {
     bio_program_release(p);
 }
 
+static void wide_call_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    int32_t args[] = {3, -5, 7, 100}, result;
+    char path[256];
+    FILE *dump;
+    /* Four arguments through a two-level chain; the middle gene forwards all. */
+    write_source("four.dna",
+        "GENE main i32/4\nCALL mix r0,r1,r2,r3\nRET r0 _\nEND _ _\n"
+        "GENE mix i32/4\nCALL add4 r0,r1,r2,r3\nMUL r0 r1\nRET r0 _\nEND _ _\n"
+        "GENE add4 i32/4\nADD r0 r1\nADD r0 r2\nADD r0 r3\nRET r0 _\nEND _ _\n");
+    p = compile_name("four.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, args, 4, &result, &e) && result == (3 - 5 + 7 + 100) * -5);
+    REQUIRE(bio_program_interpret(p, args, 4, &result, &e) && result == (3 - 5 + 7 + 100) * -5);
+    result = 0;
+    REQUIRE(!bio_program_run(p, args, 3, &result, &e));
+    REQUIRE(strstr(e.message, "expects 4 arguments") != NULL);
+    /* The dump keeps all four argument registers and reparses identically. */
+    path_for(path, sizeof(path), "four-normalized.dna");
+    dump = fopen(path, "wb"); REQUIRE(dump != NULL);
+    bio_program_dump(p, dump); REQUIRE(fclose(dump) == 0);
+    bio_program_release(p);
+    p = bio_load(path, 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_interpret(p, args, 4, &result, &e) && result == (3 - 5 + 7 + 100) * -5);
+    bio_program_release(p);
+    /* Array plus length and three scalars: i32/4 with PARAM. data[3] = -5, then
+       pick receives length 4, index 3 and the two scalars: xs[3] + r2 + r3. */
+    write_source("wide-array.dna",
+        "GENE main i32/2\nARRAY data 4\nASET data r0,r1\nLOAD r2 4\nCALL pick data,r2,r0,r1,r0\nRET r0 _\nEND _ _\n"
+        "GENE pick i32/4\nPARAM xs r0\nLOAD r4 0\nAGET r4 xs,r1\nADD r4 r2\nADD r4 r3\nRET r4 _\nEND _ _\n");
+    p = compile_name("wide-array.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, args, 2, &result, &e) && result == -7);
+    REQUIRE(bio_program_interpret(p, args, 2, &result, &e) && result == -7);
+    bio_program_release(p);
+}
+
 static void flow_tests(void) {
     expect_value("GENE main i32\nLOAD r0 0\nJZ r0 yes\nLOAD r1 8\nJMP done _\nLABEL yes _\nLOAD r1 42\nLABEL done _\nRET r1 _\nEND _ _\n", 42);
     expect_value("GENE main i32\nLOAD r0 -1\nJNZ r0 yes\nLOAD r1 8\nRET r1 _\nLABEL yes _\nLOAD r1 42\nRET r1 _\nEND _ _\n", 42);
@@ -1172,6 +1208,7 @@ int main(void) {
     module_and_repair_tests();
     differential_tests();
     argument_tests();
+    wide_call_tests();
     flow_tests();
     loop_budget_tests();
     loop_runtime_tests();

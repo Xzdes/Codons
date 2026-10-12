@@ -135,9 +135,9 @@ static unsigned reads(const CodonNode *n) {
         return (1u << n->arg1) | (1u << n->arg2);
     case OP_RET: case OP_JZ: case OP_JNZ: case OP_NOT: case OP_LNOT: return 1u << n->arg1;
     case OP_CALL: {
-        unsigned argc = n->arg2 >> 16;
-        unsigned mask = argc ? 1u << (n->arg2 & 255u) : 0;
-        if (argc == 2) mask |= 1u << ((n->arg2 >> 8) & 255u);
+        /* Argument registers are packed three bits each starting at bit 0. */
+        unsigned argc = n->arg2 >> 16, mask = 0, i;
+        for (i = 0; i < argc; ++i) mask |= 1u << ((n->arg2 >> (3 * i)) & 7u);
         return mask;
     }
     default: return 0;

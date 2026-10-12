@@ -22,11 +22,15 @@ static void word32(Emitter *b, uint32_t value) {
     for (i = 0; i < 4; ++i) byte(b, (value >> (8 * i)) & 255u);
 }
 
-/* Each virtual register occupies a 4-byte stack slot above 32-byte shadow space.
+/* Frame layout (BIO_STACK_SIZE bytes above the saved registers):
+     0..31  shadow space
+    32/40   outgoing context / locals base for nested CALLs (Win64 stack args 5-6)
+    48..79  virtual registers r0..r7, 4 bytes each
+    80/88   PARAM array view (pointer and length)
    The execution context lives in RBX and the local data base in RSI for the whole
    gene body: both are callee-saved, so nested CALLs (which re-save them) preserve
    the caller's values. */
-static unsigned slot(unsigned r) { return 32u + r * 4u; }
+static unsigned slot(unsigned r) { return 48u + r * 4u; }
 
 static void load_eax(Emitter *b, unsigned r) {
     byte(b, 0x8b); byte(b, 0x44); byte(b, 0x24); byte(b, slot(r));
@@ -198,21 +202,28 @@ static void emit_gene(Emitter *b, BioGene *g) {
     CodonNode *n;
     g->code_offset = (uint32_t)b->length;
     b->cached = -1;
-    /* push rbx; push rsi; sub rsp,104 — callee-saved context and locals base. */
+    /* push rbx; push rsi; sub rsp,104. Context and locals base arrive as Win64
+       stack arguments 5 and 6: [rsp+160] and [rsp+168] after the prolog. */
     byte(b, 0x53); byte(b, 0x56);
     byte(b, 0x48); byte(b, 0x83); byte(b, 0xec); byte(b, BIO_STACK_SIZE);
-    byte(b, 0x4c); byte(b, 0x89); byte(b, 0xc3); /* mov rbx,r8 (context) */
-    byte(b, 0x4c); byte(b, 0x89); byte(b, 0xce); /* mov rsi,r9 (locals base) */
+    byte(b, 0x48); byte(b, 0x8b); byte(b, 0x9c); byte(b, 0x24); word32(b, 160); /* mov rbx,[rsp+160] */
+    byte(b, 0x48); byte(b, 0x8b); byte(b, 0xb4); byte(b, 0x24); word32(b, 168); /* mov rsi,[rsp+168] */
     if (g->has_array) {
         /* Internal CALL passes the checked view in volatile R10/R11D. */
         byte(b, 0x4c); byte(b, 0x89); byte(b, 0x54); byte(b, 0x24); byte(b, 80);
         byte(b, 0x44); byte(b, 0x89); byte(b, 0x5c); byte(b, 0x24); byte(b, 88);
     }
     if (g->arity > 0) {
-        byte(b, 0x89); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(0));
+        byte(b, 0x89); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(0)); /* mov [rsp+slot0],ecx */
     }
     if (g->arity > 1) {
-        byte(b, 0x89); byte(b, 0x54); byte(b, 0x24); byte(b, slot(1));
+        byte(b, 0x89); byte(b, 0x54); byte(b, 0x24); byte(b, slot(1)); /* mov [rsp+slot1],edx */
+    }
+    if (g->arity > 2) {
+        byte(b, 0x44); byte(b, 0x89); byte(b, 0x44); byte(b, 0x24); byte(b, slot(2)); /* mov [rsp+slot2],r8d */
+    }
+    if (g->arity > 3) {
+        byte(b, 0x44); byte(b, 0x89); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(3)); /* mov [rsp+slot3],r9d */
     }
     initialize_locals(b, g);
     for (n = g->head->next; n; n = n->next) {
@@ -344,10 +355,11 @@ static void emit_gene(Emitter *b, BioGene *g) {
             store_eax(b, n->arg1);
             break;
         case OP_CALL: {
+            /* Argument registers are packed three bits each starting at bit 0. */
             unsigned argc = n->arg2 >> 16;
             if (n->call_array) {
                 const BioLocal *local = &g->locals[n->call_array - 1u];
-                emit_load(b, n->arg2 & 255u);
+                emit_load(b, n->arg2 & 7u);
                 array_length(b, local, 1);
                 byte(b, 0x89); byte(b, 0x43); byte(b, 16);
                 byte(b, 0x89); byte(b, 0x53); byte(b, 20);
@@ -357,17 +369,29 @@ static void emit_gene(Emitter *b, BioGene *g) {
                 array_base(b, local);
                 byte(b, 0x4d); byte(b, 0x89); byte(b, 0xca); /* r10=array */
             }
-            byte(b, 0x49); byte(b, 0x89); byte(b, 0xf1); /* mov r9,rsi */
+            /* Context and the callee's locals base are Win64 stack arguments 5-6,
+               written into the outgoing slots at [rsp+32] and [rsp+40]. */
+            byte(b, 0x48); byte(b, 0x89); byte(b, 0x5c); byte(b, 0x24); byte(b, 32); /* mov [rsp+32],rbx */
+            byte(b, 0x48); byte(b, 0x89); byte(b, 0xf0); /* mov rax,rsi */
             if (g->local_cells) {
-                byte(b, 0x49); byte(b, 0x81); byte(b, 0xc1); word32(b, g->local_cells * 4u); /* add r9,own cells */
+                byte(b, 0x48); byte(b, 0x81); byte(b, 0xc0); word32(b, g->local_cells * 4u); /* add rax,own cells */
             }
-            byte(b, 0x49); byte(b, 0x89); byte(b, 0xd8); /* mov r8,rbx: context for the callee */
+            byte(b, 0x48); byte(b, 0x89); byte(b, 0x44); byte(b, 0x24); byte(b, 40); /* mov [rsp+40],rax */
+            b->cached = -1;
             if (argc > 0) {
-                byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2 & 255u));
-            } else { byte(b, 0x31); byte(b, 0xc9); }
+                byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, slot(n->arg2 & 7u));
+            } else { byte(b, 0x31); byte(b, 0xc9); } /* xor ecx,ecx */
             if (argc > 1) {
-                byte(b, 0x8b); byte(b, 0x54); byte(b, 0x24); byte(b, slot((n->arg2 >> 8) & 255u));
-            } else { byte(b, 0x31); byte(b, 0xd2); }
+                byte(b, 0x8b); byte(b, 0x54); byte(b, 0x24); byte(b, slot((n->arg2 >> 3) & 7u));
+            } else { byte(b, 0x31); byte(b, 0xd2); } /* xor edx,edx */
+            if (argc > 2) {
+                byte(b, 0x44); byte(b, 0x8b); byte(b, 0x44); byte(b, 0x24);
+                byte(b, slot((n->arg2 >> 6) & 7u)); /* mov r8d,[rsp+slot] */
+            } else { byte(b, 0x45); byte(b, 0x31); byte(b, 0xc0); } /* xor r8d,r8d */
+            if (argc > 3) {
+                byte(b, 0x44); byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24);
+                byte(b, slot((n->arg2 >> 9) & 7u)); /* mov r9d,[rsp+slot] */
+            } else { byte(b, 0x45); byte(b, 0x31); byte(b, 0xc9); } /* xor r9d,r9d */
             byte(b, 0xe8);
             n->patch_offset = (uint32_t)b->length;
             word32(b, 0);
