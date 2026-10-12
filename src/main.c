@@ -203,6 +203,14 @@ static void verify_outcome_json(int index, int ok, int32_t result, const BioErro
     else { fputs("{\"ok\":false,\"error\":", stdout); cli_json_string(error->message); putchar('}'); }
 }
 
+/* Inline JSON form of an output list: no temporary file needed by the caller. */
+static void json_i32_list(const int32_t *values, size_t count) {
+    size_t i;
+    putchar('[');
+    for (i = 0; i < count; ++i) { if (i) putchar(','); printf("%" PRId32, values[i]); }
+    putchar(']');
+}
+
 /* Run the JIT and the reference interpreter on identical input and require
    identical observable behavior: result, output list, or the same fault. */
 static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
@@ -219,7 +227,7 @@ static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
     }
     if (o->input_list && !cli_read_list(o->input_list, &input, &input_count, e))
         return failure(o->json, "file", e->message, 1);
-    if (o->output_list) {
+    if (o->output_list || o->json) {
         outputs[0] = malloc(BIO_LIST_LIMIT * sizeof(*outputs[0]));
         outputs[1] = malloc(BIO_LIST_LIMIT * sizeof(*outputs[1]));
         if (!outputs[0] || !outputs[1]) {
@@ -281,6 +289,9 @@ static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
         if (o->output_list) {
             fputs(",\"output\":", stdout); cli_json_string(o->output_list);
             printf(",\"output_count\":%zu", io[0].output_count);
+        }
+        if (io[0].output_written) {
+            fputs(",\"output_list\":", stdout); json_i32_list(outputs[0], io[0].output_count);
         }
         repair_report(p, 1);
         puts("}");
@@ -395,7 +406,7 @@ static int cli(int argc, char **argv) {
             int ok = 1;
             const char *stage = "file";
             if (o.input_list) ok = cli_read_list(o.input_list, &input, &input_count, &e);
-            if (ok && o.output_list) {
+            if (ok && (o.output_list || o.json)) {
                 output = malloc(BIO_LIST_LIMIT * sizeof(*output));
                 if (!output) { bio_error(&e, "out of memory preparing output list"); ok = 0; }
             }
@@ -417,6 +428,9 @@ static int cli(int argc, char **argv) {
                 if (o.output_list) {
                     fputs(",\"output\":", stdout); cli_json_string(o.output_list);
                     printf(",\"output_count\":%zu", io.output_count);
+                }
+                if (io.output_written) {
+                    fputs(",\"output_list\":", stdout); json_i32_list(output, io.output_count);
                 }
                 repair_report(p, 1);
                 puts("}");

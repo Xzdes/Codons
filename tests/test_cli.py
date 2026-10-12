@@ -329,6 +329,18 @@ class CliTests(unittest.TestCase):
         proc = self.call("test", source, csv)
         self.assertIn("Tests: 3 total, 3 passed", proc.stdout)
 
+    def test_json_output_list_without_file(self):
+        source = self.source("GENE main i32/1\nARRAY out 3\nLOAD r1 0\nASET out r1,r0\nLOAD r1 1\nASET out r1,r0\n"
+                             "LOAD r1 2\nASET out r1,r0\nLOAD r1 3\nWRITE out r1\nRET r1 _\nEND _ _\n")
+        for command in ("run", "interpret", "verify"):
+            with self.subTest(command=command):
+                data = json.loads(self.call(command, source, 7, "--json").stdout)
+                self.assertTrue(data["ok"])
+                self.assertEqual(data["output_list"], [7, 7, 7])
+        # Text mode has no list channel: WRITE still requires --output there.
+        proc = self.call("run", source, 7, code=1)
+        self.assertIn("WRITE requires an output list", proc.stderr)
+
     def test_live_gated_reload(self):
         old = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n", "old.dna")
         new = self.source("GENE main i32/2\nMUL r0 r1\nRET r0 _\nEND _ _\n", "new.dna")
