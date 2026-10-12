@@ -57,7 +57,7 @@ static void expect_value(const char *source, int32_t expected) {
     DWORD64 base = 0;
     PRUNTIME_FUNCTION table;
     CONTEXT context = {0};
-    DWORD64 fake_stack[BIO_STACK_SIZE / 8u + 1u] = {0};
+    DWORD64 fake_stack[BIO_STACK_SIZE / 8u + 3u] = {0}; /* frame + saved rsi/rbx + return */
     DWORD64 frame = 0;
     PVOID handler_data = NULL;
     write_source("case.dna", source);
@@ -72,14 +72,16 @@ static void expect_value(const char *source, int32_t expected) {
     REQUIRE(table != NULL);
     REQUIRE(base == (DWORD64)(uintptr_t)p->code);
     REQUIRE(table->BeginAddress == p->genes[p->main_gene].code_offset);
-    /* Exercise Windows' actual unwinder after the JIT's stack allocation. */
-    fake_stack[BIO_STACK_SIZE / 8u] = 0x12345678u;
+    /* Exercise Windows' actual unwinder after the JIT's prolog (6 bytes:
+       push rbx; push rsi; sub rsp,104). The fake stack holds saved rsi and
+       rbx above the frame, then the return address. */
+    fake_stack[BIO_STACK_SIZE / 8u + 2u] = 0x12345678u;
     context.ContextFlags = CONTEXT_FULL;
-    context.Rip = base + table->BeginAddress + 4;
+    context.Rip = base + table->BeginAddress + 6;
     context.Rsp = (DWORD64)(uintptr_t)fake_stack;
     RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, context.Rip, table, &context,
                      &handler_data, &frame, NULL);
-    REQUIRE(context.Rip == fake_stack[BIO_STACK_SIZE / 8u]);
+    REQUIRE(context.Rip == fake_stack[BIO_STACK_SIZE / 8u + 2u]);
     REQUIRE(context.Rsp == (DWORD64)(uintptr_t)fake_stack + sizeof(fake_stack));
     bio_program_release(p);
 }
