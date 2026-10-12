@@ -44,17 +44,18 @@ static void load_context(Emitter *b) {
 }
 
 /* Jump past a normal error return when the x86 condition is satisfied.
-   R8 points to this invocation's context, restored by guard_step. */
+   R8 points to this invocation's context, restored by guard_step.
+   Near (rel32) form: guards stay valid however large the function grows. */
 static void require_condition(Emitter *b, const CodonNode *n, BioFault fault, unsigned condition) {
-    size_t patch, distance;
-    byte(b, condition); patch = b->length; byte(b, 0);
+    size_t patch, distance, j;
+    byte(b, 0x0f); byte(b, (condition & 0x0fu) | 0x80u); patch = b->length; word32(b, 0);
     byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 8); word32(b, n->index);
     byte(b, 0x41); byte(b, 0xc7); byte(b, 0x40); byte(b, 12); word32(b, (uint32_t)fault);
     byte(b, 0x31); byte(b, 0xc0); epilog(b);
     if (b->failed) return;
-    distance = b->length - (patch + 1);
-    if (distance > 127) { b->failed = 1; return; }
-    b->data[patch] = (unsigned char)distance;
+    distance = b->length - (patch + 4);
+    for (j = 0; j < 4; ++j)
+        b->data[patch + j] = (unsigned char)(distance >> (8 * j));
 }
 
 static void guard_step(Emitter *b, const CodonNode *n) {
@@ -71,10 +72,15 @@ static void emit_quarantine(Emitter *b, const CodonNode *n) {
 }
 
 static void propagate_failure(Emitter *b) {
+    size_t patch, distance;
     load_context(b);
     byte(b, 0x41); byte(b, 0x83); byte(b, 0x78); byte(b, 8); byte(b, 0xff); /* cmp dword [r8+8],-1 */
-    byte(b, 0x74); byte(b, 7); /* je past error return */
+    byte(b, 0x74); patch = b->length; byte(b, 0); /* je past error return */
     byte(b, 0x31); byte(b, 0xc0); epilog(b);
+    if (b->failed) return;
+    distance = b->length - (patch + 1);
+    if (distance > 127) { b->failed = 1; return; }
+    b->data[patch] = (unsigned char)distance;
 }
 
 static void initialize_locals(Emitter *b, const BioGene *g) {
@@ -366,8 +372,8 @@ int bio_jit(BioProgram *p, BioError *e) {
     uint32_t unwind_offset;
     DWORD old_protection;
     Emitter b = {0};
-    /* WRITE includes five guards and a bounded copy loop; every opcode fits in 256 bytes. */
-    p->allocation_size = (p->stats.nodes + p->gene_count) * 256u + 16u;
+    /* WRITE includes five near guards and a bounded copy loop; every opcode fits in 288 bytes. */
+    p->allocation_size = (p->stats.nodes + p->gene_count) * 288u + 16u;
     p->code = VirtualAlloc(NULL, p->allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!p->code) { bio_error(e, "VirtualAlloc failed (%lu)", GetLastError()); return 0; }
     b.data = p->code; b.capacity = p->allocation_size;
