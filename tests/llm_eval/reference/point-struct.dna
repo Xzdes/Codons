@@ -1,0 +1,10 @@
+GENE main i32/2
+STRUCT point x,y
+SET point.x r0
+SET point.y r1
+GET r2 point.x
+ADD r2 r2
+GET r3 point.y
+ADD r2 r3
+RET r2 _
+END _ _

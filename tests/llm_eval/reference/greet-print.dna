@@ -1,0 +1,6 @@
+GENE main i32
+SLOAD r1 "hi\n"
+PRINT r1 _
+LOAD r0 0
+RET r0 _
+END _ _

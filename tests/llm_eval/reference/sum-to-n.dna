@@ -1,0 +1,10 @@
+GENE main i32/1
+LOAD r1 0
+JZ r0 done
+LABEL loop _
+ADD r1 r0
+SUB r0 1
+JNZ r0 loop
+LABEL done _
+RET r1 _
+END _ _

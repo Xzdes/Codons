@@ -1,0 +1,6 @@
+GENE main i32/1
+LOAD r1 0
+SUB r1 r0
+MAX r0 r1
+RET r0 _
+END _ _

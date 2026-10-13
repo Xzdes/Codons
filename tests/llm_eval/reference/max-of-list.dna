@@ -1,0 +1,16 @@
+GENE main i32
+ARRAY buf 100
+READ buf r1
+LOAD r2 0
+AGET r3 buf,r2
+LABEL loop _
+ADD r2 1
+MOV r4 r2
+LT r4 r1
+JZ r4 done
+AGET r5 buf,r2
+MAX r3 r5
+JMP loop _
+LABEL done _
+RET r3 _
+END _ _

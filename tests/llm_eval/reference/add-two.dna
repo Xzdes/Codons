@@ -1,0 +1,4 @@
+GENE main i32/2
+ADD r0 r1
+RET r0 _
+END _ _

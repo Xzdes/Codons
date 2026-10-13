@@ -1,0 +1,5 @@
+GENE main i32
+SLOAD r1 "hello world"
+SLEN r0 r1
+RET r0 _
+END _ _
