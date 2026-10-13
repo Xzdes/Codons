@@ -35,7 +35,7 @@ static void usage(void) {
          "  emit <file.dna> <code.bin>     Export raw machine code (not an .exe)\n"
          "\nOptions after the file: --repair, --json\n"
          "  --repair restores safe '_' fields and quarantines ambiguous codons\n"
-         "  --json is available for new, run, test, check, interpret and emit\n"
+         "  --json is available for new, run, test, check, interpret, verify and emit\n"
          "  run/interpret: --input <numbers.txt> --output <result.txt>\n"
          "  Lists: one i32 per nonblank UTF-8 line; output must be a new file\n"
          "  PRINT writes bytes to stdout; --json reports them as \"printed\"\n"
