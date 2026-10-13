@@ -134,7 +134,7 @@ static unsigned reads(const CodonNode *n) {
     case OP_DIV: case OP_MOD: case OP_AND: case OP_OR: case OP_XOR:
     case OP_LAND: case OP_LOR: case OP_LXOR: case OP_SHL: case OP_SHR: case OP_SAR:
         return (1u << n->arg1) | (1u << n->arg2);
-    case OP_RET: case OP_JZ: case OP_JNZ: case OP_NOT: case OP_LNOT: return 1u << n->arg1;
+    case OP_RET: case OP_JZ: case OP_JNZ: case OP_NOT: case OP_LNOT: case OP_PRINT: return 1u << n->arg1;
     case OP_SLEN: return 1u << n->arg2;
     case OP_SGET: case OP_SCAT: case OP_SEQ: return (1u << (n->arg2 & 255u)) | (1u << (n->arg2 >> 8));
     case OP_CALL: {

@@ -283,6 +283,27 @@ static void emit_seq(Emitter *b, const CodonNode *n) {
     patch_forward(b, done);
 }
 
+/* PRINT calls the shared C helper under the Win64 ABI: the body keeps RSP
+   16-aligned and the frame's shadow space (0..31) is reserved for callees.
+   Only volatile registers are used; RBX/RSI survive because the helper is C. */
+static void emit_print(Emitter *b, const CodonNode *n) {
+    uintptr_t address = (uintptr_t)&bio_print_helper;
+    size_t skip;
+    unsigned i;
+    byte(b, 0x48); byte(b, 0x89); byte(b, 0xd9); /* mov rcx,rbx: execution */
+    byte(b, 0x8b); byte(b, 0x54); byte(b, 0x24); byte(b, slot(n->arg1)); /* mov edx,[slot]: handle */
+    byte(b, 0x41); byte(b, 0xb8); word32(b, n->index); /* mov r8d,node */
+    byte(b, 0x48); byte(b, 0xb8); /* mov rax,imm64: helper address */
+    for (i = 0; i < 8; ++i) byte(b, (unsigned)(address >> (8 * i)) & 255u);
+    byte(b, 0xff); byte(b, 0xd0); /* call rax */
+    byte(b, 0x85); byte(b, 0xc0); /* test eax,eax */
+    skip = jump_ahead(b, 0x75); /* jnz: printed */
+    /* The helper already wrote failed_node and the fault kind; just return 0. */
+    byte(b, 0x31); byte(b, 0xc0); epilog(b);
+    patch_forward(b, skip);
+    b->cached = -1; /* The C call clobbers every volatile register. */
+}
+
 static void emit_transfer(Emitter *b, const BioGene *g, const CodonNode *n) {
     const BioLocal *local = &g->locals[n->arg1];
     int reading = n->op_code == OP_READ;
@@ -411,6 +432,7 @@ static void emit_gene(Emitter *b, BioGene *g) {
             break;
         case OP_SCAT: emit_scat(b, n); break;
         case OP_SEQ: emit_seq(b, n); break;
+        case OP_PRINT: emit_print(b, n); break;
         case OP_SET:
             emit_load(b, n->arg2);
             byte(b, 0x89); byte(b, 0x86); word32(b, g->locals[n->arg1].offset * 4u); /* mov [rsi+off],eax */

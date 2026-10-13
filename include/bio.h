@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define BIO_VERSION "0.12.0"
+#define BIO_VERSION "0.13.0"
 #define BIO_EXECUTION_LIMIT 1000000u
 #define BIO_LIST_LIMIT 65536u
 
@@ -53,6 +53,14 @@ typedef struct {
     size_t output_capacity;
     size_t output_count;
     int output_written;
+    /* Host capability for the PRINT codon. NULL forbids printing: a program that
+       reaches PRINT then fails with "PRINT requires a host print capability".
+       The callback receives raw bytes (not NUL-terminated, not necessarily text)
+       and returns nonzero on success; a zero return stops the run with an error.
+       Printing charges one step plus one step per byte against the shared budget,
+       and nothing is delivered when the budget check fails beforehand. */
+    int (*print)(void *user, const unsigned char *bytes, size_t length);
+    void *print_user;
 } BioIO;
 
 /* With repair disabled, source is strict. With repair enabled, unambiguous

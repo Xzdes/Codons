@@ -173,7 +173,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.12.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.13.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -317,6 +317,44 @@ class CliTests(unittest.TestCase):
                 verify = self.call("verify", source, code=1)
                 self.assertIn("verified: JIT and interpreter agree on the failure", verify.stderr)
                 self.assertIn(message, verify.stderr)
+
+    def test_print_streams_capture_and_verify(self):
+        source = self.source("GENE main i32\nSLOAD r1 \"hi\"\nPRINT r1 _\nSLOAD r2 \" there\\n\"\nPRINT r2 _\n"
+                             "SLEN r3 r1\nRET r3 _\nEND _ _\n")
+        for command in ("run", "interpret"):
+            proc = self.call(command, source)
+            self.assertEqual(proc.stdout.replace("\r\n", "\n"), "hi there\n2\n")
+        for command in ("run", "interpret", "verify"):
+            data = json.loads(self.call(command, source, "--json").stdout)
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["printed"], "hi there\n")
+            self.assertEqual(data["result"], 2)
+        # verify prints the agreed bytes once in text mode.
+        proc = self.call("verify", source)
+        self.assertEqual(proc.stdout.replace("\r\n", "\n"), "hi there\n2\n")
+        # No PRINT, no output: the JSON field is present and empty.
+        plain = self.source("GENE main i32\nLOAD r0 1\nRET r0 _\nEND _ _\n", "plain.dna")
+        data = json.loads(self.call("run", plain, "--json").stdout)
+        self.assertEqual(data["printed"], "")
+
+    def test_print_faults_and_repair(self):
+        source = self.source("GENE main i32\nLOAD r1 7\nPRINT r1 _\nRET r1 _\nEND _ _\n")
+        messages = []
+        for command in ("run", "interpret"):
+            data = json.loads(self.call(command, source, "--json", code=1).stdout)
+            self.assertEqual(data["error"]["stage"], "run")
+            self.assertIn("invalid string handle 7 (0 handles exist in this invocation)",
+                          data["error"]["message"])
+            self.assertIn(f"{source}:3:", data["error"]["message"])
+            messages.append(data["error"]["message"])
+        self.assertEqual(*messages)
+        # The third field is unambiguous: --repair restores it.
+        broken = self.source("GENE main i32\nSLOAD r1 \"ok\"\nPRINT r1\nLOAD r2 3\nRET r2 _\nEND _ _\n", "broken.dna")
+        data = json.loads(self.call("run", broken, "--repair", "--json").stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["printed"], "ok")
+        self.assertEqual(data["result"], 3)
+        self.assertEqual(data["repair_log"][0]["kind"], "fill")
 
     def test_strings_rejections(self):
         cases = [

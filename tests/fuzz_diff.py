@@ -22,7 +22,7 @@ I32_POOL = (-2147483648, -100, -7, -1, 0, 1, 2, 5, 31, 32, 100, 2147483647)
 BIN_OPS = ("ADD", "SUB", "MUL", "AND", "OR", "XOR", "LAND", "LOR", "LXOR", "EQ", "LT", "MIN", "MAX")
 RISKY_OPS = ("DIV", "MOD", "SHL", "SHR", "SAR")
 UN_OPS = ("NOT", "LNOT")
-FILLABLE_HEADS = ("RET", "END", "NOT", "LNOT", "LABEL", "JMP")
+FILLABLE_HEADS = ("RET", "END", "NOT", "LNOT", "LABEL", "JMP", "PRINT")
 REGS = tuple(f"r{i}" for i in range(8))
 STRING_CHARS = "abz AZ019._-#"
 
@@ -216,6 +216,8 @@ class Gene:
             offer("sget", 1.5, bool(self.init))
             offer("scat", 1.5)
             offer("seq", 1.5)
+            offer("print", 1.5)
+        offer("print_maybe_bad", 0.3, bool(sorted(self.init - set(forbidden))))
         kind = rng.choices(kinds, weights)[0]
         if kind == "load":
             self.load(forbidden=forbidden)
@@ -322,6 +324,11 @@ class Gene:
             self.emit(f"SEQ {dst} {rng.choice(handles)},{rng.choice(handles)}")
             self.init.add(dst)
             self.strings.discard(dst)
+        elif kind == "print":
+            self.emit(f"PRINT {rng.choice(sorted(self.strings - set(forbidden)))} _")
+        elif kind == "print_maybe_bad":
+            # Usually a handle fault at run time; both backends must agree.
+            self.emit(f"PRINT {rng.choice(sorted(self.init - set(forbidden)))} _")
 
     def gen_statements(self, count, forbidden=()):
         for _ in range(count):

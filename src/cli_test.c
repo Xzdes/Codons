@@ -280,6 +280,8 @@ static void run_file_case(const BioProgram *program, const TestCase *test, unsig
     output = malloc(BIO_LIST_LIMIT * sizeof(*output));
     if (!output) { bio_error(&result->error, "out of memory comparing output list"); goto done; }
     io.input = input; io.output = output; io.output_capacity = BIO_LIST_LIMIT;
+    /* The test harness grants printing but discards it: expected output is data. */
+    io.print = cli_print_discard;
     if (!bio_program_run_io(program, test->arguments, arity, &io, &result->actual, &result->error)) goto done;
     if (!io.output_written) {
         bio_error(&result->error, "program did not execute WRITE; an empty result needs WRITE with count 0");

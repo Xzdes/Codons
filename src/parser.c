@@ -214,7 +214,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             (strcmp(fields[0], "RET") == 0 || strcmp(fields[0], "END") == 0 ||
              strcmp(fields[0], "NOT") == 0 || strcmp(fields[0], "LNOT") == 0 ||
              strcmp(fields[0], "LABEL") == 0 || strcmp(fields[0], "JMP") == 0 ||
-             strcmp(fields[0], "IMPORT") == 0)) {
+             strcmp(fields[0], "PRINT") == 0 || strcmp(fields[0], "IMPORT") == 0)) {
             fields[count++] = "_";
             if (!bio_record_repair(p, &location, "fill", "inserted an unused '_' third field", e)) goto fail;
         }
@@ -475,6 +475,9 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         } else if (!strcmp(fields[0], "NOT") || !strcmp(fields[0], "LNOT")) {
             if (strcmp(fields[2], "_")) QUARANTINE("NOT/LNOT requires an unused '_' third field");
             n->op_code = !strcmp(fields[0], "NOT") ? OP_NOT : OP_LNOT;
+        } else if (!strcmp(fields[0], "PRINT")) {
+            if (strcmp(fields[2], "_")) QUARANTINE("PRINT requires an unused '_' third field");
+            n->op_code = OP_PRINT;
         } else {
             b = reg(fields[2]);
             if (b < 0) QUARANTINE("second operand must be a register");

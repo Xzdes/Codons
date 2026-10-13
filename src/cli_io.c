@@ -9,6 +9,47 @@
 
 #define LIST_FILE_LIMIT (1024u * 1024u)
 
+int cli_print_stdout(void *user, const unsigned char *bytes, size_t length) {
+    (void)user;
+    return fwrite(bytes, 1, length, stdout) == length;
+}
+
+int cli_print_discard(void *user, const unsigned char *bytes, size_t length) {
+    (void)user; (void)bytes; (void)length;
+    return 1;
+}
+
+int cli_print_capture(void *user, const unsigned char *bytes, size_t length) {
+    CliPrint *buffer = user;
+    size_t capacity;
+    unsigned char *grown;
+    /* The step budget already bounds the total; this is a memory backstop. */
+    if (length > (size_t)BIO_EXECUTION_LIMIT || buffer->length > (size_t)BIO_EXECUTION_LIMIT - length)
+        return 0;
+    if (buffer->length + length > buffer->capacity) {
+        capacity = buffer->capacity ? buffer->capacity : 4096;
+        while (capacity < buffer->length + length) capacity *= 2;
+        grown = realloc(buffer->data, capacity);
+        if (!grown) return 0;
+        buffer->data = grown; buffer->capacity = capacity;
+    }
+    memcpy(buffer->data + buffer->length, bytes, length);
+    buffer->length += length;
+    return 1;
+}
+
+void cli_json_bytes(const unsigned char *bytes, size_t length) {
+    size_t i;
+    putchar('"');
+    for (i = 0; i < length; ++i) {
+        unsigned c = bytes[i];
+        if (c == '"' || c == '\\') { putchar('\\'); putchar((int)c); }
+        else if (c < 32) printf("\\u%04x", c);
+        else putchar((int)c);
+    }
+    putchar('"');
+}
+
 int cli_read_list(const char *path, int32_t **values, size_t *count, BioError *e) {
     FILE *file = bio_fopen(path, L"rb");
     int32_t *data = NULL;

@@ -36,7 +36,7 @@ typedef enum {
     OP_LAND, OP_LOR, OP_LXOR, OP_LNOT, OP_SHL, OP_SHR, OP_SAR,
     OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN, OP_READ, OP_WRITE, OP_PARAM,
     OP_QUARANTINE,
-    OP_SLOAD, OP_SLEN, OP_SGET, OP_SCAT, OP_SEQ
+    OP_SLOAD, OP_SLEN, OP_SGET, OP_SCAT, OP_SEQ, OP_PRINT
 } BioOp;
 
 typedef struct CodonNode {
@@ -102,7 +102,7 @@ typedef enum {
     BIO_FAULT_INPUT, BIO_FAULT_OUTPUT, BIO_FAULT_READ_SIZE,
     BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE, BIO_FAULT_ARGUMENT_SIZE, BIO_FAULT_QUARANTINE,
     BIO_FAULT_STRING_HANDLE, BIO_FAULT_STRING_BUDGET, BIO_FAULT_STRING_BOUNDS,
-    BIO_FAULT_STRING_TABLE
+    BIO_FAULT_STRING_TABLE, BIO_FAULT_PRINT_CAPABILITY, BIO_FAULT_PRINT_FAILED
 } BioFault;
 
 /* Immutable byte string. Literals point into the program's literal pool;
@@ -139,6 +139,9 @@ typedef struct {
     uint8_t *string_pool;  /* Bump allocator for SCAT results; never freed mid-run. */
     uint32_t pool_used;
     uint32_t pool_capacity;
+    /* Host capability for PRINT: NULL forbids printing in this invocation. */
+    int (*print)(void *user, const unsigned char *bytes, size_t length);
+    void *print_user;
 } BioExecution;
 
 _Static_assert(offsetof(BioExecution, remaining) == 0, "JIT budget offset");
@@ -157,6 +160,8 @@ _Static_assert(offsetof(BioExecution, string_count) == 72, "JIT string count off
 _Static_assert(offsetof(BioExecution, string_pool) == 80, "JIT string pool offset");
 _Static_assert(offsetof(BioExecution, pool_used) == 88, "JIT pool used offset");
 _Static_assert(offsetof(BioExecution, pool_capacity) == 92, "JIT pool capacity offset");
+_Static_assert(offsetof(BioExecution, print) == 96, "JIT print capability offset");
+_Static_assert(offsetof(BioExecution, print_user) == 104, "JIT print user offset");
 
 struct BioProgram {
     volatile LONG references;
@@ -185,6 +190,9 @@ struct BioProgram {
 };
 
 void bio_error(BioError *error, const char *format, ...);
+/* PRINT semantics shared by both backends: capability, handle, budget, callback.
+   On failure the fault fields are written and 0 is returned. */
+int bio_print_helper(BioExecution *execution, uint32_t handle, uint32_t node);
 void bio_node_error(const BioProgram *p, const CodonNode *n, BioError *e, const char *format, ...);
 int bio_record_repair(BioProgram *p, const CodonNode *n, const char *kind, const char *detail, BioError *e);
 int bio_quarantine(BioProgram *p, CodonNode *n, const char *detail, BioError *e);

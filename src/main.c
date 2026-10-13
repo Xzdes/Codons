@@ -38,6 +38,7 @@ static void usage(void) {
          "  --json is available for new, run, test, check, interpret and emit\n"
          "  run/interpret: --input <numbers.txt> --output <result.txt>\n"
          "  Lists: one i32 per nonblank UTF-8 line; output must be a new file\n"
+         "  PRINT writes bytes to stdout; --json reports them as \"printed\"\n"
          "CSV header: expected | arg1,expected | arg1,arg2,expected\n"
          "CSV with lists: add input before expected and expected_output after it\n"
          "List paths are relative to CSV; test compares in memory without writing files\n"
@@ -221,6 +222,7 @@ static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
     int32_t results[2] = {0, 0};
     size_t input_count = 0, i;
     int ok[2], agree, code = 1;
+    CliPrint printed[2] = {{0}, {0}};
     if (o->argument_count != s.arity) {
         bio_error(e, "main expects %u arguments, got %zu", s.arity, o->argument_count);
         return failure(o->json, "arguments", e->message, 2);
@@ -240,6 +242,7 @@ static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
         io[i].input = input; io[i].input_count = input_count;
         io[i].output = outputs[i];
         io[i].output_capacity = outputs[i] ? BIO_LIST_LIMIT : 0;
+        io[i].print = cli_print_capture; io[i].print_user = &printed[i];
     }
     ok[0] = bio_program_run_io(p, o->arguments, o->argument_count, &io[0], &results[0], &errors[0]);
     ok[1] = bio_program_interpret_io(p, o->arguments, o->argument_count, &io[1], &results[1], &errors[1]);
@@ -247,7 +250,9 @@ static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
     if (agree && ok[0]) {
         agree = results[0] == results[1] &&
             io[0].output_written == io[1].output_written &&
-            io[0].output_count == io[1].output_count;
+            io[0].output_count == io[1].output_count &&
+            printed[0].length == printed[1].length &&
+            (!printed[0].length || !memcmp(printed[0].data, printed[1].data, printed[0].length));
         for (i = 0; agree && i < io[0].output_count; ++i)
             agree = outputs[0][i] == outputs[1][i];
     }
@@ -293,15 +298,18 @@ static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
         if (io[0].output_written) {
             fputs(",\"output_list\":", stdout); json_i32_list(outputs[0], io[0].output_count);
         }
+        fputs(",\"printed\":", stdout); cli_json_bytes(printed[0].data, printed[0].length);
         repair_report(p, 1);
         puts("}");
     } else {
+        if (printed[0].length) fwrite(printed[0].data, 1, printed[0].length, stdout);
         printf("%" PRId32 "\n", results[0]);
         fputs("verified: JIT and interpreter agree\n", stderr);
     }
     code = 0;
 done:
     free(input); free(outputs[0]); free(outputs[1]);
+    free(printed[0].data); free(printed[1].data);
     return code;
 }
 
@@ -332,8 +340,12 @@ static int live(BioProgram *p, int repair, BioError *e) {
                 ++argc; part = strtok(NULL, " \t");
             }
             if (!valid) fputs("run accepts at most four decimal i32 inputs\n", stderr);
-            else if (bio_runtime_run(runtime, args, argc, &result, e)) printf("result=%" PRId32 "\n", result);
-            else fprintf(stderr, "%s\n", e->message);
+            else {
+                BioIO io = {0};
+                io.print = cli_print_stdout;
+                if (bio_runtime_run_io(runtime, args, argc, &io, &result, e)) printf("result=%" PRId32 "\n", result);
+                else fprintf(stderr, "%s\n", e->message);
+            }
         } else if (!strncmp(line, "reload ", 7) && line[7]) {
             char *path = strtok(line + 7, " \t");
             char *flag = strtok(NULL, " \t");
@@ -401,6 +413,7 @@ static int cli(int argc, char **argv) {
             code = failure(o.json, "arguments", e.message, 2);
         } else {
             BioIO io = {0};
+            CliPrint printed = {0};
             int32_t *input = NULL, *output = NULL;
             size_t input_count = 0;
             int ok = 1;
@@ -412,6 +425,8 @@ static int cli(int argc, char **argv) {
             }
             io.input = input; io.input_count = input_count;
             io.output = output; io.output_capacity = output ? BIO_LIST_LIMIT : 0;
+            io.print = o.json ? cli_print_capture : cli_print_stdout;
+            io.print_user = &printed;
             if (ok) {
                 stage = "run";
                 ok = is_interpret ? bio_program_interpret_io(p, o.arguments, o.argument_count, &io, &result, &e) :
@@ -432,10 +447,11 @@ static int cli(int argc, char **argv) {
                 if (io.output_written) {
                     fputs(",\"output_list\":", stdout); json_i32_list(output, io.output_count);
                 }
+                fputs(",\"printed\":", stdout); cli_json_bytes(printed.data, printed.length);
                 repair_report(p, 1);
                 puts("}");
             } else printf("%" PRId32 "\n", result);
-            free(input); free(output);
+            free(input); free(output); free(printed.data);
         }
     } else if (!strcmp(o.command, "verify")) code = cli_verify(p, &o, &e);
     else if (!strcmp(o.command, "check")) {

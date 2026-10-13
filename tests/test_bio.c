@@ -423,7 +423,7 @@ static DWORD WINAPI io_reader(LPVOID arg) {
     for (i = 0; i < 120; ++i) {
         int32_t input[5] = {(int32_t)worker->id, (int32_t)i, INT32_MIN, 4, 5};
         int32_t output[3] = {99, 99, 99}, result = 99;
-        BioIO io = {input, i % 3 ? 3 : 5, output, 3, 77, 77};
+        BioIO io = {input, i % 3 ? 3 : 5, output, 3, 77, 77, NULL, NULL};
         BioError e = {{0}};
         RunIO run = i % 2 ? bio_program_run_io : bio_program_interpret_io;
         int ok = run(worker->program, NULL, 0, &io, &result, &e);
@@ -450,7 +450,7 @@ static void io_tests(void) {
         REQUIRE(p->stats.dynamic_steps && p->stats.execution_steps == 0);
         for (mode = 0; mode < 2; ++mode) {
             RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
-            BioIO io = {input, 3, output + 1, 4, 99, 99};
+            BioIO io = {input, 3, output + 1, 4, 99, 99, NULL, NULL};
             unsigned i;
             for (i = 0; i < 6; ++i) output[i] = 123;
             REQUIRE(run(p, NULL, 0, &io, &result, &e) && result == 3);
@@ -488,7 +488,7 @@ static void io_tests(void) {
     for (mode = 0; mode < 2; ++mode) {
         RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
         int32_t arg = 0;
-        BioIO io = {input, 3, output, 6, 99, 99};
+        BioIO io = {input, 3, output, 6, 99, 99, NULL, NULL};
         output[0] = 123;
         REQUIRE(run(p, &arg, 1, &io, &result, &e));
         REQUIRE(result == 3 && io.output_count == 1 && output[0] == INT32_MIN);
@@ -508,7 +508,7 @@ static void io_tests(void) {
     p = compile_name("io-budget.dna", 0, &e); REQUIRE(p != NULL);
     for (mode = 0; mode < 2; ++mode) {
         RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
-        BioIO io = {input, 1, NULL, 0, 9, 9};
+        BioIO io = {input, 1, NULL, 0, 9, 9, NULL, NULL};
         int32_t arg = 249999;
         REQUIRE(run(p, &arg, 1, &io, &result, &e) && result == 1);
         REQUIRE(io.output_count == 0 && io.output_written == 0);
@@ -524,7 +524,7 @@ static void io_tests(void) {
         MemoryWorker workers[4] = {0};
         HANDLE threads[4];
         unsigned i;
-        BioIO io = {input, 3, output, 6, 0, 0};
+        BioIO io = {input, 3, output, 6, 0, 0, NULL, NULL};
         REQUIRE(runtime != NULL);
         REQUIRE(bio_runtime_run_io(runtime, NULL, 0, &io, &result, &e) && result == 3);
         REQUIRE(io.output_count == 3 && !memcmp(output, input, 3 * sizeof(*input)));
@@ -538,7 +538,7 @@ static void io_tests(void) {
     }
     for (mode = 0; mode < 2; ++mode) {
         RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
-        BioIO io = {input, 0, output, 0, 77, 77};
+        BioIO io = {input, 0, output, 0, 77, 77, NULL, NULL};
         output[0] = 99;
         REQUIRE(run(p, NULL, 0, &io, &result, &e) && result == 0);
         REQUIRE(io.output_count == 0 && io.output_written == 1 && output[0] == 99);
@@ -642,7 +642,7 @@ static void array_parameter_tests(void) {
     for (mode = 0; mode < 2; ++mode) {
         RunIO run = mode ? bio_program_interpret_io : bio_program_run_io;
         int32_t input[3] = {-5, INT32_MIN, INT32_MAX}, output[3] = {11, 12, 13};
-        BioIO io = {input, 3, output, 3, 9, 9};
+        BioIO io = {input, 3, output, 3, 9, 9, NULL, NULL};
         arg = 2; result = 99;
         REQUIRE(!run(p, &arg, 1, &io, &result, &e) && strstr(e.message, "array capacity is 2"));
         REQUIRE(output[0] == 11 && io.output_count == 9 && io.output_written == 9 && result == 99);
@@ -888,6 +888,135 @@ static void expect_run_failure(const char *source, const char *message) {
     REQUIRE(!bio_program_interpret(p, NULL, 0, &result, &ie));
     REQUIRE(strstr(ie.message, message) != NULL);
     REQUIRE(!strcmp(e.message, ie.message));
+    bio_program_release(p);
+}
+
+/* Captures PRINT bytes; fail=1 makes the callback report an I/O failure. */
+typedef struct {
+    unsigned char data[1024];
+    size_t length;
+    int fail;
+} PrintCapture;
+
+static int capture_print(void *user, const unsigned char *bytes, size_t length) {
+    PrintCapture *capture = user;
+    if (capture->fail) return 0;
+    if (length > sizeof(capture->data) - capture->length) return 0;
+    memcpy(capture->data + capture->length, bytes, length);
+    capture->length += length;
+    return 1;
+}
+
+/* Counts bytes without storing them: the budget parity probe prints a lot. */
+static int count_print(void *user, const unsigned char *bytes, size_t length) {
+    (void)bytes;
+    *(size_t *)user += length;
+    return 1;
+}
+
+/* Both backends must deliver identical bytes and the same result. */
+static void expect_print(const char *source, int32_t expected, const char *bytes) {
+    BioError e = {{0}}, ie = {{0}};
+    BioProgram *p;
+    int32_t result = 0;
+    PrintCapture a = {{0}, 0, 0}, b = {{0}, 0, 0};
+    BioIO io_a = {NULL, 0, NULL, 0, 0, 0, capture_print, &a};
+    BioIO io_b = {NULL, 0, NULL, 0, 0, 0, capture_print, &b};
+    write_source("print.dna", source);
+    p = compile_name("print.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run_io(p, NULL, 0, &io_a, &result, &e)); REQUIRE(result == expected);
+    REQUIRE(bio_program_interpret_io(p, NULL, 0, &io_b, &result, &ie)); REQUIRE(result == expected);
+    REQUIRE(a.length == strlen(bytes) && !memcmp(a.data, bytes, a.length));
+    REQUIRE(b.length == a.length && !memcmp(a.data, b.data, a.length));
+    bio_program_release(p);
+}
+
+static void expect_print_failure(const char *source, const char *message, int grant) {
+    BioError e = {{0}}, ie = {{0}};
+    BioProgram *p;
+    int32_t result = 0;
+    PrintCapture a = {{0}, 0, 0}, b = {{0}, 0, 0};
+    BioIO io_a = {NULL, 0, NULL, 0, 0, 0, grant ? capture_print : NULL, &a};
+    BioIO io_b = {NULL, 0, NULL, 0, 0, 0, grant ? capture_print : NULL, &b};
+    write_source("printfail.dna", source);
+    p = compile_name("printfail.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(!bio_program_run_io(p, NULL, 0, &io_a, &result, &e));
+    REQUIRE(strstr(e.message, message) != NULL);
+    REQUIRE(!bio_program_interpret_io(p, NULL, 0, &io_b, &result, &ie));
+    REQUIRE(!strcmp(e.message, ie.message));
+    bio_program_release(p);
+}
+
+static void print_tests(void) {
+    BioError e = {{0}}, ie = {{0}};
+    BioProgram *p;
+    int32_t result = 0;
+    char path[256];
+    FILE *dump;
+    size_t total_a = 0, total_b = 0;
+    PrintCapture a = {{0}, 0, 0}, b = {{0}, 0, 0};
+    BioIO io_a = {NULL, 0, NULL, 0, 0, 0, capture_print, &a};
+    BioIO io_b = {NULL, 0, NULL, 0, 0, 0, capture_print, &b};
+    /* Basics: concatenated prints, empty string, repetition, printing in a call. */
+    expect_print("GENE main i32\nSLOAD r1 \"hello\"\nPRINT r1 _\nSLOAD r2 \" world\"\nPRINT r2 _\n"
+                 "SLEN r3 r1\nRET r3 _\nEND _ _\n", 5, "hello world");
+    expect_print("GENE main i32\nSLOAD r1 \"\"\nPRINT r1 _\nLOAD r0 7\nRET r0 _\nEND _ _\n", 7, "");
+    expect_print("GENE main i32\nSLOAD r1 \"ab\"\nLOAD r2 3\nLOAD r3 1\nLABEL loop _\n"
+                 "PRINT r1 _\nSUB r2 r3\nJNZ r2 loop\nLOAD r0 0\nRET r0 _\nEND _ _\n", 0, "ababab");
+    expect_print("GENE main i32\nCALL say _\nRET r0 _\nEND _ _\n"
+                 "GENE say i32\nSLOAD r1 \"hi\"\nPRINT r1 _\nLOAD r0 7\nRET r0 _\nEND _ _\n", 7, "hi");
+    /* A printed result of SCAT, with escapes and non-ASCII bytes. */
+    expect_print("GENE main i32\nSLOAD r1 \"a\\n\"\nSLOAD r2 \"\\x80\\xff\"\nSCAT r3 r1,r2\n"
+                 "PRINT r3 _\nSLEN r4 r3\nRET r4 _\nEND _ _\n", 4, "a\n\x80\xff");
+    /* Faults: identical messages in both backends. */
+    expect_print_failure("GENE main i32\nLOAD r1 7\nPRINT r1 _\nRET r1 _\nEND _ _\n",
+                         "invalid string handle 7", 1);
+    expect_print_failure("GENE main i32\nSLOAD r1 \"x\"\nPRINT r1 _\nRET r1 _\nEND _ _\n",
+                         "PRINT requires a host print capability", 0);
+    /* A failing callback stops the run; nothing is retried. */
+    a.fail = 1; b.fail = 1;
+    write_source("printfail.dna", "GENE main i32\nSLOAD r1 \"x\"\nPRINT r1 _\nRET r1 _\nEND _ _\n");
+    p = compile_name("printfail.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(!bio_program_run_io(p, NULL, 0, &io_a, &result, &e));
+    REQUIRE(strstr(e.message, "the host print callback failed") != NULL);
+    REQUIRE(!bio_program_interpret_io(p, NULL, 0, &io_b, &result, &ie));
+    REQUIRE(!strcmp(e.message, ie.message));
+    REQUIRE(a.length == 0 && b.length == 0);
+    bio_program_release(p);
+    /* Byte charging: an unbounded print loop dies on the step budget, after
+       delivering exactly the same byte count through both backends. */
+    write_source("ploop.dna", "GENE main i32\nSLOAD r1 \"ab\"\nLABEL loop _\nPRINT r1 _\nJMP loop _\nEND _ _\n");
+    p = compile_name("ploop.dna", 0, &e); REQUIRE(p != NULL);
+    io_a.print = count_print; io_a.print_user = &total_a;
+    io_b.print = count_print; io_b.print_user = &total_b;
+    REQUIRE(!bio_program_run_io(p, NULL, 0, &io_a, &result, &e));
+    REQUIRE(strstr(e.message, "execution budget exhausted") != NULL);
+    REQUIRE(!bio_program_interpret_io(p, NULL, 0, &io_b, &result, &ie));
+    REQUIRE(!strcmp(e.message, ie.message));
+    REQUIRE(total_a > 0 && total_a == total_b);
+    bio_program_release(p);
+    /* Parse rules and repair of the unused third field. */
+    expect_error("GENE main i32\nPRINT r1 x\nRET r1 _\nEND _ _\n", "PRINT requires an unused '_' third field");
+    expect_error("GENE main i32\nPRINT r8 _\nRET r1 _\nEND _ _\n", "first operand must be r0..r7");
+    write_source("prepair.dna", "GENE main i32\nSLOAD r1 \"ok\"\nPRINT r1\nLOAD r2 1\nRET r2 _\nEND _ _\n");
+    p = compile_name("prepair.dna", 1, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_repair_count(p) == 1);
+    a.fail = 0; a.length = 0;
+    io_a.print = capture_print; io_a.print_user = &a;
+    REQUIRE(bio_program_run_io(p, NULL, 0, &io_a, &result, &e) && result == 1);
+    REQUIRE(a.length == 2 && !memcmp(a.data, "ok", 2));
+    bio_program_release(p);
+    /* Dump prints PRINT rN _ and the round trip keeps printing. */
+    write_source("pdump.dna", "GENE main i32\nSLOAD r1 \"z\"\nPRINT r1 _\nSLEN r2 r1\nRET r2 _\nEND _ _\n");
+    p = compile_name("pdump.dna", 0, &e); REQUIRE(p != NULL);
+    path_for(path, sizeof(path), "pdump-normalized.dna");
+    dump = fopen(path, "wb"); REQUIRE(dump != NULL);
+    bio_program_dump(p, dump); REQUIRE(fclose(dump) == 0);
+    bio_program_release(p);
+    p = compile_name("pdump-normalized.dna", 0, &e); REQUIRE(p != NULL);
+    a.length = 0;
+    REQUIRE(bio_program_run_io(p, NULL, 0, &io_a, &result, &e) && result == 1);
+    REQUIRE(a.length == 1 && a.data[0] == 'z');
     bio_program_release(p);
 }
 
@@ -1293,6 +1422,7 @@ int main(void) {
     argument_tests();
     wide_call_tests();
     string_tests();
+    print_tests();
     flow_tests();
     loop_budget_tests();
     loop_runtime_tests();

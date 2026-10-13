@@ -210,6 +210,10 @@ static int execution_ok(const BioProgram *p, const BioExecution *execution, BioE
         snprintf(detail, sizeof(detail), "string handle table full (%u entries per invocation)",
                  execution->bound);
         message = detail; break;
+    case BIO_FAULT_PRINT_CAPABILITY:
+        message = "PRINT requires a host print capability"; break;
+    case BIO_FAULT_PRINT_FAILED:
+        message = "the host print callback failed"; break;
     case BIO_FAULT_QUARANTINE:
         message = "quarantined repaired codon reached; inspect the repair report"; break;
     default: message = "unknown execution error"; break;
@@ -235,6 +239,32 @@ static uint32_t interpreter_fault(BioExecution *execution, const CodonNode *n, B
     execution->failed_node = n->index;
     execution->fault = (uint32_t)fault;
     return 0;
+}
+
+/* Both backends call this one helper, so charging and faults cannot diverge.
+   The whole byte count is checked against the budget before anything is delivered. */
+int bio_print_helper(BioExecution *execution, uint32_t handle, uint32_t node) {
+    const BioString *s;
+    if (!execution->print) {
+        execution->failed_node = node; execution->fault = BIO_FAULT_PRINT_CAPABILITY;
+        return 0;
+    }
+    if (handle >= execution->string_count) {
+        execution->bad_index = signed_value(handle); execution->bound = execution->string_count;
+        execution->failed_node = node; execution->fault = BIO_FAULT_STRING_HANDLE;
+        return 0;
+    }
+    s = &execution->strings[handle];
+    if (execution->remaining < s->length) {
+        execution->failed_node = node; execution->fault = BIO_FAULT_BUDGET;
+        return 0;
+    }
+    execution->remaining -= s->length;
+    if (s->length && !execution->print(execution->print_user, s->data, s->length)) {
+        execution->failed_node = node; execution->fault = BIO_FAULT_PRINT_FAILED;
+        return 0;
+    }
+    return 1;
 }
 
 static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_t *args,
@@ -439,6 +469,9 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
                 (!sa->length || !memcmp(sa->data, sb->data, sa->length));
             break;
         }
+        case OP_PRINT:
+            if (!bio_print_helper(execution, r[n->arg1], n->index)) return 0;
+            break;
         case OP_RET: return r[n->arg1];
         case OP_QUARANTINE: return interpreter_fault(execution, n, BIO_FAULT_QUARANTINE);
         case OP_JMP: next = n->bond; break;
@@ -475,6 +508,7 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
     if (io) {
         execution.input = io->input; execution.input_count = (uint32_t)io->input_count;
         execution.output_capacity = (uint32_t)io->output_capacity;
+        execution.print = io->print; execution.print_user = io->print_user;
         if (io->output) {
             /* Keep all writes private until the entire invocation succeeds. */
             execution.output = malloc((io->output_capacity ? io->output_capacity : 1u) * sizeof(*execution.output));
@@ -548,7 +582,7 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
         "LABEL", "JMP", "JZ", "JNZ", "DIV", "MOD", "AND", "OR", "XOR", "NOT",
         "LAND", "LOR", "LXOR", "LNOT", "SHL", "SHR", "SAR",
         "VAR", "ARRAY", "GET", "SET", "AGET", "ASET", "LEN", "READ", "WRITE", "PARAM", "QUARANTINE",
-        "SLOAD", "SLEN", "SGET", "SCAT", "SEQ"
+        "SLOAD", "SLEN", "SGET", "SCAT", "SEQ", "PRINT"
     };
     unsigned i;
     for (i = 0; i < p->gene_count; ++i) {
@@ -595,7 +629,8 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
                 fprintf(out, "%s r%u r%u,r%u", names[n->op_code], n->arg1, n->arg2 & 255u, n->arg2 >> 8);
             else if (n->op_code == OP_LOAD)
                 fprintf(out, "LOAD r%u %ld", n->arg1, (long)signed_value(n->arg2));
-            else if (n->op_code == OP_RET || n->op_code == OP_NOT || n->op_code == OP_LNOT)
+            else if (n->op_code == OP_RET || n->op_code == OP_NOT || n->op_code == OP_LNOT ||
+                     n->op_code == OP_PRINT)
                 fprintf(out, "%s r%u _", names[n->op_code], n->arg1);
             else if (n->op_code == OP_LABEL || n->op_code == OP_JMP)
                 fprintf(out, "%s %s _", names[n->op_code], p->symbols[n->arg1]);
