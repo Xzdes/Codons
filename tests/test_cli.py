@@ -173,7 +173,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.14.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.15.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -367,6 +367,50 @@ class CliTests(unittest.TestCase):
             data = json.loads(self.call(command, frames, "1000000", "--json", code=1).stdout)
             self.assertIn("call frame memory exhausted", data["error"]["message"])
             self.assertIn(f"{frames}:5:", data["error"]["message"])
+
+    def test_wide_registers(self):
+        # 2^62 + 2^62 wraps to INT64_MIN; the flag reaches i32 via WEQ.
+        wrap = self.source("GENE main i32\nWLOAD w0 4611686018427387904\nWADD w0 w0\n"
+                           "WLOAD w1 -9223372036854775808\nWEQ r1 w0,w1\nRET r1 _\nEND _ _\n",
+                           "wide.dna")
+        for command in ("run", "interpret"):
+            self.assertEqual(self.call(command, wrap).stdout.strip(), "1")
+        self.assertEqual(self.call("verify", wrap).stdout.strip(), "1")
+        # Wide faults carry file and line and match between the engines.
+        for body, needle in (
+            ("WLOAD w0 1\nWLOAD w1 0\nWDIV w0 w1", "division by zero"),
+            ("WLOAD w0 -9223372036854775808\nWLOAD w1 -1\nWDIV w0 w1",
+             "division overflow: -9223372036854775808 / -1 does not fit i64"),
+            ("WLOAD w0 1\nWLOAD w1 64\nWSHL w0 w1", "wide shift count must be in 0..63"),
+            ("WLOAD w0 1\nWLOAD w0 1099511627776\nNARROW r1 w0",
+             "wide value does not fit in i32 (-2147483648..2147483647)"),
+        ):
+            path = self.source(f"GENE main i32\n{body}\nLOAD r0 0\nRET r0 _\nEND _ _\n", "wfault.dna")
+            messages = []
+            for command in ("run", "interpret"):
+                data = json.loads(self.call(command, path, "--json", code=1).stdout)
+                self.assertIn(needle, data["error"]["message"])
+                self.assertIn(f"{path}:4:", data["error"]["message"])
+                messages.append(data["error"]["message"])
+            self.assertEqual(*messages)
+        # Compile-time checks.
+        uninit = self.source("GENE main i32\nWADD w0 w1\nLOAD r0 0\nRET r0 _\nEND _ _\n", "wuninit.dna")
+        self.assertIn("read of uninitialized wide register w0",
+                      self.call("check", uninit, code=1).stderr)
+        # Dump round trip keeps the extreme literals exact: INT64_MIN + INT64_MAX = -1.
+        edge = self.source("GENE main i32\nWLOAD w0 -9223372036854775808\n"
+                           "WLOAD w1 9223372036854775807\nWADD w0 w1\nNARROW r0 w0\nRET r0 _\nEND _ _\n",
+                           "wedge.dna")
+        dumped = self.root / "wedge-dump.dna"
+        dumped.write_text(self.call("dump", edge).stdout.replace("\r\n", "\n"), encoding="utf-8")
+        self.assertEqual(self.call("verify", str(dumped)).stdout.strip(), "-1")
+        # WNOT with a dropped '_' is repairable.
+        broken = self.source("GENE main i32\nWLOAD w0 0\nWNOT w0\nNARROW r0 w0\nRET r0 _\nEND _ _\n",
+                             "wbroken.dna")
+        data = json.loads(self.call("run", broken, "--repair", "--json").stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["result"], -1)
+        self.assertEqual(data["repair_log"][0]["kind"], "fill")
 
     def test_print_faults_and_repair(self):
         source = self.source("GENE main i32\nLOAD r1 7\nPRINT r1 _\nRET r1 _\nEND _ _\n")

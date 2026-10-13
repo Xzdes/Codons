@@ -21,6 +21,39 @@ static int reg(const char *s) {
     return strlen(s) == 2 && s[0] == 'r' && s[1] >= '0' && s[1] <= '7' ? s[1] - '0' : -1;
 }
 
+/* Wide i64 registers live in a separate class: w0..w3. */
+static int wreg(const char *s) {
+    return strlen(s) == 2 && s[0] == 'w' && s[1] >= '0' && s[1] <= '3' ? s[1] - '0' : -1;
+}
+
+/* i64 literals live once per program; WLOAD nodes carry the literal index. */
+static int add_wide_literal(BioProgram *p, const char *field, uint32_t *index, BioError *e) {
+    char *end;
+    long long value;
+    errno = 0;
+    value = strtoll(field, &end, 10);
+    if (errno || *end || end == field) {
+        bio_error(e, "WLOAD requires a decimal i64 literal"); return 0;
+    }
+    if (p->wide_literal_count == BIO_MAX_LITERALS) {
+        bio_error(e, "apoptosis: wide literal budget exceeded (%u)", BIO_MAX_LITERALS); return 0;
+    }
+    if (!p->wide_literals) {
+        p->wide_literals = malloc(BIO_MAX_LITERALS * sizeof(*p->wide_literals));
+        if (!p->wide_literals) { bio_error(e, "out of memory"); return 0; }
+    }
+    p->wide_literals[p->wide_literal_count] = (int64_t)value;
+    *index = p->wide_literal_count++;
+    return 1;
+}
+
+static const struct { const char *name; BioOp op; } wide_binary[] = {
+    {"WMOV", OP_WMOV}, {"WADD", OP_WADD}, {"WSUB", OP_WSUB}, {"WMUL", OP_WMUL},
+    {"WDIV", OP_WDIV}, {"WMOD", OP_WMOD}, {"WAND", OP_WAND}, {"WOR", OP_WOR},
+    {"WXOR", OP_WXOR}, {"WSHL", OP_WSHL}, {"WSHR", OP_WSHR}, {"WSAR", OP_WSAR},
+    {"WMIN", OP_WMIN}, {"WMAX", OP_WMAX}
+};
+
 static int same_path(const char *a, const char *b) {
     wchar_t left[BIO_PATH_SIZE], right[BIO_PATH_SIZE];
     return bio_wide_path(a, left, BIO_PATH_SIZE) && bio_wide_path(b, right, BIO_PATH_SIZE) &&
@@ -214,7 +247,8 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             (strcmp(fields[0], "RET") == 0 || strcmp(fields[0], "END") == 0 ||
              strcmp(fields[0], "NOT") == 0 || strcmp(fields[0], "LNOT") == 0 ||
              strcmp(fields[0], "LABEL") == 0 || strcmp(fields[0], "JMP") == 0 ||
-             strcmp(fields[0], "PRINT") == 0 || strcmp(fields[0], "IMPORT") == 0)) {
+             strcmp(fields[0], "PRINT") == 0 || strcmp(fields[0], "WNOT") == 0 ||
+             strcmp(fields[0], "IMPORT") == 0)) {
             fields[count++] = "_";
             if (!bio_record_repair(p, &location, "fill", "inserted an unused '_' third field", e)) goto fail;
         }
@@ -457,6 +491,58 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             }
             p->uses_strings = 1;
             continue;
+        }
+        if (!strcmp(fields[0], "WLOAD")) {
+            BioError le = {{0}};
+            uint32_t lit = 0;
+            a = wreg(fields[1]);
+            if (a < 0) QUARANTINE("WLOAD requires a wide register w0..w3 first field");
+            if (!add_wide_literal(p, fields[2], &lit, &le)) QUARANTINE("%.300s", le.message);
+            n->op_code = OP_WLOAD; n->arg1 = (uint32_t)a; n->arg2 = lit;
+            continue;
+        }
+        if (!strcmp(fields[0], "WIDEN") || !strcmp(fields[0], "NARROW")) {
+            int wide = !strcmp(fields[0], "WIDEN");
+            a = wide ? wreg(fields[1]) : reg(fields[1]);
+            b = wide ? reg(fields[2]) : wreg(fields[2]);
+            if (a < 0 || b < 0)
+                QUARANTINE("%s requires '%s'", fields[0], wide ? "wN rM" : "rN wM");
+            n->op_code = wide ? OP_WIDEN : OP_NARROW;
+            n->arg1 = (uint32_t)a; n->arg2 = (uint32_t)b;
+            continue;
+        }
+        if (!strcmp(fields[0], "WEQ") || !strcmp(fields[0], "WLT")) {
+            char *comma = strchr(fields[2], ',');
+            int first, second;
+            a = reg(fields[1]);
+            if (a < 0) QUARANTINE("%s requires an i32 register first field", fields[0]);
+            if (!comma) QUARANTINE("%s requires 'rN wM,wK'", fields[0]);
+            *comma++ = '\0';
+            first = wreg(fields[2]); second = wreg(comma);
+            if (first < 0 || second < 0) QUARANTINE("%s requires 'rN wM,wK'", fields[0]);
+            n->op_code = !strcmp(fields[0], "WEQ") ? OP_WEQ : OP_WLT;
+            n->arg1 = (uint32_t)a;
+            n->arg2 = (uint32_t)first | ((uint32_t)second << 8);
+            continue;
+        }
+        if (!strcmp(fields[0], "WNOT")) {
+            a = wreg(fields[1]);
+            if (a < 0) QUARANTINE("WNOT requires a wide register w0..w3 first field");
+            if (strcmp(fields[2], "_")) QUARANTINE("WNOT requires an unused '_' third field");
+            n->op_code = OP_WNOT; n->arg1 = (uint32_t)a;
+            continue;
+        }
+        {
+            unsigned wide_index;
+            for (wide_index = 0; wide_index < sizeof(wide_binary) / sizeof(wide_binary[0]); ++wide_index) {
+                if (strcmp(fields[0], wide_binary[wide_index].name)) continue;
+                a = wreg(fields[1]); b = wreg(fields[2]);
+                if (a < 0 || b < 0) QUARANTINE("%s requires wide registers 'wN wM'", fields[0]);
+                n->op_code = wide_binary[wide_index].op;
+                n->arg1 = (uint32_t)a; n->arg2 = (uint32_t)b;
+                break;
+            }
+            if (wide_index < sizeof(wide_binary) / sizeof(wide_binary[0])) continue;
         }
         a = reg(fields[1]);
         if (a < 0) QUARANTINE("first operand must be r0..r7");

@@ -72,12 +72,12 @@ static void expect_value(const char *source, int32_t expected) {
     REQUIRE(table != NULL);
     REQUIRE(base == (DWORD64)(uintptr_t)p->code);
     REQUIRE(table->BeginAddress == p->genes[p->main_gene].code_offset);
-    /* Exercise Windows' actual unwinder after the JIT's prolog (6 bytes:
-       push rbx; push rsi; sub rsp,104). The fake stack holds saved rsi and
+    /* Exercise Windows' actual unwinder after the JIT's prolog (9 bytes:
+       push rbx; push rsi; sub rsp,136). The fake stack holds saved rsi and
        rbx above the frame, then the return address. */
     fake_stack[BIO_STACK_SIZE / 8u + 2u] = 0x12345678u;
     context.ContextFlags = CONTEXT_FULL;
-    context.Rip = base + table->BeginAddress + 6;
+    context.Rip = base + table->BeginAddress + 9;
     context.Rsp = (DWORD64)(uintptr_t)fake_stack;
     RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, context.Rip, table, &context,
                      &handler_data, &frame, NULL);
@@ -1109,6 +1109,66 @@ static void recursion_tests(void) {
     bio_program_release(p);
 }
 
+/* Wide i64 registers (0.15): wraparound arithmetic, signed ops and conversions,
+   identical in both backends. */
+static void wide_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    char path[256];
+    FILE *dump;
+    int32_t result = 0;
+    /* 2^62 + 2^62 wraps to INT64_MIN; comparison is on raw bits. */
+    expect_value("GENE main i32\nWLOAD w0 4611686018427387904\nWADD w0 w0\n"
+                 "WLOAD w1 -9223372036854775808\nWEQ r1 w0,w1\nRET r1 _\nEND _ _\n", 1);
+    /* 20! fits i64: a wide loop with a wide accumulator. */
+    expect_value("GENE main i32\nWLOAD w0 1\nWLOAD w1 20\nWLOAD w2 1\nWLOAD w3 0\n"
+                 "LABEL loop _\nWEQ r1 w1,w3\nJNZ r1 done\nWMUL w0 w1\nWSUB w1 w2\nJMP loop _\n"
+                 "LABEL done _\nWLOAD w2 2432902008176640000\nWEQ r2 w0,w2\nRET r2 _\nEND _ _\n", 1);
+    /* Truncating division: -7/2 = -3 and -7%2 = -1, like i32 DIV/MOD. */
+    expect_value("GENE main i32\nWLOAD w0 -7\nWLOAD w1 2\nWMOV w2 w0\nWDIV w0 w1\nWMOD w2 w1\n"
+                 "NARROW r0 w0\nNARROW r1 w2\nADD r0 r1\nRET r0 _\nEND _ _\n", -4);
+    /* WSAR keeps the sign, WSHR is logical. */
+    expect_value("GENE main i32\nWLOAD w0 -16\nWLOAD w1 2\nWSAR w0 w1\nNARROW r0 w0\nRET r0 _\nEND _ _\n", -4);
+    expect_value("GENE main i32\nWLOAD w0 -1\nWLOAD w1 1\nWSHR w0 w1\n"
+                 "WLOAD w2 9223372036854775807\nWEQ r2 w0,w2\nRET r2 _\nEND _ _\n", 1);
+    /* WMIN/WMAX compare signed. */
+    expect_value("GENE main i32\nWLOAD w0 -5\nWLOAD w1 3\nWMOV w2 w0\nWMIN w0 w1\nWMAX w2 w1\n"
+                 "NARROW r0 w0\nNARROW r1 w2\nADD r0 r1\nRET r0 _\nEND _ _\n", -2);
+    /* WIDEN sign-extends; NARROW accepts exactly the i32 range. */
+    expect_value("GENE main i32\nLOAD r1 -3\nWIDEN w0 r1\nWLOAD w1 -3\nWEQ r2 w0,w1\nRET r2 _\nEND _ _\n", 1);
+    expect_value("GENE main i32\nWLOAD w0 2147483647\nNARROW r0 w0\nRET r0 _\nEND _ _\n", 2147483647);
+    expect_value("GENE main i32\nWLOAD w0 -2147483648\nNARROW r0 w0\nRET r0 _\nEND _ _\n", INT32_MIN);
+    /* Faults, byte-identical in both backends. */
+    expect_run_failure("GENE main i32\nWLOAD w0 1\nWLOAD w1 0\nWDIV w0 w1\nLOAD r0 0\nRET r0 _\nEND _ _\n",
+                       "division by zero");
+    expect_run_failure("GENE main i32\nWLOAD w0 -9223372036854775808\nWLOAD w1 -1\nWDIV w0 w1\nLOAD r0 0\nRET r0 _\nEND _ _\n",
+                       "division overflow: -9223372036854775808 / -1 does not fit i64");
+    expect_run_failure("GENE main i32\nWLOAD w0 -9223372036854775808\nWLOAD w1 -1\nWMOD w0 w1\nLOAD r0 0\nRET r0 _\nEND _ _\n",
+                       "does not fit i64");
+    expect_run_failure("GENE main i32\nWLOAD w0 1\nWLOAD w1 64\nWSHL w0 w1\nLOAD r0 0\nRET r0 _\nEND _ _\n",
+                       "wide shift count must be in 0..63");
+    expect_run_failure("GENE main i32\nWLOAD w0 2147483648\nNARROW r0 w0\nRET r0 _\nEND _ _\n",
+                       "wide value does not fit in i32");
+    expect_run_failure("GENE main i32\nWLOAD w0 -2147483649\nNARROW r0 w0\nRET r0 _\nEND _ _\n",
+                       "wide value does not fit in i32");
+    /* Compile-time checks. */
+    expect_error("GENE main i32\nWADD w0 w1\nRET r0 _\nEND _ _\n", "read of uninitialized wide register w0");
+    expect_error("GENE main i32\nWLOAD w0 1\nWADD w0 w9\nRET r0 _\nEND _ _\n", "WADD requires wide registers");
+    expect_error("GENE main i32\nWLOAD w0 9223372036854775808\nRET r0 _\nEND _ _\n", "i64 literal");
+    expect_error("GENE main i32\nWNOT w0 x\nRET r0 _\nEND _ _\n", "WNOT requires an unused '_' third field");
+    /* Dump round trip keeps the extreme literals exact. */
+    write_source("wdump.dna", "GENE main i32\nWLOAD w0 -9223372036854775808\nWLOAD w1 9223372036854775807\n"
+                 "WADD w0 w1\nNARROW r0 w0\nRET r0 _\nEND _ _\n");
+    p = compile_name("wdump.dna", 0, &e); REQUIRE(p != NULL);
+    path_for(path, sizeof(path), "wdump-normalized.dna");
+    dump = fopen(path, "wb"); REQUIRE(dump != NULL);
+    bio_program_dump(p, dump); REQUIRE(fclose(dump) == 0);
+    bio_program_release(p);
+    p = compile_name("wdump-normalized.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, NULL, 0, &result, &e) && result == -1);
+    bio_program_release(p);
+}
+
 static void string_tests(void) {
     BioError e = {{0}};
     BioProgram *p;
@@ -1522,6 +1582,7 @@ int main(void) {
     string_tests();
     print_tests();
     recursion_tests();
+    wide_tests();
     flow_tests();
     loop_budget_tests();
     loop_runtime_tests();

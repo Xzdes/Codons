@@ -22,9 +22,13 @@ I32_POOL = (-2147483648, -100, -7, -1, 0, 1, 2, 5, 31, 32, 100, 2147483647)
 BIN_OPS = ("ADD", "SUB", "MUL", "AND", "OR", "XOR", "LAND", "LOR", "LXOR", "EQ", "LT", "MIN", "MAX")
 RISKY_OPS = ("DIV", "MOD", "SHL", "SHR", "SAR")
 UN_OPS = ("NOT", "LNOT")
-FILLABLE_HEADS = ("RET", "END", "NOT", "LNOT", "LABEL", "JMP", "PRINT")
+FILLABLE_HEADS = ("RET", "END", "NOT", "LNOT", "LABEL", "JMP", "PRINT", "WNOT")
 REGS = tuple(f"r{i}" for i in range(8))
 STRING_CHARS = "abz AZ019._-#"
+WIDE_POOL = (0, 1, -1, 2, 63, 64, 2147483647, 2147483648, -2147483648, -2147483649,
+             4611686018427387904, -9223372036854775808, 9223372036854775807)
+WIDE_BIN_OPS = ("WADD", "WSUB", "WMUL", "WAND", "WOR", "WXOR", "WMIN", "WMAX", "WMOV")
+WIDE_RISKY_OPS = ("WDIV", "WMOD", "WSHL", "WSHR", "WSAR")
 
 
 class Gene:
@@ -47,6 +51,9 @@ class Gene:
         self.branches = 0
         self.loops = 0
         self.init = {f"r{i}" for i in range(arity)}
+        # Wide i64 registers w0-w3: initialized set, same join semantics as init.
+        # No value model is needed: run and interpret must agree either way.
+        self.winit = set()
         # Registers known to hold a live string handle; best-effort tracking so
         # string ops mostly take their success path (faults would agree too).
         self.strings = set()
@@ -113,20 +120,25 @@ class Gene:
         else_label, end_label = self.new_label(), self.new_label()
         self.emit(f"{self.rng.choice(('JZ', 'JNZ'))} {cond} {else_label}")
         saved = set(self.init)
+        saved_wide = set(self.winit)
         saved_strings = set(self.strings)
         self.branches += 1
         self.gen_statements(self.rng.randint(1, 3), forbidden)
         arm_a = set(self.init)
+        wide_a = set(self.winit)
         strings_a = set(self.strings)
         self.emit(f"JMP {end_label} _")
         self.emit(f"LABEL {else_label} _")
         self.init = set(saved)
+        self.winit = set(saved_wide)
         self.strings = set(saved_strings)
         self.gen_statements(self.rng.randint(1, 3), forbidden)
         arm_b = set(self.init)
+        wide_b = set(self.winit)
         strings_b = set(self.strings)
         self.emit(f"LABEL {end_label} _")
         self.init = arm_a & arm_b
+        self.winit = wide_a & wide_b
         self.strings = strings_a & strings_b
 
     def gen_loop(self, forbidden):
@@ -218,6 +230,14 @@ class Gene:
             offer("seq", 1.5)
             offer("print", 1.5)
         offer("print_maybe_bad", 0.3, bool(sorted(self.init - set(forbidden))))
+        # Wide i64 registers: loads always possible, the rest needs live w0-w3.
+        offer("wload", 1.5)
+        offer("wbin", 1.5, bool(self.winit))
+        offer("wrisky", 1, bool(self.winit))
+        offer("wunop", 1, bool(self.winit))
+        offer("wcmp", 1.5, bool(self.winit))
+        offer("widen", 1, bool(sorted(self.init - set(forbidden))))
+        offer("narrow", 1, bool(self.winit))
         kind = rng.choices(kinds, weights)[0]
         if kind == "load":
             self.load(forbidden=forbidden)
@@ -329,6 +349,43 @@ class Gene:
         elif kind == "print_maybe_bad":
             # Usually a handle fault at run time; both backends must agree.
             self.emit(f"PRINT {rng.choice(sorted(self.init - set(forbidden)))} _")
+        elif kind == "wload":
+            dst = f"w{rng.randint(0, 3)}"
+            value = rng.choice(WIDE_POOL) if rng.random() < 0.5 else rng.randint(-(2 ** 63), 2 ** 63 - 1)
+            self.emit(f"WLOAD {dst} {value}")
+            self.winit.add(dst)
+        elif kind == "wbin":
+            target = rng.choice(sorted(self.winit))
+            self.emit(f"{rng.choice(WIDE_BIN_OPS)} {target} {rng.choice(sorted(self.winit))}")
+        elif kind == "wrisky":
+            target = rng.choice(sorted(self.winit))
+            op = rng.choice(WIDE_RISKY_OPS)
+            src = f"w{rng.randint(0, 3)}"
+            if op in ("WDIV", "WMOD"):
+                value = 0 if rng.random() < 0.15 else rng.choice((-1, 1, 2, 3, -9223372036854775808))
+            else:
+                value = rng.choice((0, 1, 31, 63)) if rng.random() < 0.8 else rng.choice((64, -1, 1000000))
+            self.emit(f"WLOAD {src} {value}")
+            self.winit.add(src)
+            self.emit(f"{op} {target} {src}")
+        elif kind == "wunop":
+            self.emit(f"WNOT {rng.choice(sorted(self.winit))} _")
+        elif kind == "wcmp":
+            dst = self.dst_reg(forbidden)
+            pair = sorted(self.winit)
+            self.emit(f"{rng.choice(('WEQ', 'WLT'))} {dst} {rng.choice(pair)},{rng.choice(pair)}")
+            self.init.add(dst)
+            self.strings.discard(dst)
+        elif kind == "widen":
+            dst = f"w{rng.randint(0, 3)}"
+            self.emit(f"WIDEN {dst} {rng.choice(sorted(self.init - set(forbidden)))}")
+            self.winit.add(dst)
+        elif kind == "narrow":
+            dst = self.dst_reg(forbidden)
+            # Out-of-range values fault at run time; both engines must agree.
+            self.emit(f"NARROW {dst} {rng.choice(sorted(self.winit))}")
+            self.init.add(dst)
+            self.strings.discard(dst)
 
     def gen_statements(self, count, forbidden=()):
         for _ in range(count):

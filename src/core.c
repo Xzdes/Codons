@@ -81,6 +81,7 @@ void bio_program_release(BioProgram *p) {
     free(p->unwind_table);
     free(p->literals);
     free(p->literal_pool);
+    free(p->wide_literals);
     while (p->arena) {
         ArenaBlock *next = p->arena->next;
         free(p->arena);
@@ -214,6 +215,11 @@ static int execution_ok(const BioProgram *p, const BioExecution *execution, BioE
         message = "PRINT requires a host print capability"; break;
     case BIO_FAULT_PRINT_FAILED:
         message = "the host print callback failed"; break;
+    case BIO_FAULT_WIDE_OVERFLOW:
+        message = "division overflow: -9223372036854775808 / -1 does not fit i64"; break;
+    case BIO_FAULT_WSHIFT: message = "wide shift count must be in 0..63"; break;
+    case BIO_FAULT_NARROW:
+        message = "wide value does not fit in i32 (-2147483648..2147483647)"; break;
     case BIO_FAULT_DEPTH:
         snprintf(detail, sizeof(detail), "call depth limit reached (%u active genes)", BIO_MAX_DEPTH);
         message = detail; break;
@@ -238,6 +244,12 @@ static int execution_ok(const BioProgram *p, const BioExecution *execution, BioE
 
 static int32_t signed_value(uint32_t bits) {
     int32_t value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static int64_t wide_signed(uint64_t bits) {
+    int64_t value;
     memcpy(&value, &bits, sizeof(value));
     return value;
 }
@@ -278,6 +290,7 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
                                BioExecution *execution, uint32_t *memory,
                                uint32_t *array, uint32_t array_count) {
     uint32_t r[8] = {0};
+    uint64_t w[4] = {0}; /* Wide registers w0-w3: bits; signed reads via wide_signed. */
     const BioGene *g = &p->genes[gene];
     unsigned i;
     const CodonNode *n;
@@ -490,6 +503,55 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
         case OP_PRINT:
             if (!bio_print_helper(execution, r[n->arg1], n->index)) return 0;
             break;
+        case OP_WLOAD: w[n->arg1] = (uint64_t)p->wide_literals[n->arg2]; break;
+        case OP_WMOV: w[n->arg1] = w[n->arg2]; break;
+        case OP_WADD: w[n->arg1] += w[n->arg2]; break;
+        case OP_WSUB: w[n->arg1] -= w[n->arg2]; break;
+        case OP_WMUL: w[n->arg1] *= w[n->arg2]; break;
+        case OP_WDIV: case OP_WMOD: {
+            int64_t a = wide_signed(w[n->arg1]), b = wide_signed(w[n->arg2]);
+            if (!b) return interpreter_fault(execution, n, BIO_FAULT_DIV_ZERO);
+            if (a == INT64_MIN && b == -1)
+                return interpreter_fault(execution, n, BIO_FAULT_WIDE_OVERFLOW);
+            /* The overflow pair is excluded above, so signed division is defined. */
+            w[n->arg1] = (uint64_t)(n->op_code == OP_WDIV ? a / b : a % b);
+            break;
+        }
+        case OP_WAND: w[n->arg1] &= w[n->arg2]; break;
+        case OP_WOR: w[n->arg1] |= w[n->arg2]; break;
+        case OP_WXOR: w[n->arg1] ^= w[n->arg2]; break;
+        case OP_WNOT: w[n->arg1] = ~w[n->arg1]; break;
+        case OP_WSHL: case OP_WSHR: case OP_WSAR: {
+            uint64_t value = w[n->arg1], count = w[n->arg2];
+            if (count > 63) return interpreter_fault(execution, n, BIO_FAULT_WSHIFT);
+            if (n->op_code == OP_WSHL) value <<= count;
+            else {
+                uint64_t sign = value & UINT64_C(0x8000000000000000);
+                value >>= count;
+                /* Avoid implementation-defined signed shifts and a shift by 64. */
+                if (n->op_code == OP_WSAR && sign && count) value |= UINT64_MAX << (64u - count);
+            }
+            w[n->arg1] = value;
+            break;
+        }
+        case OP_WEQ: r[n->arg1] = w[n->arg2 & 255u] == w[n->arg2 >> 8]; break;
+        case OP_WLT:
+            r[n->arg1] = wide_signed(w[n->arg2 & 255u]) < wide_signed(w[n->arg2 >> 8]);
+            break;
+        case OP_WMIN:
+            if (wide_signed(w[n->arg1]) > wide_signed(w[n->arg2])) w[n->arg1] = w[n->arg2];
+            break;
+        case OP_WMAX:
+            if (wide_signed(w[n->arg1]) < wide_signed(w[n->arg2])) w[n->arg1] = w[n->arg2];
+            break;
+        case OP_WIDEN: w[n->arg1] = (uint64_t)(int64_t)signed_value(r[n->arg2]); break;
+        case OP_NARROW: {
+            int64_t value = wide_signed(w[n->arg2]);
+            if (value < INT32_MIN || value > INT32_MAX)
+                return interpreter_fault(execution, n, BIO_FAULT_NARROW);
+            r[n->arg1] = (uint32_t)(int32_t)value;
+            break;
+        }
         case OP_RET: return r[n->arg1];
         case OP_QUARANTINE: return interpreter_fault(execution, n, BIO_FAULT_QUARANTINE);
         case OP_JMP: next = n->bond; break;
@@ -604,7 +666,10 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
         "LABEL", "JMP", "JZ", "JNZ", "DIV", "MOD", "AND", "OR", "XOR", "NOT",
         "LAND", "LOR", "LXOR", "LNOT", "SHL", "SHR", "SAR",
         "VAR", "ARRAY", "GET", "SET", "AGET", "ASET", "LEN", "READ", "WRITE", "PARAM", "QUARANTINE",
-        "SLOAD", "SLEN", "SGET", "SCAT", "SEQ", "PRINT"
+        "SLOAD", "SLEN", "SGET", "SCAT", "SEQ", "PRINT",
+        "WLOAD", "WMOV", "WADD", "WSUB", "WMUL", "WDIV", "WMOD",
+        "WAND", "WOR", "WXOR", "WNOT", "WSHL", "WSHR", "WSAR",
+        "WEQ", "WLT", "WMIN", "WMAX", "WIDEN", "NARROW"
     };
     unsigned i;
     for (i = 0; i < p->gene_count; ++i) {
@@ -649,6 +714,19 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
             }
             else if (n->op_code == OP_SGET || n->op_code == OP_SCAT || n->op_code == OP_SEQ)
                 fprintf(out, "%s r%u r%u,r%u", names[n->op_code], n->arg1, n->arg2 & 255u, n->arg2 >> 8);
+            else if (n->op_code == OP_WLOAD)
+                fprintf(out, "WLOAD w%u %lld", n->arg1, (long long)p->wide_literals[n->arg2]);
+            else if (n->op_code == OP_WMOV || (n->op_code >= OP_WADD && n->op_code <= OP_WSAR) ||
+                     n->op_code == OP_WMIN || n->op_code == OP_WMAX)
+                fprintf(out, "%s w%u w%u", names[n->op_code], n->arg1, n->arg2);
+            else if (n->op_code == OP_WNOT)
+                fprintf(out, "WNOT w%u _", n->arg1);
+            else if (n->op_code == OP_WEQ || n->op_code == OP_WLT)
+                fprintf(out, "%s r%u w%u,w%u", names[n->op_code], n->arg1, n->arg2 & 255u, n->arg2 >> 8);
+            else if (n->op_code == OP_WIDEN)
+                fprintf(out, "WIDEN w%u r%u", n->arg1, n->arg2);
+            else if (n->op_code == OP_NARROW)
+                fprintf(out, "NARROW r%u w%u", n->arg1, n->arg2);
             else if (n->op_code == OP_LOAD)
                 fprintf(out, "LOAD r%u %ld", n->arg1, (long)signed_value(n->arg2));
             else if (n->op_code == OP_RET || n->op_code == OP_NOT || n->op_code == OP_LNOT ||

@@ -24,7 +24,9 @@
 #define BIO_MAX_LOCAL_CELLS 65536u
 #define BIO_MEMORY_CELLS 262144u /* 1 MiB of i32 storage across an active call chain.
     For recursive programs this is the fixed frame pool, checked at every CALL. */
-#define BIO_STACK_SIZE 104u
+/* Frame: shadow 0-31, outgoing args 32/40, r0-r7 at 48+4r, PARAM view 80/88,
+   wide registers w0-w3 at 96+8w. 136 keeps the body 16-aligned for calls. */
+#define BIO_STACK_SIZE 136u
 #define BIO_MAX_LITERALS 1024u
 #define BIO_LITERAL_BYTES (256u * 1024u)
 #define BIO_MAX_STRINGS 4096u /* Handle table capacity: literals plus dynamic entries. */
@@ -37,13 +39,18 @@ typedef enum {
     OP_LAND, OP_LOR, OP_LXOR, OP_LNOT, OP_SHL, OP_SHR, OP_SAR,
     OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN, OP_READ, OP_WRITE, OP_PARAM,
     OP_QUARANTINE,
-    OP_SLOAD, OP_SLEN, OP_SGET, OP_SCAT, OP_SEQ, OP_PRINT
+    OP_SLOAD, OP_SLEN, OP_SGET, OP_SCAT, OP_SEQ, OP_PRINT,
+    /* Wide (i64) registers w0..w3: a class separate from r0..r7, like strings.
+       WLOAD carries an index into the program's wide literal table. */
+    OP_WLOAD, OP_WMOV, OP_WADD, OP_WSUB, OP_WMUL, OP_WDIV, OP_WMOD,
+    OP_WAND, OP_WOR, OP_WXOR, OP_WNOT, OP_WSHL, OP_WSHR, OP_WSAR,
+    OP_WEQ, OP_WLT, OP_WMIN, OP_WMAX, OP_WIDEN, OP_NARROW
 } BioOp;
 
 typedef struct CodonNode {
     uint8_t op_code;
     uint8_t reachable;
-    uint8_t initialized;
+    uint16_t initialized; /* Bits 0-7: r0-r7; bits 8-11: wide w0-w3. */
     uint8_t queued;
     uint32_t arg1;
     uint32_t arg2;
@@ -104,7 +111,8 @@ typedef enum {
     BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE, BIO_FAULT_ARGUMENT_SIZE, BIO_FAULT_QUARANTINE,
     BIO_FAULT_STRING_HANDLE, BIO_FAULT_STRING_BUDGET, BIO_FAULT_STRING_BOUNDS,
     BIO_FAULT_STRING_TABLE, BIO_FAULT_PRINT_CAPABILITY, BIO_FAULT_PRINT_FAILED,
-    BIO_FAULT_DEPTH, BIO_FAULT_FRAME
+    BIO_FAULT_DEPTH, BIO_FAULT_FRAME,
+    BIO_FAULT_WIDE_OVERFLOW, BIO_FAULT_WSHIFT, BIO_FAULT_NARROW
 } BioFault;
 
 /* Immutable byte string. Literals point into the program's literal pool;
@@ -193,6 +201,8 @@ struct BioProgram {
     uint32_t literal_count;
     uint8_t *literal_pool;
     size_t literal_pool_used;
+    int64_t *wide_literals;  /* Compile-time i64 literals (WLOAD). */
+    uint32_t wide_literal_count;
     unsigned uses_strings;   /* Any string opcode or literal in the program. */
     unsigned has_recursion;  /* A call cycle exists: frame pool is runtime-checked. */
     unsigned char *code;

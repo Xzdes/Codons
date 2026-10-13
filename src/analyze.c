@@ -121,6 +121,11 @@ static unsigned definitions(const CodonNode *n) {
     case OP_CALL: return 1;
     case OP_READ: return 1u << n->arg2;
     case OP_SLOAD: case OP_SLEN: case OP_SGET: case OP_SCAT: case OP_SEQ: return 1u << n->arg1;
+    case OP_WLOAD: case OP_WMOV: case OP_WADD: case OP_WSUB: case OP_WMUL:
+    case OP_WDIV: case OP_WMOD: case OP_WAND: case OP_WOR: case OP_WXOR: case OP_WNOT:
+    case OP_WSHL: case OP_WSHR: case OP_WSAR: case OP_WMIN: case OP_WMAX:
+    case OP_WIDEN: return 1u << (8u + n->arg1);
+    case OP_WEQ: case OP_WLT: case OP_NARROW: return 1u << n->arg1;
     default: return 0;
     }
 }
@@ -137,6 +142,16 @@ static unsigned reads(const CodonNode *n) {
     case OP_RET: case OP_JZ: case OP_JNZ: case OP_NOT: case OP_LNOT: case OP_PRINT: return 1u << n->arg1;
     case OP_SLEN: return 1u << n->arg2;
     case OP_SGET: case OP_SCAT: case OP_SEQ: return (1u << (n->arg2 & 255u)) | (1u << (n->arg2 >> 8));
+    case OP_WMOV: return 1u << (8u + n->arg2);
+    case OP_WIDEN: return 1u << n->arg2;
+    case OP_NARROW: return 1u << (8u + n->arg2);
+    case OP_WADD: case OP_WSUB: case OP_WMUL: case OP_WDIV: case OP_WMOD:
+    case OP_WAND: case OP_WOR: case OP_WXOR: case OP_WSHL: case OP_WSHR: case OP_WSAR:
+    case OP_WMIN: case OP_WMAX:
+        return (1u << (8u + n->arg1)) | (1u << (8u + n->arg2));
+    case OP_WNOT: return 1u << (8u + n->arg1);
+    case OP_WEQ: case OP_WLT:
+        return (1u << (8u + (n->arg2 & 255u))) | (1u << (8u + (n->arg2 >> 8)));
     case OP_CALL: {
         /* Argument registers are packed three bits each starting at bit 0. */
         unsigned argc = n->arg2 >> 16, mask = 0, i;
@@ -155,10 +170,10 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
     if (!entry) { bio_node_error(p, g->head, e, "empty gene"); return 0; }
     for (n = entry; n; n = n->next) {
         n->reachable = 0;
-        n->initialized = 255;
+        n->initialized = 0xFFF; /* All 12 registers "initialized": the meet is intersection. */
         n->queued = 0;
     }
-    entry->initialized = (uint8_t)((1u << g->arity) - 1u);
+    entry->initialized = (uint16_t)((1u << g->arity) - 1u);
     entry->reachable = entry->queued = 1;
     queue[back++ % capacity] = entry; ++pending;
     while (pending) {
@@ -185,7 +200,7 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
             }
             mask = next->initialized & out;
             changed = !next->reachable || mask != next->initialized;
-            next->reachable = 1; next->initialized = (uint8_t)mask;
+            next->reachable = 1; next->initialized = (uint16_t)mask;
             if (changed && !next->queued) {
                 queue[back++ % capacity] = next; ++pending; next->queued = 1;
             }
@@ -195,13 +210,16 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
         unsigned missing, r;
         if (!n->reachable) continue;
         missing = reads(n) & ~n->initialized;
-        for (r = 0; r < 8; ++r) {
+        for (r = 0; r < 12; ++r) {
             if (!(missing & (1u << r))) continue;
             if (p->repair_mode) {
                 if (!bio_quarantine(p, n, "instruction reads an uninitialized register", e)) return 0;
                 return 2;
             }
-            bio_node_error(p, n, e, "read of uninitialized register r%u on a reachable path", r);
+            if (r < 8)
+                bio_node_error(p, n, e, "read of uninitialized register r%u on a reachable path", r);
+            else
+                bio_node_error(p, n, e, "read of uninitialized wide register w%u on a reachable path", r - 8);
             return 0;
         }
         if (n->op_code == OP_JMP || n->op_code == OP_JZ || n->op_code == OP_JNZ ||

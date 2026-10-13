@@ -31,6 +31,16 @@ static void word32(Emitter *b, uint32_t value) {
    gene body: both are callee-saved, so nested CALLs (which re-save them) preserve
    the caller's values. */
 static unsigned slot(unsigned r) { return 48u + r * 4u; }
+/* Wide i64 registers w0-w3 live in 8-byte slots; all accesses use REX.W. */
+static unsigned wslot(unsigned w) { return 96u + w * 8u; }
+static void load_wide(Emitter *b, unsigned w) {
+    byte(b, 0x48); byte(b, 0x8b); byte(b, 0x44); byte(b, 0x24); byte(b, wslot(w)); /* mov rax,[wslot] */
+    b->cached = -1;
+}
+static void store_wide(Emitter *b, unsigned w) {
+    byte(b, 0x48); byte(b, 0x89); byte(b, 0x44); byte(b, 0x24); byte(b, wslot(w)); /* mov [wslot],rax */
+    b->cached = -1;
+}
 
 static void load_eax(Emitter *b, unsigned r) {
     byte(b, 0x8b); byte(b, 0x44); byte(b, 0x24); byte(b, slot(r));
@@ -46,9 +56,9 @@ static void store_eax(Emitter *b, unsigned r) {
     b->cached = (int)r;
 }
 
-/* add rsp,104; pop rsi; pop rbx; ret */
+/* add rsp,BIO_STACK_SIZE; pop rsi; pop rbx; ret */
 static void epilog(Emitter *b) {
-    byte(b, 0x48); byte(b, 0x83); byte(b, 0xc4); byte(b, BIO_STACK_SIZE);
+    byte(b, 0x48); byte(b, 0x81); byte(b, 0xc4); word32(b, BIO_STACK_SIZE);
     byte(b, 0x5e); byte(b, 0x5b); byte(b, 0xc3);
 }
 
@@ -363,9 +373,11 @@ static void emit_gene(Emitter *b, const BioProgram *p, BioGene *g) {
     /* push rbx; push rsi; sub rsp,104. Context and locals base arrive as Win64
        stack arguments 5 and 6: [rsp+160] and [rsp+168] after the prolog. */
     byte(b, 0x53); byte(b, 0x56);
-    byte(b, 0x48); byte(b, 0x83); byte(b, 0xec); byte(b, BIO_STACK_SIZE);
-    byte(b, 0x48); byte(b, 0x8b); byte(b, 0x9c); byte(b, 0x24); word32(b, 160); /* mov rbx,[rsp+160] */
-    byte(b, 0x48); byte(b, 0x8b); byte(b, 0xb4); byte(b, 0x24); word32(b, 168); /* mov rsi,[rsp+168] */
+    byte(b, 0x48); byte(b, 0x81); byte(b, 0xec); word32(b, BIO_STACK_SIZE);
+    /* push rbx; push rsi; sub rsp,136. Context and locals base arrive as Win64
+       stack arguments 5 and 6: [rsp+192] and [rsp+200] after the prolog. */
+    byte(b, 0x48); byte(b, 0x8b); byte(b, 0x9c); byte(b, 0x24); word32(b, 192); /* mov rbx,[rsp+192] */
+    byte(b, 0x48); byte(b, 0x8b); byte(b, 0xb4); byte(b, 0x24); word32(b, 200); /* mov rsi,[rsp+200] */
     if (g->has_array) {
         /* Internal CALL passes the checked view in volatile R10/R11D. */
         byte(b, 0x4c); byte(b, 0x89); byte(b, 0x54); byte(b, 0x24); byte(b, 80);
@@ -433,6 +445,93 @@ static void emit_gene(Emitter *b, const BioProgram *p, BioGene *g) {
         case OP_SCAT: emit_scat(b, n); break;
         case OP_SEQ: emit_seq(b, n); break;
         case OP_PRINT: emit_print(b, n); break;
+        case OP_WLOAD: {
+            uint64_t bits;
+            unsigned k;
+            memcpy(&bits, &p->wide_literals[n->arg2], sizeof(bits));
+            byte(b, 0x48); byte(b, 0xb8); /* mov rax,imm64 */
+            for (k = 0; k < 8; ++k) byte(b, (unsigned)(bits >> (8 * k)) & 255u);
+            store_wide(b, n->arg1);
+            break;
+        }
+        case OP_WMOV: load_wide(b, n->arg2); store_wide(b, n->arg1); break;
+        case OP_WADD: case OP_WSUB: case OP_WAND: case OP_WOR: case OP_WXOR:
+            load_wide(b, n->arg1);
+            byte(b, 0x48);
+            byte(b, n->op_code == OP_WADD ? 0x03 : n->op_code == OP_WSUB ? 0x2b :
+                   n->op_code == OP_WAND ? 0x23 : n->op_code == OP_WOR ? 0x0b : 0x33);
+            byte(b, 0x44); byte(b, 0x24); byte(b, wslot(n->arg2)); /* op rax,[wslot] */
+            store_wide(b, n->arg1);
+            break;
+        case OP_WMUL:
+            load_wide(b, n->arg1);
+            byte(b, 0x48); byte(b, 0x0f); byte(b, 0xaf); byte(b, 0x44); byte(b, 0x24);
+            byte(b, wslot(n->arg2)); /* imul rax,[wslot] */
+            store_wide(b, n->arg1);
+            break;
+        case OP_WDIV: case OP_WMOD: {
+            /* 64-bit IDIV raises on INT64_MIN / -1, so check it explicitly. */
+            size_t skip;
+            unsigned k;
+            load_wide(b, n->arg1);
+            byte(b, 0x48); byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, wslot(n->arg2)); /* rcx=divisor */
+            byte(b, 0x48); byte(b, 0x85); byte(b, 0xc9); /* test rcx,rcx */
+            require_condition(b, n, BIO_FAULT_DIV_ZERO, 0x75); /* jne */
+            byte(b, 0x48); byte(b, 0x83); byte(b, 0xf9); byte(b, 0xff); /* cmp rcx,-1 */
+            skip = jump_ahead(b, 0x75); /* jne: overflow pair impossible */
+            byte(b, 0x48); byte(b, 0xba); /* mov rdx,INT64_MIN */
+            for (k = 0; k < 8; ++k) byte(b, k == 7 ? 0x80 : 0);
+            byte(b, 0x48); byte(b, 0x39); byte(b, 0xd0); /* cmp rax,rdx */
+            require_condition(b, n, BIO_FAULT_WIDE_OVERFLOW, 0x75); /* jne: safe */
+            patch_forward(b, skip);
+            byte(b, 0x48); byte(b, 0x99); /* cqo */
+            byte(b, 0x48); byte(b, 0xf7); byte(b, 0xf9); /* idiv rcx */
+            if (n->op_code == OP_WMOD) { byte(b, 0x48); byte(b, 0x89); byte(b, 0xd0); } /* mov rax,rdx */
+            store_wide(b, n->arg1);
+            break;
+        }
+        case OP_WNOT:
+            load_wide(b, n->arg1);
+            byte(b, 0x48); byte(b, 0xf7); byte(b, 0xd0); /* not rax */
+            store_wide(b, n->arg1);
+            break;
+        case OP_WSHL: case OP_WSHR: case OP_WSAR:
+            byte(b, 0x48); byte(b, 0x8b); byte(b, 0x4c); byte(b, 0x24); byte(b, wslot(n->arg2)); /* rcx=count */
+            byte(b, 0x48); byte(b, 0x83); byte(b, 0xf9); byte(b, 63); /* cmp rcx,63 */
+            require_condition(b, n, BIO_FAULT_WSHIFT, 0x76); /* jbe: unsigned rejects huge too */
+            load_wide(b, n->arg1);
+            byte(b, 0x48); byte(b, 0xd3);
+            byte(b, n->op_code == OP_WSHL ? 0xe0 : n->op_code == OP_WSHR ? 0xe8 : 0xf8);
+            store_wide(b, n->arg1);
+            break;
+        case OP_WEQ: case OP_WLT:
+            load_wide(b, n->arg2 & 255u);
+            byte(b, 0x48); byte(b, 0x3b); byte(b, 0x44); byte(b, 0x24);
+            byte(b, wslot(n->arg2 >> 8)); /* cmp rax,[wslot] */
+            byte(b, 0x0f); byte(b, n->op_code == OP_WEQ ? 0x94 : 0x9c); byte(b, 0xc0); /* sete/setl al */
+            byte(b, 0x0f); byte(b, 0xb6); byte(b, 0xc0); /* movzx eax,al */
+            store_eax(b, n->arg1);
+            break;
+        case OP_WMIN: case OP_WMAX:
+            load_wide(b, n->arg1);
+            byte(b, 0x48); byte(b, 0x3b); byte(b, 0x44); byte(b, 0x24); byte(b, wslot(n->arg2));
+            byte(b, 0x48); byte(b, 0x0f);
+            byte(b, n->op_code == OP_WMIN ? 0x4f : 0x4c); /* cmovg/cmovl rax,[wslot] */
+            byte(b, 0x44); byte(b, 0x24); byte(b, wslot(n->arg2));
+            store_wide(b, n->arg1);
+            break;
+        case OP_WIDEN:
+            byte(b, 0x48); byte(b, 0x63); byte(b, 0x44); byte(b, 0x24);
+            byte(b, slot(n->arg2)); /* movsxd rax,[slot]: sign-extend i32 */
+            store_wide(b, n->arg1);
+            break;
+        case OP_NARROW:
+            load_wide(b, n->arg2);
+            byte(b, 0x48); byte(b, 0x63); byte(b, 0xd0); /* movsxd rdx,eax */
+            byte(b, 0x48); byte(b, 0x39); byte(b, 0xc2); /* cmp rdx,rax */
+            require_condition(b, n, BIO_FAULT_NARROW, 0x74); /* je: sign extension round-trips */
+            store_eax(b, n->arg1);
+            break;
         case OP_SET:
             emit_load(b, n->arg2);
             byte(b, 0x89); byte(b, 0x86); word32(b, g->locals[n->arg1].offset * 4u); /* mov [rsi+off],eax */
@@ -668,13 +767,14 @@ int bio_jit(BioProgram *p, BioError *e) {
     }
     while (b.length % 4) byte(&b, 0);
     unwind_offset = (uint32_t)b.length;
-    /* UNWIND_INFO v1; prolog 6 bytes: push rbx; push rsi; UWOP_ALLOC_SMALL covers the frame.
-       Codes are listed in undo order: grow rsp, then pop rsi, then pop rbx. */
-    byte(&b, 1); byte(&b, 6); byte(&b, 3); byte(&b, 0);
-    byte(&b, 6); byte(&b, ((BIO_STACK_SIZE / 8u - 1u) << 4) | 2u);
+    /* UNWIND_INFO v1; prolog 9 bytes: push rbx; push rsi; sub rsp,136.
+       The frame exceeds the UWOP_ALLOC_SMALL 128-byte ceiling, so the size goes
+       through UWOP_ALLOC_LARGE's payload slot (136/8 = 17). Codes in undo order. */
+    byte(&b, 1); byte(&b, 9); byte(&b, 4); byte(&b, 0);
+    byte(&b, 9); byte(&b, 1); /* UWOP_ALLOC_LARGE: size/8 follows */
+    byte(&b, BIO_STACK_SIZE / 8u); byte(&b, 0);
     byte(&b, 2); byte(&b, 6u << 4); /* UWOP_PUSH_NONVOL rsi */
-    byte(&b, 1); byte(&b, 0); /* UWOP_PUSH_NONVOL rbx */
-    byte(&b, 0); byte(&b, 0); /* alignment pad for the odd code count */
+    byte(&b, 1); byte(&b, 3u << 4); /* UWOP_PUSH_NONVOL rbx */
     if (b.failed) { bio_error(e, "internal error: unwind data exceeds buffer"); return 0; }
     p->unwind_table = calloc(p->stats.live_genes, sizeof(*p->unwind_table));
     if (!p->unwind_table) { bio_error(e, "out of memory allocating unwind table"); return 0; }
