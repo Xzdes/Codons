@@ -71,6 +71,9 @@ BioProgram *bio_compile(const char *path, int repair, BioError *error);
 BioProgram *bio_load(const char *path, int repair, BioError *error);
 void bio_program_release(BioProgram *program);
 BioStats bio_program_stats(const BioProgram *program);
+/* Channel usage of live code: bit 1 = a reachable READ, bit 2 = a reachable
+   WRITE. Lets hosts scaffold matching CSV tests or I/O plumbing. */
+unsigned bio_program_channels(const BioProgram *program);
 size_t bio_program_repair_count(const BioProgram *program);
 int bio_program_repair_at(const BioProgram *program, size_t index, BioRepair *repair);
 /* Return 1 on success; on failure return 0 and leave result unchanged.

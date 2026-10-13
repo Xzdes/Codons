@@ -123,6 +123,20 @@ BioProgram *bio_compile(const char *path, int repair, BioError *e) {
 
 BioStats bio_program_stats(const BioProgram *p) { return p->stats; }
 
+unsigned bio_program_channels(const BioProgram *p) {
+    unsigned channels = 0, i;
+    for (i = 0; i < p->gene_count; ++i) {
+        const CodonNode *n;
+        if (!p->genes[i].live) continue;
+        for (n = p->genes[i].head->next; n; n = n->next) {
+            if (!n->reachable) continue;
+            if (n->op_code == OP_READ) channels |= 1u;
+            else if (n->op_code == OP_WRITE) channels |= 2u;
+        }
+    }
+    return channels;
+}
+
 size_t bio_program_repair_count(const BioProgram *p) { return p ? p->repair_count : 0; }
 
 int bio_program_repair_at(const BioProgram *p, size_t index, BioRepair *repair) {

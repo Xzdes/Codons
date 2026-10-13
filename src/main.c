@@ -16,6 +16,7 @@ typedef struct {
     size_t argument_count;
     int repair;
     int json;
+    int init; /* test --init: scaffold the CSV header instead of comparing */
 } Options;
 
 static void usage(void) {
@@ -27,15 +28,17 @@ static void usage(void) {
          "  new <file.dna>                 Create an example; never overwrite a file\n"
          "  run <file.dna> [number ...]     Compile and run with 0 to 4 i32 inputs\n"
          "  test <file.dna> <cases.csv>     Compare CSV examples, including file lists\n"
+         "  test <file.dna> --init [out.csv]  Print or write the CSV header for main\n"
          "  check <file.dna>               Validate without running or preparing JIT\n"
          "  interpret <file.dna> [number ...]  Run the reference interpreter\n"
          "  verify <file.dna> [number ...]    Run JIT and interpreter; require identical results\n"
          "  dump <file.dna>                Show the normalized program\n"
+         "  fix <file.dna> [out.dna]       Repair and write the normalized program\n"
          "  live <file.dna>                Run and reload in one process\n"
          "  emit <file.dna> <code.bin>     Export raw machine code (not an .exe)\n"
          "\nOptions after the file: --repair, --json\n"
          "  --repair restores safe '_' fields and quarantines ambiguous codons\n"
-         "  --json is available for new, run, test, check, interpret, verify and emit\n"
+         "  --json is available for new, run, test, check, interpret, verify, fix and emit\n"
          "  run/interpret: --input <numbers.txt> --output <result.txt>\n"
          "  Lists: one i32 per nonblank UTF-8 line; output must be a new file\n"
          "  PRINT writes bytes to stdout; --json reports them as \"printed\"\n"
@@ -135,25 +138,28 @@ int cli_parse_i32(const char *s, int32_t *out) {
 }
 
 static int options(int argc, char **argv, Options *o, BioError *e) {
-    int i, is_emit, is_test;
+    int i, is_emit, is_test, is_fix;
     for (i = 1; i < argc; ++i) if (!strcmp(argv[i], "--json")) o->json = 1;
     if (argc < 3) { bio_error(e, "expected a command and file; use --help"); return 0; }
     o->command = argv[1]; o->path = argv[2];
     is_emit = !strcmp(o->command, "emit");
     is_test = !strcmp(o->command, "test");
+    is_fix = !strcmp(o->command, "fix");
     if (strcmp(o->command, "new") && strcmp(o->command, "run") && strcmp(o->command, "check") &&
         strcmp(o->command, "interpret") && strcmp(o->command, "verify") && strcmp(o->command, "dump") &&
-        strcmp(o->command, "live") && !is_emit && !is_test) {
+        strcmp(o->command, "live") && !is_emit && !is_test && !is_fix) {
         bio_error(e, "unknown command '%s'; use --help", o->command); return 0;
     }
-    if (is_emit || is_test) {
-        if (argc < 4 || !strncmp(argv[3], "--", 2)) {
-            bio_error(e, "%s requires %s", o->command, is_test ? "a CSV examples file" : "an output file"); return 0;
-        }
-        o->output = argv[3];
+    for (i = 3; i < argc; ++i) if (!strcmp(argv[i], "--init")) o->init = 1;
+    if (o->init && !is_test) { bio_error(e, "--init is supported only for test"); return 0; }
+    if (is_fix) o->repair = 1; /* fix implies repair */
+    if (is_emit && (argc < 4 || !strncmp(argv[3], "--", 2))) {
+        bio_error(e, "emit requires an output file"); return 0;
     }
-    for (i = (is_emit || is_test) ? 4 : 3; i < argc; ++i) {
+    if (is_emit) o->output = argv[3];
+    for (i = is_emit ? 4 : 3; i < argc; ++i) {
         if (!strcmp(argv[i], "--repair")) o->repair = 1;
+        else if (!strcmp(argv[i], "--init")) o->init = 1; /* validity checked above */
         else if (!strcmp(argv[i], "--json")) o->json = 1;
         else if (!strcmp(argv[i], "--input") || !strcmp(argv[i], "--output")) {
             const char **target = !strcmp(argv[i], "--input") ? &o->input_list : &o->output_list;
@@ -164,7 +170,9 @@ static int options(int argc, char **argv, Options *o, BioError *e) {
                 bio_error(e, "%s requires exactly one file path and cannot be repeated", argv[i]); return 0;
             }
             *target = argv[++i];
-        } else if ((!strcmp(o->command, "run") || !strcmp(o->command, "interpret") ||
+        } else if ((is_test || is_fix) && !o->output && strncmp(argv[i], "--", 2))
+            o->output = argv[i]; /* CSV for test, target file for fix; any position */
+        else if ((!strcmp(o->command, "run") || !strcmp(o->command, "interpret") ||
                     !strcmp(o->command, "verify")) &&
                  o->argument_count < 4 && cli_parse_i32(argv[i], &o->arguments[o->argument_count]))
             ++o->argument_count;
@@ -174,6 +182,9 @@ static int options(int argc, char **argv, Options *o, BioError *e) {
             else bio_error(e, "unexpected argument '%s' for %s; use --help", argv[i], o->command);
             return 0;
         }
+    }
+    if (is_test && !o->output && !o->init) {
+        bio_error(e, "test requires a CSV examples file (or --init to scaffold one)"); return 0;
     }
     if (o->json && (!strcmp(o->command, "live") || !strcmp(o->command, "dump"))) {
         bio_error(e, "--json is not supported for live or dump"); return 0;
@@ -437,6 +448,43 @@ static int live(BioProgram *p, int repair, BioError *e) {
     return 0;
 }
 
+/* Scaffold the CSV header matching main's arity and the program's channels,
+   so agents never hand-guess column counts. */
+static int cli_test_init(const BioProgram *p, const Options *o, BioError *e) {
+    BioStats s = bio_program_stats(p);
+    unsigned channels = bio_program_channels(p), i;
+    char header[160], tmp[16];
+    header[0] = '\0';
+    if (channels & 1u) strcat(header, "input,");
+    for (i = 1; i <= s.arity; ++i) {
+        sprintf(tmp, "arg%u,", i);
+        strcat(header, tmp);
+    }
+    strcat(header, "expected");
+    if (channels & 2u) strcat(header, ",expected_output");
+    if (o->output) {
+        FILE *out = bio_fopen(o->output, L"rb");
+        if (out) {
+            fclose(out);
+            bio_error(e, "refusing to overwrite existing file: %s", o->output);
+            return failure(o->json, "file", e->message, 1);
+        }
+        out = bio_fopen(o->output, L"wb");
+        if (!out) { bio_error(e, "cannot write %s", o->output); return failure(o->json, "file", e->message, 1); }
+        fprintf(out, "%s\n", header);
+        if (fclose(out) != 0) { bio_error(e, "failed writing %s", o->output); return failure(o->json, "file", e->message, 1); }
+    }
+    if (o->json) {
+        fputs("{\"ok\":true,\"header\":", stdout); cli_json_string(header);
+        printf(",\"arity\":%u,\"uses_input\":%s,\"uses_output\":%s", s.arity,
+               channels & 1u ? "true" : "false", channels & 2u ? "true" : "false");
+        if (o->output) { fputs(",\"output\":", stdout); cli_json_string(o->output); }
+        puts("}");
+    } else if (o->output) printf("Wrote %s\n", o->output);
+    else puts(header);
+    return 0;
+}
+
 static int cli(int argc, char **argv) {
     Options o = {0};
     BioError e = {{0}};
@@ -456,7 +504,8 @@ static int cli(int argc, char **argv) {
     }
     is_run = !strcmp(o.command, "run");
     is_interpret = !strcmp(o.command, "interpret");
-    if (is_interpret || !strcmp(o.command, "check") || !strcmp(o.command, "dump"))
+    if (is_interpret || !strcmp(o.command, "check") || !strcmp(o.command, "dump") ||
+        !strcmp(o.command, "fix") || (!strcmp(o.command, "test") && o.init))
         p = bio_load(o.path, o.repair, &e);
     else p = bio_compile(o.path, o.repair, &e);
     if (!p) return failure(o.json, "compile", e.message, 1);
@@ -513,7 +562,59 @@ static int cli(int argc, char **argv) {
     else if (!strcmp(o.command, "check")) {
         if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); repair_report(p, 1); puts("}"); }
         else stats(s, 0);
-    } else if (!strcmp(o.command, "test")) code = cli_test(p, o.output, o.json);
+    } else if (!strcmp(o.command, "test")) code = o.init ? cli_test_init(p, &o, &e) : cli_test(p, o.output, o.json);
+    else if (!strcmp(o.command, "fix")) {
+        /* Repair-load, then write the normalized program to a NEW file. */
+        char derived[1200];
+        const char *out_path = o.output;
+        FILE *out = NULL;
+        if (!out_path) {
+            size_t len = strlen(o.path), base = len;
+            if (len >= 4 && o.path[len - 4] == '.' &&
+                (o.path[len - 3] == 'd' || o.path[len - 3] == 'D')) base = len - 4;
+            if (base + 11 >= sizeof(derived)) {
+                code = failure(o.json, "file", "output path is too long", 1);
+                out_path = NULL;
+            } else {
+                memcpy(derived, o.path, base); strcpy(derived + base, ".fixed.dna");
+                out_path = derived;
+            }
+        }
+        if (out_path && !strcmp(out_path, o.path)) {
+            code = failure(o.json, "file", "fix never writes in place; choose another file", 1);
+            out_path = NULL;
+        }
+        if (out_path) {
+            out = bio_fopen(out_path, L"rb");
+            if (out) {
+                fclose(out); out = NULL;
+                bio_error(&e, "refusing to overwrite existing file: %s", out_path);
+                code = failure(o.json, "file", e.message, 1);
+            }
+        }
+        if (out_path && !code) {
+            out = bio_fopen(out_path, L"wb");
+            if (!out) {
+                bio_error(&e, "cannot write %s", out_path);
+                code = failure(o.json, "file", e.message, 1);
+            } else {
+                bio_program_dump(p, out);
+                if (fclose(out) != 0) {
+                    bio_error(&e, "failed writing %s", out_path);
+                    code = failure(o.json, "file", e.message, 1);
+                }
+            }
+        }
+        if (out_path && !code) {
+            if (o.json) {
+                fputs("{\"ok\":true,\"output\":", stdout); cli_json_string(out_path);
+                fputs(",", stdout); stats(s, 1); repair_report(p, 1); puts("}");
+            } else {
+                repair_report(p, 0);
+                printf("Wrote %s (repairs=%zu quarantines=%zu)\n", out_path, s.repairs, s.quarantines);
+            }
+        }
+    }
     else if (!strcmp(o.command, "dump")) bio_program_dump(p, stdout);
     else if (!strcmp(o.command, "live")) return live(p, o.repair, &e);
     else if (!strcmp(o.command, "emit")) {

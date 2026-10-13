@@ -476,6 +476,38 @@ class CliTests(unittest.TestCase):
         text = self.call("dump", src).stdout
         self.assertIn("ADD r0 10", text)
 
+    def test_test_init_scaffolds_csv(self):
+        # --init derives the CSV header from main's arity and the I/O channels.
+        src = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n")
+        self.assertEqual(self.call("test", src, "--init").stdout.strip(), "arg1,arg2,expected")
+        data = json.loads(self.call("test", src, "--init", "--json").stdout)
+        self.assertEqual((data["header"], data["arity"], data["uses_input"], data["uses_output"]),
+                         ("arg1,arg2,expected", 2, False, False))
+        out = self.root / "cases.csv"
+        self.call("test", src, out, "--init")
+        self.assertEqual(out.read_text(encoding="utf-8").strip(), "arg1,arg2,expected")
+        self.assertIn("refusing to overwrite", self.call("test", src, out, "--init", code=1).stderr)
+        io_src = self.source("GENE main i32\nARRAY a 8\nREAD a r1\nWRITE a r1\nRET r1 _\nEND _ _\n",
+                             "io.dna")
+        data = json.loads(self.call("test", io_src, "--init", "--json").stdout)
+        self.assertEqual(data["header"], "input,expected,expected_output")
+        # The scaffolded header is accepted by test itself.
+        out.write_text("arg1,arg2,expected\n3,4,7\n", encoding="utf-8")
+        self.assertIn("1 passed", self.call("test", src, out).stdout)
+
+    def test_fix_writes_normalized_program(self):
+        # fix implies --repair and writes the normalized program to a new file.
+        src = self.source("GENE main i32\nLOAD r0 1\nRET r0\nEND _ _\n", "broke.dna")
+        fixed = self.root / "broke.fixed.dna"
+        self.assertIn("repairs=1", self.call("fix", src).stdout)
+        self.assertIn("RET r0 _", fixed.read_text(encoding="utf-8"))
+        self.assertEqual(self.call("run", fixed).stdout.strip(), "1")
+        self.assertIn("refusing to overwrite", self.call("fix", src, code=1).stderr)
+        data = json.loads(self.call("fix", src, self.root / "other.dna", "--json").stdout)
+        self.assertEqual(data["stats"]["repairs"], 1)
+        self.assertTrue(data["ok"])
+        self.assertIn("never writes in place", self.call("fix", src, src, code=1).stderr)
+
     def test_error_hints_and_line_text(self):
         # JSON errors carry the offending source line, so an agent sees what it wrote.
         src = self.source("GENE main i32\nLOAD r0 1\nADD r0 r1\nRET r0 _\nEND _ _\n", "hint.dna")
