@@ -38,7 +38,7 @@ static unsigned node_registers(const CodonNode *n) {
     case OP_MIN: case OP_MAX: case OP_DIV: case OP_MOD: case OP_AND: case OP_OR:
     case OP_XOR: case OP_LAND: case OP_LOR: case OP_LXOR:
     case OP_SHL: case OP_SHR: case OP_SAR: case OP_SLEN:
-        hi = n->arg1 > n->arg2 ? n->arg1 : n->arg2; break;
+        hi = n->arg2_literal ? n->arg1 : (n->arg1 > n->arg2 ? n->arg1 : n->arg2); break;
     case OP_LOAD: case OP_NOT: case OP_LNOT: case OP_RET: case OP_JZ: case OP_JNZ:
     case OP_PRINT: case OP_GET: case OP_LEN: case OP_SLOAD:
     case OP_WEQ: case OP_WLT: case OP_NARROW:
@@ -691,9 +691,21 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             if (strcmp(fields[2], "_")) QUARANTINE("PRINT requires an unused '_' third field");
             n->op_code = OP_PRINT;
         } else {
+            /* The second operand of a binary i32 op is a register or an i32
+               literal (ADD r0 5); a literal is never read as a register. */
             b = reg(fields[2]);
-            if (b < 0) QUARANTINE("second operand must be a register");
-            n->arg2 = (uint32_t)b;
+            if (b < 0) {
+                char *end;
+                long long value;
+                errno = 0;
+                value = strtoll(fields[2], &end, 10);
+                if (errno || *end || end == fields[2] || value < INT32_MIN || value > INT32_MAX)
+                    QUARANTINE("second operand must be a register r0..r255 or an i32 literal");
+                n->arg2 = (uint32_t)value;
+                n->arg2_literal = 1;
+            } else {
+                n->arg2 = (uint32_t)b;
+            }
             if (strcmp(fields[0], "MOV") == 0) n->op_code = OP_MOV;
             else if (strcmp(fields[0], "ADD") == 0) n->op_code = OP_ADD;
             else if (strcmp(fields[0], "SUB") == 0) n->op_code = OP_SUB;
@@ -714,6 +726,14 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             else if (strcmp(fields[0], "SHR") == 0) n->op_code = OP_SHR;
             else if (strcmp(fields[0], "SAR") == 0) n->op_code = OP_SAR;
             else QUARANTINE("unknown opcode: %s", fields[0]);
+            if (n->arg2_literal) {
+                int32_t lit = (int32_t)n->arg2;
+                if ((n->op_code == OP_DIV || n->op_code == OP_MOD) && !lit)
+                    QUARANTINE("division by literal zero is certain to fail");
+                if ((n->op_code == OP_SHL || n->op_code == OP_SHR || n->op_code == OP_SAR) &&
+                    (uint32_t)lit > 31u)
+                    QUARANTINE("literal shift count must be in 0..31");
+            }
         }
     }
     if (status < 0) {

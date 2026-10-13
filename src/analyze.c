@@ -144,13 +144,14 @@ static void definitions(const CodonNode *n, uint64_t *set, unsigned wide_base) {
 
 static void reads(const BioProgram *p, const CodonNode *n, uint64_t *set, unsigned wide_base) {
     switch (n->op_code) {
-    case OP_MOV: case OP_SET: case OP_WRITE: set_bit(set, n->arg2); break;
+    case OP_MOV: if (!n->arg2_literal) set_bit(set, n->arg2); break;
+    case OP_SET: case OP_WRITE: set_bit(set, n->arg2); break;
     case OP_AGET: set_bit(set, n->arg2 & 255u); break;
     case OP_ASET: set_bit(set, n->arg2 & 255u); set_bit(set, n->arg2 >> 8); break;
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_EQ: case OP_LT: case OP_MIN: case OP_MAX:
     case OP_DIV: case OP_MOD: case OP_AND: case OP_OR: case OP_XOR:
     case OP_LAND: case OP_LOR: case OP_LXOR: case OP_SHL: case OP_SHR: case OP_SAR:
-        set_bit(set, n->arg1); set_bit(set, n->arg2); break;
+        set_bit(set, n->arg1); if (!n->arg2_literal) set_bit(set, n->arg2); break;
     case OP_RET: case OP_JZ: case OP_JNZ: case OP_NOT: case OP_LNOT: case OP_PRINT:
         set_bit(set, n->arg1); break;
     case OP_SLEN: set_bit(set, n->arg2); break;

@@ -573,21 +573,38 @@ static void emit_gene(Emitter *b, const BioProgram *p, BioGene *g) {
             if (b->cached == (int)n->arg1) b->cached = -1; /* cell rewritten behind EAX */
             break;
         case OP_MOV:
-            emit_load(b, n->arg2); store_eax(b, n->arg1);
+            if (n->arg2_literal) {
+                byte(b, 0xb8); word32(b, n->arg2); /* mov eax,imm32 */
+            } else emit_load(b, n->arg2);
+            store_eax(b, n->arg1);
             break;
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_AND: case OP_OR: case OP_XOR:
             emit_load(b, n->arg1);
-            if (n->op_code == OP_MUL) { byte(b, 0x0f); byte(b, 0xaf); }
-            else byte(b, n->op_code == OP_ADD ? 0x03 : n->op_code == OP_SUB ? 0x2b :
-                         n->op_code == OP_AND ? 0x23 : n->op_code == OP_OR ? 0x0b : 0x33);
-            modrm_rsi(b, 0, slot(b, n->arg2)); /* op eax,[r] */
+            if (n->arg2_literal) {
+                if (n->op_code == OP_MUL) { byte(b, 0x69); byte(b, 0xc0); } /* imul eax,eax,imm32 */
+                else { /* 81 /digit id: op eax,imm32 */
+                    byte(b, 0x81);
+                    byte(b, n->op_code == OP_ADD ? 0xc0 : n->op_code == OP_SUB ? 0xe8 :
+                             n->op_code == OP_AND ? 0xe0 : n->op_code == OP_OR ? 0xc8 : 0xf0);
+                }
+                word32(b, n->arg2);
+            } else {
+                if (n->op_code == OP_MUL) { byte(b, 0x0f); byte(b, 0xaf); }
+                else byte(b, n->op_code == OP_ADD ? 0x03 : n->op_code == OP_SUB ? 0x2b :
+                             n->op_code == OP_AND ? 0x23 : n->op_code == OP_OR ? 0x0b : 0x33);
+                modrm_rsi(b, 0, slot(b, n->arg2)); /* op eax,[r] */
+            }
             store_eax(b, n->arg1);
             break;
         case OP_DIV: case OP_MOD:
             emit_load(b, n->arg1);
-            byte(b, 0x8b); modrm_rsi(b, 1, slot(b, n->arg2)); /* mov ecx,[r] */
-            byte(b, 0x85); byte(b, 0xc9); /* test ecx,ecx */
-            require_condition(b, n, BIO_FAULT_DIV_ZERO, 0x75); /* jne */
+            if (n->arg2_literal) { /* A zero literal is rejected at compile time. */
+                byte(b, 0xb9); word32(b, n->arg2); /* mov ecx,imm32 */
+            } else {
+                byte(b, 0x8b); modrm_rsi(b, 1, slot(b, n->arg2)); /* mov ecx,[r] */
+                byte(b, 0x85); byte(b, 0xc9); /* test ecx,ecx */
+                require_condition(b, n, BIO_FAULT_DIV_ZERO, 0x75); /* jne */
+            }
             /* Widen both i32 inputs before IDIV: even INT32_MIN / -1 fits i64.
                Zero is checked first, so IDIV cannot raise a divide exception. */
             byte(b, 0x48); byte(b, 0x98); /* cdqe */
@@ -616,7 +633,12 @@ static void emit_gene(Emitter *b, const BioProgram *p, BioGene *g) {
             byte(b, 0x85); byte(b, 0xc0); /* test eax,eax */
             byte(b, 0x0f); byte(b, 0x95); byte(b, 0xc0); /* setne al */
             byte(b, 0x0f); byte(b, 0xb6); byte(b, 0xc0); /* movzx eax,al */
-            byte(b, 0x83); modrm_rsi(b, 7, slot(b, n->arg2)); byte(b, 0); /* cmp dword [r],0 */
+            if (n->arg2_literal) {
+                byte(b, 0xb9); word32(b, n->arg2); /* mov ecx,imm32 */
+                byte(b, 0x85); byte(b, 0xc9); /* test ecx,ecx */
+            } else {
+                byte(b, 0x83); modrm_rsi(b, 7, slot(b, n->arg2)); byte(b, 0); /* cmp dword [r],0 */
+            }
             byte(b, 0x0f); byte(b, 0x95); byte(b, 0xc1); /* setne cl */
             byte(b, 0x0f); byte(b, 0xb6); byte(b, 0xc9); /* movzx ecx,cl */
             byte(b, n->op_code == OP_LAND ? 0x23 : n->op_code == OP_LOR ? 0x0b : 0x33);
@@ -625,18 +647,31 @@ static void emit_gene(Emitter *b, const BioProgram *p, BioGene *g) {
             break;
         case OP_SHL: case OP_SHR: case OP_SAR:
             emit_load(b, n->arg1);
-            byte(b, 0x8b); modrm_rsi(b, 1, slot(b, n->arg2)); /* mov ecx,[r]: count */
-            byte(b, 0x83); byte(b, 0xf9); byte(b, 31); /* cmp ecx,31 */
-            require_condition(b, n, BIO_FAULT_SHIFT, 0x76); /* jbe: unsigned also rejects negatives */
-            byte(b, 0xd3); byte(b, n->op_code == OP_SHL ? 0xe0 : n->op_code == OP_SHR ? 0xe8 : 0xf8);
+            if (n->arg2_literal) { /* The parser bounded the count to 0..31. */
+                byte(b, 0xc1); /* op eax,imm8 */
+                byte(b, n->op_code == OP_SHL ? 0xe0 : n->op_code == OP_SHR ? 0xe8 : 0xf8);
+                byte(b, (uint8_t)n->arg2);
+            } else {
+                byte(b, 0x8b); modrm_rsi(b, 1, slot(b, n->arg2)); /* mov ecx,[r]: count */
+                byte(b, 0x83); byte(b, 0xf9); byte(b, 31); /* cmp ecx,31 */
+                require_condition(b, n, BIO_FAULT_SHIFT, 0x76); /* jbe: unsigned also rejects negatives */
+                byte(b, 0xd3); byte(b, n->op_code == OP_SHL ? 0xe0 : n->op_code == OP_SHR ? 0xe8 : 0xf8);
+            }
             store_eax(b, n->arg1);
             break;
         case OP_EQ: case OP_LT: case OP_MIN: case OP_MAX:
             emit_load(b, n->arg1);
-            byte(b, 0x3b); modrm_rsi(b, 0, slot(b, n->arg2)); /* cmp eax,[r] */
+            if (n->arg2_literal) {
+                byte(b, 0x81); byte(b, 0xf8); word32(b, n->arg2); /* cmp eax,imm32 */
+            } else {
+                byte(b, 0x3b); modrm_rsi(b, 0, slot(b, n->arg2)); /* cmp eax,[r] */
+            }
             if (n->op_code == OP_EQ || n->op_code == OP_LT) {
                 byte(b, 0x0f); byte(b, n->op_code == OP_EQ ? 0x94 : 0x9c); byte(b, 0xc0); /* sete/setl al */
                 byte(b, 0x0f); byte(b, 0xb6); byte(b, 0xc0); /* movzx eax,al */
+            } else if (n->arg2_literal) {
+                byte(b, 0xba); word32(b, n->arg2); /* mov edx,imm32 (cmov needs a register) */
+                byte(b, 0x0f); byte(b, n->op_code == OP_MIN ? 0x4f : 0x4c); byte(b, 0xc2); /* cmov eax,edx */
             } else {
                 byte(b, 0x0f); byte(b, n->op_code == OP_MIN ? 0x4f : 0x4c); /* cmovg/cmovl eax,[r] */
                 modrm_rsi(b, 0, slot(b, n->arg2));

@@ -162,7 +162,8 @@ class Gene:
         self.gen_statements(self.rng.randint(0, 2), forbidden + (counter, step))
         # A handle survives the body only if the body never overwrote it.
         self.strings &= saved_strings
-        self.emit(f"SUB {counter} {step}")
+        # The countdown sometimes uses the literal form (0.17).
+        self.emit(f"SUB {counter} 1" if self.rng.random() < 0.5 else f"SUB {counter} {step}")
         self.emit(f"JNZ {counter} {label}")
 
     def gen_param_access(self, forbidden):
@@ -252,14 +253,25 @@ class Gene:
             self.load(forbidden=forbidden)
         elif kind == "mov":
             dst = self.dst_reg(forbidden)
-            src = self.init_reg()
-            self.emit(f"MOV {dst} {src}")
             self.init.add(dst)
-            (self.strings.add if src in self.strings else self.strings.discard)(dst)
+            if rng.random() < 0.3:
+                # Literal form (0.17): MOV rN 5 behaves like LOAD.
+                value = rng.choice(I32_POOL) if rng.random() < 0.4 else rng.randint(-100, 100)
+                self.emit(f"MOV {dst} {value}")
+                self.strings.discard(dst)
+            else:
+                src = self.init_reg()
+                self.emit(f"MOV {dst} {src}")
+                (self.strings.add if src in self.strings else self.strings.discard)(dst)
         elif kind == "binop":
             # The first operand is overwritten; loop counters are off-limits.
             target = rng.choice(writable)
-            self.emit(f"{rng.choice(BIN_OPS)} {target} {self.init_reg()}")
+            if rng.random() < 0.4:
+                # Literal second operand (0.17): every binary i32 op accepts it.
+                value = rng.choice(I32_POOL) if rng.random() < 0.4 else rng.randint(-100, 100)
+                self.emit(f"{rng.choice(BIN_OPS)} {target} {value}")
+            else:
+                self.emit(f"{rng.choice(BIN_OPS)} {target} {self.init_reg()}")
             self.strings.discard(target)
         elif kind == "risky":
             op = rng.choice(RISKY_OPS)
@@ -267,9 +279,19 @@ class Gene:
             self.strings.discard(target)
             if op in ("DIV", "MOD"):
                 value = 0 if rng.random() < 0.2 else rng.choice((-7, -2, -1, 1, 2, 3, 7, 100))
+                # A nonzero literal divisor is legal (0.17); zero stays register-borne
+                # because a literal zero is a compile error.
+                if value and rng.random() < 0.4:
+                    self.emit(f"{op} {target} {value}")
+                else:
+                    self.emit(f"{op} {target} {self.load(value=value, forbidden=forbidden)}")
             else:
                 value = rng.choice((0, 1, 5, 31)) if rng.random() < 0.8 else rng.choice((32, -1, 100))
-            self.emit(f"{op} {target} {self.load(value=value, forbidden=forbidden)}")
+                # A literal count must be in 0..31; out-of-range counts stay register-borne.
+                if 0 <= value <= 31 and rng.random() < 0.4:
+                    self.emit(f"{op} {target} {value}")
+                else:
+                    self.emit(f"{op} {target} {self.load(value=value, forbidden=forbidden)}")
         elif kind == "unop":
             target = rng.choice(writable)
             self.emit(f"{rng.choice(UN_OPS)} {target} _")

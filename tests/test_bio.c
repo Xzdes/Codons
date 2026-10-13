@@ -169,7 +169,7 @@ static void arithmetic_slot_tests(void) {
     }
     expect_error("GENE main i32/1\nNOT r0 r1\nRET r0 _\nEND _ _\n", "unused '_'");
     expect_error("GENE main i32/1\nLNOT r0\nRET r0 _\nEND _ _\n", "exactly 3 fields");
-    expect_error("GENE main i32/1\nDIV r0 3\nRET r0 _\nEND _ _\n", "second operand");
+    expect_error("GENE main i32/1\nDIV r0 2147483648\nRET r0 _\nEND _ _\n", "second operand");
     expect_error("GENE main i32/1\nSHR r0 _\nRET r0 _\nEND _ _\n", "second operand");
 }
 
@@ -1256,6 +1256,64 @@ static void struct_tests(void) {
     bio_program_release(p);
 }
 
+static void literal_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    int32_t result;
+    char path[256];
+    FILE *dump;
+    char text[512];
+    size_t got;
+    /* Every binary i32 op accepts a literal second operand (0.17). */
+    expect_value("GENE main i32\nLOAD r0 100\nADD r0 5\nSUB r0 3\nMUL r0 2\nMOD r0 7\nRET r0 _\nEND _ _\n", 1);
+    expect_value("GENE main i32\nLOAD r0 12\nDIV r0 5\nRET r0 _\nEND _ _\n", 2);
+    expect_value("GENE main i32\nLOAD r0 -7\nDIV r0 2\nRET r0 _\nEND _ _\n", -3);
+    expect_value("GENE main i32\nLOAD r0 -7\nMOD r0 2\nRET r0 _\nEND _ _\n", -1);
+    expect_value("GENE main i32\nLOAD r0 6\nAND r0 12\nOR r0 1\nXOR r0 15\nRET r0 _\nEND _ _\n", ((6 & 12) | 1) ^ 15);
+    expect_value("GENE main i32\nLOAD r0 1\nSHL r0 31\nSAR r0 29\nSHR r0 1\nRET r0 _\nEND _ _\n", 0x7ffffffe);
+    expect_value("GENE main i32\nLOAD r0 9\nEQ r0 9\nRET r0 _\nEND _ _\n", 1);
+    expect_value("GENE main i32\nLOAD r0 9\nEQ r0 8\nRET r0 _\nEND _ _\n", 0);
+    expect_value("GENE main i32\nLOAD r0 -3\nLT r0 0\nRET r0 _\nEND _ _\n", 1);
+    expect_value("GENE main i32\nLOAD r0 7\nMIN r0 -4\nRET r0 _\nEND _ _\n", -4);
+    expect_value("GENE main i32\nLOAD r0 7\nMAX r0 -4\nRET r0 _\nEND _ _\n", 7);
+    expect_value("GENE main i32\nLOAD r0 1\nLAND r0 5\nRET r0 _\nEND _ _\n", 1);
+    expect_value("GENE main i32\nLOAD r0 0\nLOR r0 0\nRET r0 _\nEND _ _\n", 0);
+    expect_value("GENE main i32\nLOAD r0 1\nLXOR r0 1\nRET r0 _\nEND _ _\n", 0);
+    expect_value("GENE main i32\nMOV r0 42\nRET r0 _\nEND _ _\n", 42);
+    /* Literal edge values: INT32_MIN, -1, wrap-around. */
+    expect_value("GENE main i32\nLOAD r0 -2147483648\nSUB r0 1\nRET r0 _\nEND _ _\n", INT32_MAX);
+    expect_value("GENE main i32\nLOAD r0 0\nSUB r0 -2147483648\nRET r0 _\nEND _ _\n", INT32_MIN);
+    expect_value("GENE main i32\nLOAD r0 2147483647\nADD r0 1\nRET r0 _\nEND _ _\n", INT32_MIN);
+    /* A literal is not a register: ADD r0 255 does not read r255, and an
+       otherwise unused register file stays tiny. */
+    expect_value("GENE main i32\nLOAD r0 10\nADD r0 255\nRET r0 _\nEND _ _\n", 265);
+    expect_value("GENE main i32\nLOAD r0 1\nADD r0 1\nEQ r0 2\nRET r0 _\nEND _ _\n", 1);
+    /* Rejections: zero divisors and out-of-range literal shift counts are
+       compile errors, and both engines report them identically. */
+    expect_error("GENE main i32\nLOAD r0 1\nDIV r0 0\nRET r0 _\nEND _ _\n", "division by literal zero");
+    expect_error("GENE main i32\nLOAD r0 1\nMOD r0 0\nRET r0 _\nEND _ _\n", "division by literal zero");
+    expect_error("GENE main i32\nLOAD r0 1\nSHL r0 32\nRET r0 _\nEND _ _\n", "literal shift count must be in 0..31");
+    expect_error("GENE main i32\nLOAD r0 1\nSHR r0 -1\nRET r0 _\nEND _ _\n", "literal shift count must be in 0..31");
+    expect_error("GENE main i32\nLOAD r0 1\nADD r0 2147483648\nRET r0 _\nEND _ _\n", "second operand");
+    /* INT32_MIN / -1 with a literal -1 is a runtime fault, identical everywhere. */
+    expect_run_failure("GENE main i32\nLOAD r0 -2147483648\nDIV r0 -1\nRET r0 _\nEND _ _\n", "division overflow");
+    /* The dump prints literals and the dump reparses to the same program. */
+    write_source("litdump.dna", "GENE main i32\nLOAD r0 6\nMUL r0 -7\nADD r0 1\nRET r0 _\nEND _ _\n");
+    p = compile_name("litdump.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, NULL, 0, &result, &e) && result == -41);
+    path_for(path, sizeof(path), "litdump-normalized.dna");
+    dump = fopen(path, "wb"); REQUIRE(dump != NULL);
+    bio_program_dump(p, dump); REQUIRE(fclose(dump) == 0);
+    bio_program_release(p);
+    dump = fopen(path, "rb"); REQUIRE(dump != NULL);
+    got = fread(text, 1, sizeof(text) - 1, dump); text[got] = '\0';
+    REQUIRE(fclose(dump) == 0);
+    REQUIRE(strstr(text, "MUL r0 -7") != NULL && strstr(text, "ADD r0 1") != NULL);
+    p = bio_load(path, 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_interpret(p, NULL, 0, &result, &e) && result == -41);
+    bio_program_release(p);
+}
+
 static void string_tests(void) {
     BioError e = {{0}};
     BioProgram *p;
@@ -1672,6 +1730,7 @@ int main(void) {
     wide_tests();
     register_tests();
     struct_tests();
+    literal_tests();
     flow_tests();
     loop_budget_tests();
     loop_runtime_tests();

@@ -357,28 +357,31 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
             break;
         }
         case OP_LOAD: r[n->arg1] = n->arg2; break;
-        case OP_MOV: r[n->arg1] = r[n->arg2]; break;
-        case OP_ADD: r[n->arg1] += r[n->arg2]; break;
-        case OP_SUB: r[n->arg1] -= r[n->arg2]; break;
-        case OP_MUL: r[n->arg1] *= r[n->arg2]; break;
+        /* Binary i32 ops accept an i32 literal as the second operand (0.17);
+           a literal is a value, never a register index. */
+        case OP_MOV: r[n->arg1] = n->arg2_literal ? n->arg2 : r[n->arg2]; break;
+        case OP_ADD: r[n->arg1] += n->arg2_literal ? n->arg2 : r[n->arg2]; break;
+        case OP_SUB: r[n->arg1] -= n->arg2_literal ? n->arg2 : r[n->arg2]; break;
+        case OP_MUL: r[n->arg1] *= n->arg2_literal ? n->arg2 : r[n->arg2]; break;
         case OP_DIV: case OP_MOD: {
-            int64_t a = signed_value(r[n->arg1]), b = signed_value(r[n->arg2]), value;
+            int64_t a = signed_value(r[n->arg1]), value;
+            int64_t b = signed_value(n->arg2_literal ? n->arg2 : r[n->arg2]);
             if (!b) return interpreter_fault(execution, n, BIO_FAULT_DIV_ZERO);
             value = n->op_code == OP_DIV ? a / b : a % b;
             if (value > INT32_MAX) return interpreter_fault(execution, n, BIO_FAULT_DIV_OVERFLOW);
             r[n->arg1] = (uint32_t)value;
             break;
         }
-        case OP_AND: r[n->arg1] &= r[n->arg2]; break;
-        case OP_OR: r[n->arg1] |= r[n->arg2]; break;
-        case OP_XOR: r[n->arg1] ^= r[n->arg2]; break;
+        case OP_AND: r[n->arg1] &= n->arg2_literal ? n->arg2 : r[n->arg2]; break;
+        case OP_OR: r[n->arg1] |= n->arg2_literal ? n->arg2 : r[n->arg2]; break;
+        case OP_XOR: r[n->arg1] ^= n->arg2_literal ? n->arg2 : r[n->arg2]; break;
         case OP_NOT: r[n->arg1] = ~r[n->arg1]; break;
-        case OP_LAND: r[n->arg1] = !!r[n->arg1] & !!r[n->arg2]; break;
-        case OP_LOR: r[n->arg1] = !!r[n->arg1] | !!r[n->arg2]; break;
-        case OP_LXOR: r[n->arg1] = !!r[n->arg1] ^ !!r[n->arg2]; break;
+        case OP_LAND: r[n->arg1] = !!r[n->arg1] & (0 != (n->arg2_literal ? n->arg2 : r[n->arg2])); break;
+        case OP_LOR: r[n->arg1] = !!r[n->arg1] | (0 != (n->arg2_literal ? n->arg2 : r[n->arg2])); break;
+        case OP_LXOR: r[n->arg1] = !!r[n->arg1] ^ (0 != (n->arg2_literal ? n->arg2 : r[n->arg2])); break;
         case OP_LNOT: r[n->arg1] = !r[n->arg1]; break;
         case OP_SHL: case OP_SHR: case OP_SAR: {
-            uint32_t value = r[n->arg1], count = r[n->arg2];
+            uint32_t value = r[n->arg1], count = n->arg2_literal ? n->arg2 : r[n->arg2];
             if (count > 31) return interpreter_fault(execution, n, BIO_FAULT_SHIFT);
             if (n->op_code == OP_SHL) value <<= count;
             else {
@@ -390,14 +393,18 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
             r[n->arg1] = value;
             break;
         }
-        case OP_EQ: r[n->arg1] = r[n->arg1] == r[n->arg2]; break;
-        case OP_LT: r[n->arg1] = signed_value(r[n->arg1]) < signed_value(r[n->arg2]); break;
-        case OP_MIN:
-            if (signed_value(r[n->arg1]) > signed_value(r[n->arg2])) r[n->arg1] = r[n->arg2];
+        case OP_EQ: r[n->arg1] = r[n->arg1] == (n->arg2_literal ? n->arg2 : r[n->arg2]); break;
+        case OP_LT: r[n->arg1] = signed_value(r[n->arg1]) < signed_value(n->arg2_literal ? n->arg2 : r[n->arg2]); break;
+        case OP_MIN: {
+            uint32_t rhs = n->arg2_literal ? n->arg2 : r[n->arg2];
+            if (signed_value(r[n->arg1]) > signed_value(rhs)) r[n->arg1] = rhs;
             break;
-        case OP_MAX:
-            if (signed_value(r[n->arg1]) < signed_value(r[n->arg2])) r[n->arg1] = r[n->arg2];
+        }
+        case OP_MAX: {
+            uint32_t rhs = n->arg2_literal ? n->arg2 : r[n->arg2];
+            if (signed_value(r[n->arg1]) < signed_value(rhs)) r[n->arg1] = rhs;
             break;
+        }
         case OP_CALL: {
             /* The callee's arity says how many 8-bit register fields are live. */
             unsigned argc = p->genes[n->arg1].arity, i;
@@ -741,6 +748,8 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
                 fprintf(out, "%s %s _", names[n->op_code], p->symbols[n->arg1]);
             else if (n->op_code == OP_JZ || n->op_code == OP_JNZ)
                 fprintf(out, "%s r%u %s", names[n->op_code], n->arg1, p->symbols[n->arg2]);
+            else if (n->arg2_literal) /* Binary i32 op with a literal operand (0.17). */
+                fprintf(out, "%s r%u %ld", names[n->op_code], n->arg1, (long)signed_value(n->arg2));
             else fprintf(out, "%s r%u r%u", names[n->op_code], n->arg1, n->arg2);
             fprintf(out, " # line %u\n", n->line);
         }

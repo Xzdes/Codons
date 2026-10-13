@@ -43,7 +43,7 @@ typedef enum {
     OP_VAR, OP_ARRAY, OP_GET, OP_SET, OP_AGET, OP_ASET, OP_LEN, OP_READ, OP_WRITE, OP_PARAM,
     OP_QUARANTINE,
     OP_SLOAD, OP_SLEN, OP_SGET, OP_SCAT, OP_SEQ, OP_PRINT,
-    /* Wide (i64) registers w0..w3: a class separate from r0..r7, like strings.
+    /* Wide (i64) registers w0..w3: a class separate from r0..r255, like strings.
        WLOAD carries an index into the program's wide literal table. */
     OP_WLOAD, OP_WMOV, OP_WADD, OP_WSUB, OP_WMUL, OP_WDIV, OP_WMOD,
     OP_WAND, OP_WOR, OP_WXOR, OP_WNOT, OP_WSHL, OP_WSHR, OP_WSAR,
@@ -54,6 +54,7 @@ typedef struct CodonNode {
     uint8_t op_code;
     uint8_t reachable;
     uint8_t queued;
+    uint8_t arg2_literal; /* Binary i32 ops: arg2 is an i32 literal, not a register. */
     uint32_t flow; /* Word offset of this node's init bitset in the validate_flow arena. */
     uint32_t arg1;
     uint32_t arg2;

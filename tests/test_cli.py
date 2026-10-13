@@ -459,6 +459,23 @@ class CliTests(unittest.TestCase):
         late = self.source("GENE main i32\nLOAD r0 1\nSTRUCT p x\nRET r0 _\nEND _ _\n", "late.dna")
         self.assertIn("must precede all instructions", self.call("check", late, code=1).stderr)
 
+    def test_literal_operands(self):
+        # A literal second operand works for every binary i32 op (0.17).
+        src = self.source("GENE main i32/1\nADD r0 10\nSHL r0 2\nMIN r0 100\nMOD r0 7\nRET r0 _\nEND _ _\n",
+                          "lit.dna")
+        self.assertEqual(self.call("run", src, "5").stdout.strip(), "4")  # ((5+10)<<2 min 100) % 7
+        data = json.loads(self.call("verify", src, "5", "--json").stdout)
+        self.assertTrue(data["verified"])
+        self.assertEqual(data["result"], 4)
+        # Literal faults are compile errors and carry the hint plus line_text.
+        bad = self.source("GENE main i32\nLOAD r0 1\nDIV r0 0\nRET r0 _\nEND _ _\n", "lit-bad.dna")
+        data = json.loads(self.call("check", bad, "--json", code=1).stdout)
+        self.assertIn("division by literal zero", data["error"]["message"])
+        self.assertEqual(data["error"]["line_text"], "DIV r0 0")
+        # The dump prints the literal form and it reparses.
+        text = self.call("dump", src).stdout
+        self.assertIn("ADD r0 10", text)
+
     def test_error_hints_and_line_text(self):
         # JSON errors carry the offending source line, so an agent sees what it wrote.
         src = self.source("GENE main i32\nLOAD r0 1\nADD r0 r1\nRET r0 _\nEND _ _\n", "hint.dna")
