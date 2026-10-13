@@ -173,7 +173,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.16.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.17.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 

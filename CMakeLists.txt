@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(codons VERSION 0.16.0 LANGUAGES C)
+project(codons VERSION 0.17.0 LANGUAGES C)
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Codons requires 64-bit Windows (x86-64)")
 endif()
