@@ -12,13 +12,74 @@ static int identifier(const char *s) {
         unsigned char c = (unsigned char)s[i];
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') continue;
         if (i && c >= '0' && c <= '9') continue;
+        if (c == '.' && i && i + 1 < len) continue; /* Struct field paths: p.x */
         return 0;
     }
     return 1;
 }
 
+/* Registers are cells of the locals frame. The uniform ceiling is 256:
+   multi-register codons pack register numbers in 8-bit fields. */
 static int reg(const char *s) {
-    return strlen(s) == 2 && s[0] == 'r' && s[1] >= '0' && s[1] <= '7' ? s[1] - '0' : -1;
+    char *end;
+    long value;
+    if (s[0] != 'r' || s[1] < '0' || s[1] > '9') return -1;
+    value = strtol(s + 1, &end, 10);
+    if (*end || value > 255) return -1;
+    return (int)value;
+}
+
+/* The register file of a gene covers every register any of its nodes mentions.
+   Mirrors the operand layout knowledge of analyze.c's reads/definitions. */
+static unsigned node_registers(const CodonNode *n) {
+    unsigned hi = 0;
+    switch (n->op_code) {
+    case OP_MOV: case OP_ADD: case OP_SUB: case OP_MUL: case OP_EQ: case OP_LT:
+    case OP_MIN: case OP_MAX: case OP_DIV: case OP_MOD: case OP_AND: case OP_OR:
+    case OP_XOR: case OP_LAND: case OP_LOR: case OP_LXOR:
+    case OP_SHL: case OP_SHR: case OP_SAR: case OP_SLEN:
+        hi = n->arg1 > n->arg2 ? n->arg1 : n->arg2; break;
+    case OP_LOAD: case OP_NOT: case OP_LNOT: case OP_RET: case OP_JZ: case OP_JNZ:
+    case OP_PRINT: case OP_GET: case OP_LEN: case OP_SLOAD:
+    case OP_WEQ: case OP_WLT: case OP_NARROW:
+        hi = n->arg1; break;
+    case OP_SET: case OP_READ: case OP_WRITE: case OP_WIDEN:
+        hi = n->arg2; break;
+    case OP_AGET: hi = n->arg1 > (n->arg2 & 255u) ? n->arg1 : (n->arg2 & 255u); break;
+    case OP_ASET: {
+        unsigned a = n->arg2 & 255u, b = n->arg2 >> 8;
+        hi = a > b ? a : b; break;
+    }
+    case OP_SGET: case OP_SCAT: case OP_SEQ: {
+        unsigned a = n->arg2 & 255u, b = n->arg2 >> 8;
+        hi = n->arg1 > a ? n->arg1 : a;
+        if (b > hi) hi = b;
+        break;
+    }
+    case OP_CALL: {
+        /* argc lives in n->flow until linking; the result always lands in r0. */
+        unsigned argc = n->flow, i;
+        for (i = 0; i < argc; ++i) {
+            unsigned a = (n->arg2 >> (8 * i)) & 255u;
+            if (a > hi) hi = a;
+        }
+        break;
+    }
+    default: break;
+    }
+    return hi + 1;
+}
+
+/* Registers live behind the declared locals in the same frame; the register
+   file covers every register any node mentions (and at least the arity).
+   Runs at END and at the repair path that closes a gene at end of file. */
+static void finish_gene(BioGene *g) {
+    CodonNode *m;
+    g->reg_base = g->local_cells;
+    for (m = g->head->next; m; m = m->next)
+        if (node_registers(m) > g->reg_count) g->reg_count = node_registers(m);
+    if (g->arity > g->reg_count) g->reg_count = g->arity;
+    g->local_cells = g->reg_base + g->reg_count;
 }
 
 /* Wide i64 registers live in a separate class: w0..w3. */
@@ -302,6 +363,9 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
                 current->tail->next = n; current->tail = n;
                 if (!bio_quarantine(p, n, "empty gene body", e)) goto fail;
             }
+            /* Declared cells are capped at BIO_MAX_LOCAL_CELLS by the decl
+               handlers; the register tail adds at most 256 cells more. */
+            finish_gene(current);
             current = NULL;
             continue;
         }
@@ -319,6 +383,52 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             if (!bio_quarantine(p, n, "explicit quarantine codon", e)) goto fail;
             continue;
         }
+        if (!strcmp(fields[0], "STRUCT")) {
+            /* Pure sugar: STRUCT p x,y declares one-cell locals p.x and p.y. */
+            char *names, *comma;
+            if (previous->op_code != OP_GENE && previous->op_code != OP_VAR &&
+                previous->op_code != OP_ARRAY && previous->op_code != OP_PARAM)
+                QUARANTINE("STRUCT declarations must precede all instructions and labels");
+            if (!identifier(fields[1]) || reg(fields[1]) >= 0 || !strcmp(fields[1], "_") ||
+                strchr(fields[1], '.'))
+                QUARANTINE("invalid struct name: %s", fields[1]);
+            names = fields[2];
+            for (;;) {
+                char dotted[BIO_NAME_SIZE];
+                int sym;
+                BioLocal *local;
+                comma = strchr(names, ',');
+                if (comma) *comma = '\0';
+                if (!identifier(names) || !strcmp(names, "_") || strchr(names, '.'))
+                    QUARANTINE("STRUCT requires comma-separated field names: STRUCT point x,y");
+                if (snprintf(dotted, sizeof(dotted), "%s.%s", fields[1], names) >=
+                    (int)sizeof(dotted))
+                    QUARANTINE("struct field name too long");
+                sym = symbol(p, dotted);
+                if (sym < 0) QUARANTINE("symbol budget exceeded");
+                for (i = 0; i < current->local_count; ++i)
+                    if (current->locals[i].symbol == (uint32_t)sym)
+                        QUARANTINE("duplicate local declaration");
+                if (current->local_count == BIO_MAX_LOCALS)
+                    QUARANTINE("local declaration limit exceeded");
+                if (current->local_cells + 1u > BIO_MAX_LOCAL_CELLS)
+                    QUARANTINE("local storage limit exceeded");
+                local = &current->locals[current->local_count++];
+                local->symbol = (uint32_t)sym; local->offset = current->local_cells;
+                local->count = 1; local->initial = 0;
+                local->is_array = 0; local->is_parameter = 0;
+                ++current->local_cells;
+                /* Each field is a VAR node, so the dump reproduces them verbatim. */
+                n->op_code = OP_VAR; n->arg1 = (uint32_t)sym; n->arg2 = 0;
+                if (!comma) break;
+                names = comma + 1;
+                n = bio_node_new(p, e);
+                if (!n) goto fail;
+                n->file = index; n->line = location.line;
+                current->tail->next = n; current->tail = n;
+            }
+            continue;
+        }
         if (!strcmp(fields[0], "VAR") || !strcmp(fields[0], "ARRAY") || !strcmp(fields[0], "PARAM")) {
             char *end;
             long long value;
@@ -329,7 +439,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
                 previous->op_code != OP_ARRAY && previous->op_code != OP_PARAM)
                 QUARANTINE("VAR, ARRAY and PARAM declarations must precede all instructions and labels");
             if (!identifier(fields[1]) || reg(fields[1]) >= 0 || !strcmp(fields[1], "_"))
-                QUARANTINE("invalid local name: use an identifier other than r0..r7 or _");
+                QUARANTINE("invalid local name: use an identifier other than rN or _");
             if (parameter) {
                 if (strcmp(fields[2], "r0")) QUARANTINE("PARAM requires '<name> r0'; r0 is the array length");
                 if (!strcmp(current->name, "main")) QUARANTINE("main cannot declare PARAM");
@@ -366,7 +476,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
         if (!strcmp(fields[0], "READ") || !strcmp(fields[0], "WRITE")) {
             int sym;
             a = reg(fields[2]);
-            if (!identifier(fields[1]) || a < 0) QUARANTINE("%s requires '<array> rN' (r0..r7)", fields[0]);
+            if (!identifier(fields[1]) || a < 0) QUARANTINE("%s requires '<array> rN' (r0..r255)", fields[0]);
             sym = symbol(p, fields[1]);
             if (sym < 0) QUARANTINE("symbol budget exceeded");
             n->op_code = !strcmp(fields[0], "READ") ? OP_READ : OP_WRITE;
@@ -454,10 +564,13 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
                     regs[i] = reg(parts[first + i]);
                     if (regs[i] < 0) QUARANTINE("invalid CALL operands");
                 }
-                for (i = 0; i < argc; ++i) packed |= (unsigned)regs[i] << (3 * i);
+                for (i = 0; i < argc; ++i) packed |= (unsigned)regs[i] << (8 * i);
             }
+            /* argc lives in n->flow until linking; afterwards the callee's
+               arity (n->arg1 becomes the gene index) says how many of the four
+               8-bit fields are live. */
             n->op_code = OP_CALL; n->arg1 = (uint32_t)sym;
-            n->arg2 = (argc << 16) | packed;
+            n->arg2 = packed; n->flow = argc;
             continue;
         }
         if (strcmp(fields[0], "SLOAD") == 0) {
@@ -545,7 +658,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             if (wide_index < sizeof(wide_binary) / sizeof(wide_binary[0])) continue;
         }
         a = reg(fields[1]);
-        if (a < 0) QUARANTINE("first operand must be r0..r7");
+        if (a < 0) QUARANTINE("first operand must be a register r0..r255");
         n->arg1 = (uint32_t)a;
         if (strcmp(fields[0], "LOAD") == 0) {
             char *end;
@@ -609,6 +722,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             current->tail->next = missing; current->tail = missing;
             if (!bio_quarantine(p, missing, "empty gene body", e)) goto fail;
         }
+        finish_gene(current);
         current = NULL;
     }
     fclose(f);

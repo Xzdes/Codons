@@ -24,9 +24,12 @@
 #define BIO_MAX_LOCAL_CELLS 65536u
 #define BIO_MEMORY_CELLS 262144u /* 1 MiB of i32 storage across an active call chain.
     For recursive programs this is the fixed frame pool, checked at every CALL. */
-/* Frame: shadow 0-31, outgoing args 32/40, r0-r7 at 48+4r, PARAM view 80/88,
-   wide registers w0-w3 at 96+8w. 136 keeps the body 16-aligned for calls. */
-#define BIO_STACK_SIZE 136u
+/* Frame: shadow 0-31, outgoing args 32/40, PARAM view 48/56, wide registers
+   w0-w3 at 64+8w. Virtual registers rN live in the locals pool instead:
+   [rsi + 4*(reg_base + N)], so their count is limited only by the frame
+   memory budget. 104 keeps the body 16-aligned for calls and fits
+   UWOP_ALLOC_SMALL. */
+#define BIO_STACK_SIZE 104u
 #define BIO_MAX_LITERALS 1024u
 #define BIO_LITERAL_BYTES (256u * 1024u)
 #define BIO_MAX_STRINGS 4096u /* Handle table capacity: literals plus dynamic entries. */
@@ -50,8 +53,8 @@ typedef enum {
 typedef struct CodonNode {
     uint8_t op_code;
     uint8_t reachable;
-    uint16_t initialized; /* Bits 0-7: r0-r7; bits 8-11: wide w0-w3. */
     uint8_t queued;
+    uint32_t flow; /* Word offset of this node's init bitset in the validate_flow arena. */
     uint32_t arg1;
     uint32_t arg2;
     uint32_t call_array; /* CALL only: zero or array symbol/local index + 1 after linking. */
@@ -94,7 +97,9 @@ typedef struct {
     uint32_t code_end;
     BioLocal locals[BIO_MAX_LOCALS];
     unsigned local_count;
-    uint32_t local_cells;
+    uint32_t reg_base;   /* Registers are locals too: rN lives at cell reg_base + N. */
+    uint32_t reg_count;  /* Highest rN mentioned plus one, at least the arity. */
+    uint32_t local_cells; /* reg_base + reg_count: the whole frame, registers included. */
     uint32_t memory_cells; /* Maximum simultaneously active storage, including callees. */
 } BioGene;
 

@@ -173,7 +173,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.15.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.16.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -411,6 +411,53 @@ class CliTests(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(data["result"], -1)
         self.assertEqual(data["repair_log"][0]["kind"], "fill")
+
+    def test_registers_beyond_r7(self):
+        # The register file reaches r255 and travels through calls and recursion.
+        high = self.source("GENE main i32\nLOAD r15 40\nLOAD r200 2\nADD r15 r200\n"
+                           "RET r15 _\nEND _ _\n", "high.dna")
+        for command in ("run", "interpret"):
+            self.assertEqual(self.call(command, high).stdout.strip(), "42")
+        self.assertEqual(self.call("verify", high).stdout.strip(), "42")
+        call = self.source("GENE main i32\nLOAD r12 30\nLOAD r13 12\nCALL add2 r12,r13\n"
+                           "RET r0 _\nEND _ _\nGENE add2 i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n",
+                           "rcall.dna")
+        for command in ("run", "interpret"):
+            self.assertEqual(self.call(command, call).stdout.strip(), "42")
+        # Multi-digit registers survive the dump round trip.
+        dumped = self.root / "rcall-dump.dna"
+        dumped.write_text(self.call("dump", call).stdout.replace("\r\n", "\n"), encoding="utf-8")
+        self.assertEqual(self.call("verify", str(dumped)).stdout.strip(), "42")
+        # Out of range and uninitialized registers fail at compile time.
+        over = self.source("GENE main i32\nLOAD r256 1\nRET r256 _\nEND _ _\n", "over.dna")
+        self.assertIn("first operand must be a register r0..r255",
+                      self.call("check", over, code=1).stderr)
+        uninit = self.source("GENE main i32\nRET r9 _\nEND _ _\n", "runinit.dna")
+        self.assertIn("read of uninitialized register r9",
+                      self.call("check", uninit, code=1).stderr)
+
+    def test_struct_sugar(self):
+        # STRUCT expands to one-cell locals with dotted names.
+        point = self.source("GENE main i32\nSTRUCT p x,y\nLOAD r1 40\nLOAD r2 2\nSET p.x r1\n"
+                            "SET p.y r2\nGET r3 p.x\nGET r4 p.y\nADD r3 r4\nRET r3 _\nEND _ _\n",
+                            "point.dna")
+        for command in ("run", "interpret"):
+            self.assertEqual(self.call(command, point).stdout.strip(), "42")
+        self.assertEqual(self.call("verify", point).stdout.strip(), "42")
+        # The dump normalizes STRUCT into VAR lines that reparse unchanged.
+        dumped = self.root / "point-dump.dna"
+        text = self.call("dump", point).stdout.replace("\r\n", "\n")
+        dumped.write_text(text, encoding="utf-8")
+        self.assertIn("VAR p.x 0", text)
+        self.assertIn("VAR p.y 0", text)
+        self.assertEqual(self.call("verify", str(dumped)).stdout.strip(), "42")
+        # The bare struct name is not a local; fields are unique.
+        bare = self.source("GENE main i32\nSTRUCT p x\nGET r0 p\nRET r0 _\nEND _ _\n", "bare.dna")
+        self.assertIn("undefined local p in gene main", self.call("check", bare, code=1).stderr)
+        dup = self.source("GENE main i32\nSTRUCT p x,x\nRET r0 _\nEND _ _\n", "dup.dna")
+        self.assertIn("duplicate local declaration", self.call("check", dup, code=1).stderr)
+        late = self.source("GENE main i32\nLOAD r0 1\nSTRUCT p x\nRET r0 _\nEND _ _\n", "late.dna")
+        self.assertIn("must precede all instructions", self.call("check", late, code=1).stderr)
 
     def test_print_faults_and_repair(self):
         source = self.source("GENE main i32\nLOAD r1 7\nPRINT r1 _\nRET r1 _\nEND _ _\n")

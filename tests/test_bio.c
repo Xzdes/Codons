@@ -72,12 +72,12 @@ static void expect_value(const char *source, int32_t expected) {
     REQUIRE(table != NULL);
     REQUIRE(base == (DWORD64)(uintptr_t)p->code);
     REQUIRE(table->BeginAddress == p->genes[p->main_gene].code_offset);
-    /* Exercise Windows' actual unwinder after the JIT's prolog (9 bytes:
-       push rbx; push rsi; sub rsp,136). The fake stack holds saved rsi and
+    /* Exercise Windows' actual unwinder after the JIT's prolog (6 bytes:
+       push rbx; push rsi; sub rsp,104). The fake stack holds saved rsi and
        rbx above the frame, then the return address. */
     fake_stack[BIO_STACK_SIZE / 8u + 2u] = 0x12345678u;
     context.ContextFlags = CONTEXT_FULL;
-    context.Rip = base + table->BeginAddress + 9;
+    context.Rip = base + table->BeginAddress + 6;
     context.Rsp = (DWORD64)(uintptr_t)fake_stack;
     RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, context.Rip, table, &context,
                      &handler_data, &frame, NULL);
@@ -109,7 +109,7 @@ static void language_tests(void) {
     expect_error("GENE main i32\nLOAD r0 1\nRET r0\nEND _ _\n", "exactly 3 fields");
     expect_error("GENE main i32\nCALL f r0, r1\n", "exactly 3 fields");
     expect_error("GENE main i32\nRET r0 _\nEND _ _\n", "uninitialized register");
-    expect_error("GENE main i32\nLOAD r8 1\n", "r0..r7");
+    expect_error("GENE main i32\nLOAD r256 1\n", "r0..r255");
     expect_error("GENE main i32\nLOAD r0 2147483648\n", "i32 literal");
     expect_error("GENE main i32\nLOAD r0 -2147483649\n", "i32 literal");
     expect_error("GENE main i32\nLOAD r0 12x\n", "i32 literal");
@@ -283,7 +283,7 @@ static void memory_error_tests(void) {
         {"ARRAY a 1\nSET a r0\n", "requires a variable"},
         {"VAR x 0\nLEN r0 x\n", "requires an array"}, {"VAR x 0\nAGET r0 x,r0\n", "requires an array"},
         {"VAR x 0\nASET x r0,r0\n", "requires an array"},
-        {"ARRAY a 1\nAGET r0 a,r8\n", "invalid AGET operands"},
+        {"ARRAY a 1\nAGET r0 a,r256\n", "invalid AGET operands"},
         {"ARRAY a 1\nASET a r0,r1,r2\n", "invalid ASET operands"},
         {"ARRAY a 1\nAGET r0 a\n", "comma-separated"},
         {"ARRAY a 1\nASET a r0, r1\n", "exactly 3 fields"},
@@ -342,17 +342,18 @@ static void memory_call_and_budget_tests(void) {
         snprintf(source + length, sizeof(source) - length, "GET r0 v63\nRET r0 _\nEND _ _\n");
         if (count == 64) expect_value(source, 63); else expect_error(source, "local declaration limit");
     }
-    /* Four full-size frames fit exactly; the fifth exceeds the invocation limit. */
+    /* Four near-full frames fit exactly; the fifth exceeds the invocation limit.
+       Each frame is 65532 declared cells plus one register cell. */
     for (count = 4; count <= 5; ++count) {
         length = 0;
         for (i = 0; i < count; ++i) {
             if (!i) strcpy(name, "main"); else snprintf(name, sizeof(name), "f%u", i);
-            length += (size_t)snprintf(source + length, sizeof(source) - length, "GENE %s i32\nARRAY a 65536\n", name);
+            length += (size_t)snprintf(source + length, sizeof(source) - length, "GENE %s i32\nARRAY a 65532\n", name);
             if (i + 1 < count) length += (size_t)snprintf(source + length, sizeof(source) - length, "CALL f%u _\n", i + 1);
             else length += (size_t)snprintf(source + length, sizeof(source) - length, "LEN r0 a\n");
             length += (size_t)snprintf(source + length, sizeof(source) - length, "RET r0 _\nEND _ _\n");
         }
-        if (count == 4) expect_value(source, 65536); else expect_error(source, "memory budget exceeded");
+        if (count == 4) expect_value(source, 65532); else expect_error(source, "memory budget exceeded");
     }
     /* Sibling calls reuse storage, but each initialization still consumes steps. */
     for (count = 15; count <= 16; ++count) {
@@ -365,7 +366,8 @@ static void memory_call_and_budget_tests(void) {
                  "CALL child _\nSUB r3 r4\nJNZ r3 loop\nRET r0 _\nEND _ _\n"
                  "GENE child i32\nARRAY a 65536\nLEN r0 a\nRET r0 _\nEND _ _\n");
     p = compile_name("init-budget.dna", 0, &e); REQUIRE(p != NULL);
-    REQUIRE(p->genes[p->main_gene].memory_cells == 65536);
+    /* Child frame: 65536 declared cells + 1 register cell; main adds its 5. */
+    REQUIRE(p->genes[p->main_gene].memory_cells == 65542);
     arg = 16; expect_run_error(p, &arg, 1, "init-budget.dna:10: execution budget exhausted");
     arg = 15; REQUIRE(bio_program_run(p, &arg, 1, &result, &e) && result == 65536);
     REQUIRE(bio_program_interpret(p, &arg, 1, &result, &e) && result == 65536);
@@ -589,7 +591,8 @@ static void array_parameter_tests(void) {
     write_source("parameter.dna", "GENE main i32/1\nARRAY a 3\nCALL size a,r0\nRET r0 _\nEND _ _\n"
                  "GENE size i32/1\nPARAM p r0\nLEN r0 p\nRET r0 _\nEND _ _\n");
     p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
-    REQUIRE(p->stats.execution_steps == 7 && p->genes[p->main_gene].memory_cells == 3);
+    /* Steps are unchanged (registers are not initialized); frames count them. */
+    REQUIRE(p->stats.execution_steps == 7 && p->genes[p->main_gene].memory_cells == 5);
     for (arg = 0; arg <= 3; ++arg) {
         REQUIRE(bio_program_run(p, &arg, 1, &result, &e) && result == arg);
         REQUIRE(bio_program_interpret(p, &arg, 1, &result, &e) && result == arg);
@@ -622,7 +625,8 @@ static void array_parameter_tests(void) {
             used += (size_t)snprintf(source + used, sizeof(source) - used, "RET r0 _\nEND _ _\n");
         }
         write_source("parameter.dna", source); p = compile_name("parameter.dna", 0, &e); REQUIRE(p != NULL);
-        REQUIRE(p->genes[p->main_gene].memory_cells == 65536 && p->stats.execution_steps == 65555);
+        /* 65536 declared + 1 register cell in main; each PARAM frame owns 1. */
+        REQUIRE(p->genes[p->main_gene].memory_cells == 65545 && p->stats.execution_steps == 65555);
         REQUIRE(run0(p) == 65536 && interpret0(p) == 65536);
         bio_program_release(p);
     }
@@ -997,7 +1001,7 @@ static void print_tests(void) {
     bio_program_release(p);
     /* Parse rules and repair of the unused third field. */
     expect_error("GENE main i32\nPRINT r1 x\nRET r1 _\nEND _ _\n", "PRINT requires an unused '_' third field");
-    expect_error("GENE main i32\nPRINT r8 _\nRET r1 _\nEND _ _\n", "first operand must be r0..r7");
+    expect_error("GENE main i32\nPRINT r256 _\nRET r1 _\nEND _ _\n", "first operand must be a register r0..r255");
     write_source("prepair.dna", "GENE main i32\nSLOAD r1 \"ok\"\nPRINT r1\nLOAD r2 1\nRET r2 _\nEND _ _\n");
     p = compile_name("prepair.dna", 1, &e); REQUIRE(p != NULL);
     REQUIRE(bio_program_repair_count(p) == 1);
@@ -1090,8 +1094,9 @@ static void recursion_tests(void) {
     expect_call_arg(countdown, 0, 0);
     expect_call_arg(countdown, 254, 0);
     expect_call_arg_failure(countdown, 255, "call depth limit reached (256 active genes)");
+    /* Frame = 4096 declared cells + 2 register cells = 4098. */
     expect_call_arg_failure(bigframes, 1000000,
-                            "call frame memory exhausted: need 4096 more cells, 0 left this run");
+                            "call frame memory exhausted: need 4098 more cells, 3969 left this run");
     expect_run_failure("GENE main i32\nCALL main _\nRET r0 _\nEND _ _\n", "call depth limit reached");
     expect_run_failure("GENE main i32\nCALL a _\nRET r0 _\nEND _ _\n"
                        "GENE a i32\nCALL main _\nRET r0 _\nEND _ _\n", "call depth limit reached");
@@ -1166,6 +1171,88 @@ static void wide_tests(void) {
     bio_program_release(p);
     p = compile_name("wdump-normalized.dna", 0, &e); REQUIRE(p != NULL);
     REQUIRE(bio_program_run(p, NULL, 0, &result, &e) && result == -1);
+    bio_program_release(p);
+}
+
+static void register_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    int32_t args[] = {5, 3}, result;
+    char path[256];
+    FILE *dump;
+    /* The register file reaches r255; arithmetic works at any index. */
+    expect_value("GENE main i32\nLOAD r15 40\nLOAD r200 2\nADD r15 r200\nRET r15 _\nEND _ _\n", 42);
+    expect_value("GENE main i32\nLOAD r255 7\nLOAD r254 6\nMUL r255 r254\nRET r255 _\nEND _ _\n", 42);
+    /* CALL arguments travel in 8-bit fields: r12 and r13 arrive intact. */
+    expect_value("GENE main i32\nLOAD r12 30\nLOAD r13 12\nCALL add2 r12,r13\nRET r0 _\nEND _ _\n"
+                 "GENE add2 i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n", 42);
+    /* Registers are frame cells: recursion gives every level a fresh file. */
+    expect_call_arg("GENE rec i32/1\nMOV r40 r0\nLOAD r9 1\nJZ r0 done\nSUB r0 r9\nCALL rec r0\n"
+                    "ADD r0 r40\nRET r0 _\nLABEL done _\nLOAD r0 0\nRET r0 _\nEND _ _\n"
+                    "GENE main i32/1\nCALL rec r0\nRET r0 _\nEND _ _\n", 3, 6);
+    /* Entry arguments land in r0..r3 cells; wide slots stay out of the way. */
+    write_source("rargs.dna", "GENE main i32/2\nMOV r100 r0\nMOV r101 r1\nWLOAD w0 1000000\n"
+                 "MUL r100 r101\nNARROW r0 w0\nADD r0 r100\nRET r0 _\nEND _ _\n");
+    p = compile_name("rargs.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, args, 2, &result, &e) && result == 1000015);
+    REQUIRE(bio_program_interpret(p, args, 2, &result, &e) && result == 1000015);
+    /* The dump keeps multi-digit registers and reparses identically. */
+    path_for(path, sizeof(path), "rargs-normalized.dna");
+    dump = fopen(path, "wb"); REQUIRE(dump != NULL);
+    bio_program_dump(p, dump); REQUIRE(fclose(dump) == 0);
+    bio_program_release(p);
+    p = bio_load(path, 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_interpret(p, args, 2, &result, &e) && result == 1000015);
+    bio_program_release(p);
+    /* Initialization flow tracks all 256 registers. */
+    expect_error("GENE main i32\nRET r9 _\nEND _ _\n", "read of uninitialized register r9");
+    expect_error("GENE main i32\nRET r255 _\nEND _ _\n", "read of uninitialized register r255");
+    expect_error("GENE main i32\nLOAD r0 1\nJZ r0 x\nRET r7 _\nLABEL x _\nRET r8 _\nEND _ _\n",
+                 "read of uninitialized register r7");
+}
+
+static void struct_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    int32_t result;
+    char path[256];
+    FILE *dump;
+    char text[256];
+    size_t got;
+    /* STRUCT is sugar for one-cell locals with dotted names. */
+    expect_value("GENE main i32\nSTRUCT p x,y\nLOAD r1 40\nLOAD r2 2\nSET p.x r1\nSET p.y r2\n"
+                 "GET r3 p.x\nGET r4 p.y\nADD r3 r4\nRET r3 _\nEND _ _\n", 42);
+    /* A struct can sit next to plain locals and feed arrays. */
+    expect_value("GENE main i32\nVAR base 10\nSTRUCT point x,y,z\nGET r1 base\nSET point.y r1\n"
+                 "GET r2 point.y\nADD r1 r2\nRET r1 _\nEND _ _\n", 20);
+    /* The bare struct name is not a local. */
+    expect_error("GENE main i32\nSTRUCT p x\nGET r0 p\nRET r0 _\nEND _ _\n", "undefined local p in gene main");
+    /* Fields are unique locals. */
+    expect_error("GENE main i32\nSTRUCT p x\nVAR p.x 0\nRET r0 _\nEND _ _\n", "duplicate local declaration");
+    expect_error("GENE main i32\nSTRUCT p x,x\nRET r0 _\nEND _ _\n", "duplicate local declaration");
+    expect_error("GENE main i32\nSTRUCT p x\nSTRUCT p x\nRET r0 _\nEND _ _\n", "duplicate local declaration");
+    /* Names follow the local rules; register-like and dotted pieces are rejected. */
+    expect_error("GENE main i32\nSTRUCT r1 x\nRET r0 _\nEND _ _\n", "invalid struct name");
+    expect_error("GENE main i32\nSTRUCT p.q x\nRET r0 _\nEND _ _\n", "invalid struct name");
+    expect_error("GENE main i32\nSTRUCT p _\nRET r0 _\nEND _ _\n", "comma-separated field names");
+    expect_error("GENE main i32\nSTRUCT p a.b\nRET r0 _\nEND _ _\n", "comma-separated field names");
+    /* STRUCT is a declaration: it must precede instructions. */
+    expect_error("GENE main i32\nLOAD r0 1\nSTRUCT p x\nRET r0 _\nEND _ _\n", "must precede all instructions");
+    /* The dump normalizes STRUCT into VAR lines that reparse unchanged. */
+    write_source("sdump.dna", "GENE main i32\nSTRUCT p x,y\nLOAD r1 42\nSET p.y r1\nGET r0 p.y\nRET r0 _\nEND _ _\n");
+    p = compile_name("sdump.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, NULL, 0, &result, &e) && result == 42);
+    REQUIRE(bio_program_interpret(p, NULL, 0, &result, &e) && result == 42);
+    path_for(path, sizeof(path), "sdump-normalized.dna");
+    dump = fopen(path, "wb"); REQUIRE(dump != NULL);
+    bio_program_dump(p, dump); REQUIRE(fclose(dump) == 0);
+    bio_program_release(p);
+    dump = fopen(path, "rb"); REQUIRE(dump != NULL);
+    got = fread(text, 1, sizeof(text) - 1, dump); text[got] = '\0';
+    REQUIRE(fclose(dump) == 0);
+    REQUIRE(strstr(text, "VAR p.x 0") != NULL && strstr(text, "VAR p.y 0") != NULL);
+    p = bio_load(path, 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_interpret(p, NULL, 0, &result, &e) && result == 42);
     bio_program_release(p);
 }
 
@@ -1255,7 +1342,7 @@ static void flow_tests(void) {
     expect_error("GENE main i32\nEND _ _\n", "empty gene");
     expect_error("GENE main i32\nLABEL x 1\n", "'<name> _'");
     expect_error("GENE main i32\nJMP x r0\n", "'<name> _'");
-    expect_error("GENE main i32\nJZ r8 x\n", "'rN <label>'");
+    expect_error("GENE main i32\nJZ r256 x\n", "'rN <label>'");
 }
 
 static void expect_budget_failure(BioProgram *p, const int32_t *args, size_t argc) {
@@ -1583,6 +1670,8 @@ int main(void) {
     print_tests();
     recursion_tests();
     wide_tests();
+    register_tests();
+    struct_tests();
     flow_tests();
     loop_budget_tests();
     loop_runtime_tests();

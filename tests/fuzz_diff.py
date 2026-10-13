@@ -23,7 +23,8 @@ BIN_OPS = ("ADD", "SUB", "MUL", "AND", "OR", "XOR", "LAND", "LOR", "LXOR", "EQ",
 RISKY_OPS = ("DIV", "MOD", "SHL", "SHR", "SAR")
 UN_OPS = ("NOT", "LNOT")
 FILLABLE_HEADS = ("RET", "END", "NOT", "LNOT", "LABEL", "JMP", "PRINT", "WNOT")
-REGS = tuple(f"r{i}" for i in range(8))
+# Mostly small registers, with occasional high ones to exercise 8-bit packing.
+REGS = tuple(f"r{i}" for i in range(12)) + ("r200", "r255")
 STRING_CHARS = "abz AZ019._-#"
 WIDE_POOL = (0, 1, -1, 2, 63, 64, 2147483647, 2147483648, -2147483648, -2147483649,
              4611686018427387904, -9223372036854775808, 9223372036854775807)
@@ -102,14 +103,22 @@ class Gene:
 
     def gen_decls(self):
         for i in range(self.rng.randint(0, 3)):
-            if self.rng.random() < 0.5:
+            roll = self.rng.random()
+            if roll < 0.35:
                 value = self.rng.randint(-100, 100)
                 self.vars.append((f"v{i}", value))
                 self.emit(f"VAR v{i} {value}")
-            else:
+            elif roll < 0.7:
                 length = self.rng.randint(1, 8)
                 self.arrays.append((f"a{i}", length))
                 self.emit(f"ARRAY a{i} {length}")
+            else:
+                # STRUCT is sugar: one-cell locals with dotted names.
+                count = self.rng.randint(1, 3)
+                fields = ",".join(f"f{j}" for j in range(count))
+                self.emit(f"STRUCT s{i} {fields}")
+                for j in range(count):
+                    self.vars.append((f"s{i}.f{j}", 0))
         # An array call needs a local array with a compile-time known length.
         if any(c[2] for c in self.callees) and not self.local_arrays():
             self.arrays.append(("buf", 8))

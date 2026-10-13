@@ -289,17 +289,21 @@ int bio_print_helper(BioExecution *execution, uint32_t handle, uint32_t node) {
 static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_t *args,
                                BioExecution *execution, uint32_t *memory,
                                uint32_t *array, uint32_t array_count) {
-    uint32_t r[8] = {0};
-    uint64_t w[4] = {0}; /* Wide registers w0-w3: bits; signed reads via wide_signed. */
     const BioGene *g = &p->genes[gene];
+    /* Registers are the tail of the locals frame; the JIT addresses them the
+       same way, so a fresh call gets a fresh register file for free. */
+    uint32_t *r = memory + g->reg_base;
+    uint64_t w[4] = {0}; /* Wide registers w0-w3: bits; signed reads via wide_signed. */
     unsigned i;
     const CodonNode *n;
-    for (i = 0; i < g->arity; ++i) r[i] = args[i];
-    for (i = 0; i < g->local_cells; ++i) {
+    /* Declared locals are zeroed (and charged); registers are not: validation
+       proves they are written before read, and the JIT never zeroed them. */
+    for (i = 0; i < g->reg_base; ++i) {
         if (!execution->remaining) return interpreter_fault(execution, g->head, BIO_FAULT_BUDGET);
         --execution->remaining;
         memory[i] = 0;
     }
+    for (i = 0; i < g->arity; ++i) r[i] = args[i];
     for (i = 0; i < g->local_count; ++i)
         if (!g->locals[i].is_array) memory[g->locals[i].offset] = g->locals[i].initial;
     n = g->head->next;
@@ -395,11 +399,12 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
             if (signed_value(r[n->arg1]) < signed_value(r[n->arg2])) r[n->arg1] = r[n->arg2];
             break;
         case OP_CALL: {
-            unsigned argc = n->arg2 >> 16, i;
+            /* The callee's arity says how many 8-bit register fields are live. */
+            unsigned argc = p->genes[n->arg1].arity, i;
             uint32_t passed_args[4] = {0, 0, 0, 0};
             uint32_t *passed = NULL;
             uint32_t need = p->genes[n->arg1].local_cells;
-            for (i = 0; i < argc; ++i) passed_args[i] = r[(n->arg2 >> (3 * i)) & 7u];
+            for (i = 0; i < argc; ++i) passed_args[i] = r[(n->arg2 >> (8 * i)) & 255u];
             if (n->call_array) {
                 const BioLocal *local = &g->locals[n->call_array - 1u];
                 uint32_t capacity = local->is_parameter ? array_count : local->count;
@@ -680,12 +685,12 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
             if (n->op_code == OP_QUARANTINE)
                 fputs("QUARANTINE _ _", out);
             else if (n->op_code == OP_CALL) {
-                unsigned argc = n->arg2 >> 16, k;
+                unsigned argc = p->genes[n->arg1].arity, k;
                 fprintf(out, "CALL %s ", p->genes[n->arg1].name);
                 if (n->call_array) fprintf(out, "%s,", p->symbols[g->locals[n->call_array - 1u].symbol]);
                 if (!argc) fputc('_', out);
                 else for (k = 0; k < argc; ++k)
-                    fprintf(out, "%sr%u", k ? "," : "", (n->arg2 >> (3 * k)) & 7u);
+                    fprintf(out, "%sr%u", k ? "," : "", (n->arg2 >> (8 * k)) & 255u);
             } else if (n->op_code == OP_PARAM)
                 fprintf(out, "PARAM %s r0", p->symbols[n->arg1]);
             else if (n->op_code == OP_VAR || n->op_code == OP_ARRAY)
