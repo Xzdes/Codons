@@ -26,7 +26,8 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
                     if (!bio_quarantine(p, n, "CALL target is undefined", e)) return 0;
                     continue;
                 }
-                bio_node_error(p, n, e, "undefined gene: %s", p->symbols[n->arg1]); return 0;
+                bio_node_error(p, n, e, "undefined gene: %s (declare it: GENE %s i32/N ... END _ _, or fix the name)",
+                               p->symbols[n->arg1], p->symbols[n->arg1]); return 0;
             }
             if (p->genes[target].arity != argc) {
                 if (p->repair_mode) {
@@ -76,7 +77,8 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
                     if (!bio_quarantine(p, n, "branch target label is undefined", e)) return 0;
                     continue;
                 }
-                bio_node_error(p, n, e, "undefined label %s in gene %s", p->symbols[target], g->name);
+                bio_node_error(p, n, e, "undefined label %s in gene %s (labels are per-gene; add LABEL %s _)",
+                               p->symbols[target], g->name, p->symbols[target]);
                 return 0;
             }
         } else if (n->op_code >= OP_GET && n->op_code <= OP_WRITE) {
@@ -90,7 +92,9 @@ static int link_gene(BioProgram *p, BioGene *g, BioError *e) {
                     if (!bio_quarantine(p, n, "local name is undefined", e)) return 0;
                     continue;
                 }
-                bio_node_error(p, n, e, "undefined local %s in gene %s", p->symbols[target], g->name);
+                bio_node_error(p, n, e, "undefined local %s in gene %s (declare it after GENE, before the first "
+                               "instruction: VAR %s 0 or ARRAY %s 8)", p->symbols[target], g->name,
+                               p->symbols[target], p->symbols[target]);
                 return 0;
             }
             if (g->locals[i].is_array != array) {
@@ -257,10 +261,13 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
                 goto done;
             }
             if (r < g->reg_count)
-                bio_node_error(p, n, e, "read of uninitialized register r%u on a reachable path", r);
+                bio_node_error(p, n, e, "read of uninitialized register r%u on a reachable path "
+                               "(write it before this point on every path, e.g. LOAD r%u 0 "
+                               "right after GENE or before the loop)", r, r);
             else
-                bio_node_error(p, n, e, "read of uninitialized wide register w%u on a reachable path",
-                               r - g->reg_count);
+                bio_node_error(p, n, e, "read of uninitialized wide register w%u on a reachable path "
+                               "(write it before this point on every path, e.g. WLOAD w%u 0)",
+                               r - g->reg_count, r - g->reg_count);
             goto fail;
         }
         if (n->op_code == OP_JMP || n->op_code == OP_JZ || n->op_code == OP_JNZ ||

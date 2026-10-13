@@ -459,6 +459,33 @@ class CliTests(unittest.TestCase):
         late = self.source("GENE main i32\nLOAD r0 1\nSTRUCT p x\nRET r0 _\nEND _ _\n", "late.dna")
         self.assertIn("must precede all instructions", self.call("check", late, code=1).stderr)
 
+    def test_error_hints_and_line_text(self):
+        # JSON errors carry the offending source line, so an agent sees what it wrote.
+        src = self.source("GENE main i32\nLOAD r0 1\nADD r0 r1\nRET r0 _\nEND _ _\n", "hint.dna")
+        data = json.loads(self.call("check", src, "--json", code=1).stdout)
+        self.assertIn("read of uninitialized register r1", data["error"]["message"])
+        self.assertIn("LOAD r1 0", data["error"]["message"])
+        self.assertEqual(data["error"]["line_text"], "ADD r0 r1")
+        # The comma-space slip (CALL add r1, r2) gets an actionable hint.
+        comma = self.source("GENE add i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n"
+                            "GENE main i32\nLOAD r1 1\nLOAD r2 2\nCALL add r1, r2\nRET r0 _\nEND _ _\n",
+                            "comma.dna")
+        data = json.loads(self.call("check", comma, "--json", code=1).stdout)
+        self.assertIn("never put a space after a comma", data["error"]["message"])
+        self.assertEqual(data["error"]["line_text"], "CALL add r1, r2")
+        # A comma inside a field points at the same rule.
+        inner = self.source("GENE main i32\nLOAD r0 1\nLOAD r1 2\nADD r0, r1\nRET r0 _\nEND _ _\n",
+                            "inner.dna")
+        self.assertIn("no comma here", self.call("check", inner, code=1).stderr)
+        # Undefined names explain how to declare them.
+        undef = self.source("GENE main i32\nLOAD r0 1\nCALL oops r0\nRET r0 _\nEND _ _\n", "undef.dna")
+        self.assertIn("GENE oops", self.call("check", undef, code=1).stderr)
+        # line_text stays absent (and JSON valid) for a damaged source.
+        damaged = self.root / "damaged.dna"
+        damaged.write_bytes(b"GENE main i32\n\xff\xfe\n")
+        data = json.loads(self.call("check", damaged, "--json", code=1).stdout)
+        self.assertNotIn("line_text", data["error"])
+
     def test_print_faults_and_repair(self):
         source = self.source("GENE main i32\nLOAD r1 7\nPRINT r1 _\nRET r1 _\nEND _ _\n")
         messages = []

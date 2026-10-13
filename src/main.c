@@ -58,10 +58,64 @@ void cli_json_string(const char *s) {
     putchar('"');
 }
 
+/* Errors from the compiler/runtime read "path:line: text". For JSON consumers
+   (often LLM agents) we attach the offending source line as "line_text" so the
+   model sees what it wrote without re-reading the file. */
+static void print_line_text(const char *message) {
+    const char *colon = message;
+    char path[1024];
+    char line_buf[1200], *start;
+    unsigned long line_no = 0;
+    size_t length;
+    FILE *f;
+    for (;;) { /* Paths may contain ':' (drive letters); need ':' + digits + ': '. */
+        colon = strchr(colon, ':');
+        if (!colon) return;
+        if (colon[1] >= '0' && colon[1] <= '9') {
+            char *end = NULL;
+            line_no = strtoul(colon + 1, &end, 10);
+            if (end && end[0] == ':' && end[1] == ' ') break;
+        }
+        ++colon;
+    }
+    length = (size_t)(colon - message);
+    if (!length || length >= sizeof(path)) return;
+    memcpy(path, message, length); path[length] = '\0';
+    f = bio_fopen(path, L"rb");
+    if (!f) return;
+    while (line_no && fgets(line_buf, sizeof(line_buf), f)) --line_no;
+    fclose(f);
+    if (line_no) return;
+    start = line_buf;
+    if ((unsigned char)start[0] == 0xef && (unsigned char)start[1] == 0xbb &&
+        (unsigned char)start[2] == 0xbf) start += 3;
+    length = strlen(start);
+    while (length && (start[length - 1] == '\n' || start[length - 1] == '\r'))
+        start[--length] = '\0';
+    /* A damaged line is not valid UTF-8; never break the JSON with raw bytes. */
+    {
+        const unsigned char *s = (const unsigned char *)start;
+        int valid = 1;
+        while (*s && valid) {
+            if (*s < 0x80) { ++s; continue; }
+            if ((*s & 0xe0u) == 0xc0u && (s[1] & 0xc0u) == 0x80u && s[1]) s += 2;
+            else if ((*s & 0xf0u) == 0xe0u && (s[1] & 0xc0u) == 0x80u && s[1] &&
+                     (s[2] & 0xc0u) == 0x80u && s[2]) s += 3;
+            else if ((*s & 0xf8u) == 0xf0u && (s[1] & 0xc0u) == 0x80u && s[1] &&
+                     (s[2] & 0xc0u) == 0x80u && s[2] && (s[3] & 0xc0u) == 0x80u && s[3]) s += 4;
+            else valid = 0;
+        }
+        if (!valid) return;
+    }
+    fputs(",\"line_text\":", stdout); cli_json_string(start);
+}
+
 static int failure(int json, const char *stage, const char *message, int code) {
     if (json) {
         fputs("{\"ok\":false,\"error\":{\"stage\":", stdout); cli_json_string(stage);
-        fputs(",\"message\":", stdout); cli_json_string(message); puts("}}");
+        fputs(",\"message\":", stdout); cli_json_string(message);
+        print_line_text(message);
+        puts("}}");
     } else fprintf(stderr, "%s\n", message);
     return code;
 }
@@ -276,7 +330,9 @@ static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
     if (!ok[0]) {
         if (o->json) {
             fputs("{\"ok\":false,\"verified\":true,\"error\":{\"stage\":\"run\",\"message\":", stdout);
-            cli_json_string(errors[0].message); puts("}}");
+            cli_json_string(errors[0].message);
+            print_line_text(errors[0].message);
+            puts("}}");
         } else fprintf(stderr, "verified: JIT and interpreter agree on the failure\n%s\n", errors[0].message);
         goto done;
     }

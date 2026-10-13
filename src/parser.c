@@ -272,6 +272,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
     while ((status = read_line(p, f, line, e)) > 0) {
         char *fields[4], *cursor = line, *comment;
         unsigned count = 0;
+        int comma_space = 0;
         CodonNode *n, *previous;
         int a, b;
         location.line++;
@@ -286,6 +287,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
                     comment += (*comment == '\\' && comment[1]) ? 2 : 1;
                 if (!*comment) break;
             } else if (*comment == '#') { *comment = '\0'; break; }
+            else if (*comment == ',' && comment[1] == ' ') comma_space = 1;
         }
         while (*cursor) {
             while (isspace((unsigned char)*cursor)) ++cursor;
@@ -323,6 +325,10 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
                 if (!bio_quarantine(p, n, "codon does not contain exactly three fields", e)) goto fail;
                 continue;
             }
+            if (comma_space)
+                FAIL("expected exactly 3 fields; found %u: never put a space after a comma (write r1,r2)", count);
+            if (count < 3)
+                FAIL("expected exactly 3 fields; found %u: fill unused fields with _ (e.g. RET r0 _)", count);
             FAIL("expected exactly 3 fields; found %u", count);
         }
         if (strcmp(fields[0], "IMPORT") == 0) {
@@ -408,7 +414,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
                 if (sym < 0) QUARANTINE("symbol budget exceeded");
                 for (i = 0; i < current->local_count; ++i)
                     if (current->locals[i].symbol == (uint32_t)sym)
-                        QUARANTINE("duplicate local declaration");
+                        QUARANTINE("duplicate local declaration (names are per-gene; rename one)");
                 if (current->local_count == BIO_MAX_LOCALS)
                     QUARANTINE("local declaration limit exceeded");
                 if (current->local_cells + 1u > BIO_MAX_LOCAL_CELLS)
@@ -457,7 +463,8 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             sym = symbol(p, fields[1]);
             if (sym < 0) QUARANTINE("symbol budget exceeded");
             for (i = 0; i < current->local_count; ++i)
-                if (current->locals[i].symbol == (uint32_t)sym) QUARANTINE("duplicate local declaration");
+                if (current->locals[i].symbol == (uint32_t)sym)
+                    QUARANTINE("duplicate local declaration (names are per-gene; rename one)");
             if (current->local_count == BIO_MAX_LOCALS) QUARANTINE("local declaration limit exceeded");
             if (current->local_cells + (is_array ? (uint32_t)value : 1u) > BIO_MAX_LOCAL_CELLS)
                 QUARANTINE("local storage limit exceeded");
@@ -559,7 +566,8 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
                     first = 1;
                 }
                 argc = count - first;
-                if (argc > 4) QUARANTINE("CALL accepts at most four register arguments");
+                if (argc > 4) QUARANTINE("CALL accepts at most four register arguments "
+                                         "(pass bulk data via an array: CALL f items,r0)");
                 for (i = 0; i < argc; ++i) {
                     regs[i] = reg(parts[first + i]);
                     if (regs[i] < 0) QUARANTINE("invalid CALL operands");
@@ -658,7 +666,12 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
             if (wide_index < sizeof(wide_binary) / sizeof(wide_binary[0])) continue;
         }
         a = reg(fields[1]);
-        if (a < 0) QUARANTINE("first operand must be a register r0..r255");
+        if (a < 0) {
+            if (strchr(fields[1], ','))
+                QUARANTINE("first operand must be a register r0..r255 (no comma here; commas join "
+                           "operands inside one field, e.g. AGET r0 items,r1)");
+            QUARANTINE("first operand must be a register r0..r255");
+        }
         n->arg1 = (uint32_t)a;
         if (strcmp(fields[0], "LOAD") == 0) {
             char *end;
