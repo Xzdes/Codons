@@ -117,8 +117,8 @@ static void language_tests(void) {
     expect_error("GENE main i32/1\nRET r1 _\nEND _ _\n", "uninitialized register");
     expect_error("GENE main i32\nCALL missing _\nRET r0 _\nEND _ _\n", "undefined gene");
     expect_error("GENE main i32\nCALL main r0\nRET r0 _\nEND _ _\n", "expects 0 arguments");
-    expect_error("GENE main i32\nCALL main _\nRET r0 _\nEND _ _\n", "recursive call cycle");
-    expect_error("GENE main i32\nCALL a _\nRET r0 _\nEND _ _\nGENE a i32\nCALL main _\nRET r0 _\nEND _ _\n", "recursive call cycle");
+    /* Recursion is legal since 0.14; unbounded recursion dies on the depth limit
+       (recursion_tests), so only the arity check remains here. */
     expect_error("GENE main i32\nLOAD r0 1\nRET r0 _\nLOAD r1 1\nEND _ _\n", "after RET");
     expect_error("GENE main i32\nLOAD r0 1\nEND _ _\n", "must end with RET");
     expect_error("GENE main i32\nLOAD r0 1\nRET r0 _\n", "missing END");
@@ -1020,6 +1020,95 @@ static void print_tests(void) {
     bio_program_release(p);
 }
 
+/* Recursion (0.14): one argument in, one result out, both backends agree. */
+static void expect_call_arg(const char *source, int32_t arg, int32_t expected) {
+    BioError e = {{0}}, ie = {{0}};
+    BioProgram *p;
+    int32_t result = 0;
+    write_source("rec.dna", source);
+    p = compile_name("rec.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, &arg, 1, &result, &e)); REQUIRE(result == expected);
+    result = 0;
+    REQUIRE(bio_program_interpret(p, &arg, 1, &result, &ie)); REQUIRE(result == expected);
+    bio_program_release(p);
+}
+
+static void expect_call_arg_failure(const char *source, int32_t arg, const char *message) {
+    BioError e = {{0}}, ie = {{0}};
+    BioProgram *p;
+    int32_t result = 77;
+    write_source("recfail.dna", source);
+    p = compile_name("recfail.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(!bio_program_run(p, &arg, 1, &result, &e));
+    REQUIRE(strstr(e.message, message) != NULL);
+    REQUIRE(!bio_program_interpret(p, &arg, 1, &result, &ie));
+    REQUIRE(!strcmp(e.message, ie.message));
+    bio_program_release(p);
+}
+
+static void recursion_tests(void) {
+    BioError e = {{0}};
+    BioProgram *p;
+    BioStats s;
+    /* Direct self-recursion: factorial. */
+    const char *fact =
+        "GENE fact i32/1\nLOAD r1 1\nJZ r0 base\nMOV r2 r0\nSUB r0 r1\nCALL fact r0\n"
+        "MUL r2 r0\nMOV r0 r2\nRET r0 _\nLABEL base _\nLOAD r0 1\nRET r0 _\nEND _ _\n"
+        "GENE main i32/1\nCALL fact r0\nRET r0 _\nEND _ _\n";
+    /* Mutual recursion: even/odd. */
+    const char *evenodd =
+        "GENE even i32/1\nLOAD r1 1\nJZ r0 yes\nSUB r0 r1\nCALL odd r0\nRET r0 _\n"
+        "LABEL yes _\nLOAD r0 1\nRET r0 _\nEND _ _\n"
+        "GENE odd i32/1\nLOAD r1 1\nJZ r0 no\nSUB r0 r1\nCALL even r0\nRET r0 _\n"
+        "LABEL no _\nLOAD r0 0\nRET r0 _\nEND _ _\n"
+        "GENE main i32/1\nCALL even r0\nRET r0 _\nEND _ _\n";
+    /* Every frame owns fresh locals: the array survives the child call. */
+    const char *sumrec =
+        "GENE rec i32/1\nARRAY buf 8\nLOAD r1 0\nLOAD r2 1\nJZ r0 done\nASET buf r1,r0\n"
+        "SUB r0 r2\nCALL rec r0\nAGET r3 buf,r1\nADD r0 r3\nRET r0 _\n"
+        "LABEL done _\nLOAD r0 0\nRET r0 _\nEND _ _\n"
+        "GENE main i32/1\nCALL rec r0\nRET r0 _\nEND _ _\n";
+    /* VAR initials are per frame, not shared storage. */
+    const char *varrec =
+        "GENE rec i32/1\nVAR v 41\nLOAD r1 1\nJZ r0 done\nSUB r0 r1\nCALL rec r0\n"
+        "GET r2 v\nADD r0 r2\nRET r0 _\nLABEL done _\nLOAD r0 0\nRET r0 _\nEND _ _\n"
+        "GENE main i32/1\nCALL rec r0\nRET r0 _\nEND _ _\n";
+    /* Boundary probe: main + 255 nested frames is exactly the depth limit. */
+    const char *countdown =
+        "GENE rec i32/1\nLOAD r1 1\nJZ r0 done\nSUB r0 r1\nCALL rec r0\nRET r0 _\n"
+        "LABEL done _\nRET r0 _\nEND _ _\n"
+        "GENE main i32/1\nCALL rec r0\nRET r0 _\nEND _ _\n";
+    /* 4096-cell frames exhaust the 1 MiB pool after 64 levels, before depth 256. */
+    const char *bigframes =
+        "GENE rec i32/1\nARRAY buf 4096\nLOAD r1 1\nSUB r0 r1\nCALL rec r0\nRET r0 _\nEND _ _\n"
+        "GENE main i32/1\nCALL rec r0\nRET r0 _\nEND _ _\n";
+    expect_call_arg(fact, 0, 1); expect_call_arg(fact, 1, 1);
+    expect_call_arg(fact, 5, 120); expect_call_arg(fact, 10, 3628800);
+    expect_call_arg(evenodd, 10, 1); expect_call_arg(evenodd, 7, 0);
+    expect_call_arg(sumrec, 0, 0); expect_call_arg(sumrec, 3, 6); expect_call_arg(sumrec, 100, 5050);
+    expect_call_arg(varrec, 2, 82);
+    expect_call_arg(countdown, 0, 0);
+    expect_call_arg(countdown, 254, 0);
+    expect_call_arg_failure(countdown, 255, "call depth limit reached (256 active genes)");
+    expect_call_arg_failure(bigframes, 1000000,
+                            "call frame memory exhausted: need 4096 more cells, 0 left this run");
+    expect_run_failure("GENE main i32\nCALL main _\nRET r0 _\nEND _ _\n", "call depth limit reached");
+    expect_run_failure("GENE main i32\nCALL a _\nRET r0 _\nEND _ _\n"
+                       "GENE a i32\nCALL main _\nRET r0 _\nEND _ _\n", "call depth limit reached");
+    /* A recursive program reports dynamic steps; an acyclic chain stays exact. */
+    write_source("recstats.dna", fact);
+    p = compile_name("recstats.dna", 0, &e); REQUIRE(p != NULL);
+    s = bio_program_stats(p);
+    REQUIRE(s.dynamic_steps == 1);
+    bio_program_release(p);
+    write_source("recstats.dna", "GENE main i32\nCALL a _\nRET r0 _\nEND _ _\n"
+                 "GENE a i32\nLOAD r0 7\nRET r0 _\nEND _ _\n");
+    p = compile_name("recstats.dna", 0, &e); REQUIRE(p != NULL);
+    s = bio_program_stats(p);
+    REQUIRE(!s.dynamic_steps && s.execution_steps > 0);
+    bio_program_release(p);
+}
+
 static void string_tests(void) {
     BioError e = {{0}};
     BioProgram *p;
@@ -1250,6 +1339,7 @@ static void budget_tests(void) {
     FILE *f;
     BioProgram *p;
     BioError e = {{0}};
+    int32_t result = 77;
     unsigned i;
     path_for(path, sizeof(path), "budget.dna");
     f = fopen(path, "wb"); REQUIRE(f != NULL);
@@ -1258,17 +1348,25 @@ static void budget_tests(void) {
     fputs("RET r0 _\nEND _ _\n", f); REQUIRE(fclose(f) == 0);
     p = compile_name("budget.dna", 0, &e);
     REQUIRE(p == NULL && strstr(e.message, "node budget"));
+    /* A static chain exactly at the runtime depth limit compiles and runs:
+       the old compile-time depth cap is gone, the runtime limit allows 256. */
     f = fopen(path, "wb"); REQUIRE(f != NULL);
     fputs("GENE main i32\nCALL g0 _\nRET r0 _\nEND _ _\n", f);
-    for (i = 0; i < BIO_MAX_DEPTH; ++i) {
+    for (i = 0; i + 1 < BIO_MAX_DEPTH; ++i) {
         fprintf(f, "GENE g%u i32\n", i);
-        if (i + 1 < BIO_MAX_DEPTH) fprintf(f, "CALL g%u _\n", i + 1);
+        if (i + 2 < BIO_MAX_DEPTH) fprintf(f, "CALL g%u _\n", i + 1);
         else fputs("LOAD r0 1\n", f);
         fputs("RET r0 _\nEND _ _\n", f);
     }
     REQUIRE(fclose(f) == 0);
-    p = compile_name("budget.dna", 0, &e);
-    REQUIRE(p == NULL && strstr(e.message, "call depth"));
+    p = compile_name("budget.dna", 0, &e); REQUIRE(p != NULL);
+    REQUIRE(bio_program_run(p, NULL, 0, &result, &e) && result == 1);
+    {
+        BioError ie = {{0}};
+        result = 0;
+        REQUIRE(bio_program_interpret(p, NULL, 0, &result, &ie) && result == 1);
+    }
+    bio_program_release(p);
     f = fopen(path, "wb"); REQUIRE(f != NULL);
     for (i = 0; i < BIO_LINE_SIZE; ++i) fputc(' ', f);
     REQUIRE(fclose(f) == 0);
@@ -1423,6 +1521,7 @@ int main(void) {
     wide_call_tests();
     string_tests();
     print_tests();
+    recursion_tests();
     flow_tests();
     loop_budget_tests();
     loop_runtime_tests();

@@ -13,7 +13,7 @@
 #define BIO_MAX_FILES 64u
 #define BIO_MAX_NODES 65536u
 #define BIO_MAX_REPAIRS 1024u
-#define BIO_MAX_DEPTH 64u
+#define BIO_MAX_DEPTH 256u /* Active call frames at run time; recursion included. */
 #define BIO_IMPORT_DEPTH 16u
 #define BIO_LINE_SIZE 512u
 #define BIO_PATH_SIZE 1024u
@@ -22,7 +22,8 @@
 #define BIO_MAX_SOURCE_BYTES (4u * 1024u * 1024u)
 #define BIO_MAX_LOCALS 64u
 #define BIO_MAX_LOCAL_CELLS 65536u
-#define BIO_MEMORY_CELLS 262144u /* 1 MiB of i32 storage across an active call chain. */
+#define BIO_MEMORY_CELLS 262144u /* 1 MiB of i32 storage across an active call chain.
+    For recursive programs this is the fixed frame pool, checked at every CALL. */
 #define BIO_STACK_SIZE 104u
 #define BIO_MAX_LITERALS 1024u
 #define BIO_LITERAL_BYTES (256u * 1024u)
@@ -102,7 +103,8 @@ typedef enum {
     BIO_FAULT_INPUT, BIO_FAULT_OUTPUT, BIO_FAULT_READ_SIZE,
     BIO_FAULT_WRITE_SIZE, BIO_FAULT_OUTPUT_SIZE, BIO_FAULT_ARGUMENT_SIZE, BIO_FAULT_QUARANTINE,
     BIO_FAULT_STRING_HANDLE, BIO_FAULT_STRING_BUDGET, BIO_FAULT_STRING_BOUNDS,
-    BIO_FAULT_STRING_TABLE, BIO_FAULT_PRINT_CAPABILITY, BIO_FAULT_PRINT_FAILED
+    BIO_FAULT_STRING_TABLE, BIO_FAULT_PRINT_CAPABILITY, BIO_FAULT_PRINT_FAILED,
+    BIO_FAULT_DEPTH, BIO_FAULT_FRAME
 } BioFault;
 
 /* Immutable byte string. Literals point into the program's literal pool;
@@ -142,6 +144,12 @@ typedef struct {
     /* Host capability for PRINT: NULL forbids printing in this invocation. */
     int (*print)(void *user, const unsigned char *bytes, size_t length);
     void *print_user;
+    /* Call frame accounting: frame_used cells are live below the current gene,
+       depth counts active genes. Both backends check and bump these at CALL. */
+    uint32_t frame_used;
+    uint32_t depth;
+    uint32_t frame_cells;
+    uint32_t reserved3;
 } BioExecution;
 
 _Static_assert(offsetof(BioExecution, remaining) == 0, "JIT budget offset");
@@ -162,6 +170,9 @@ _Static_assert(offsetof(BioExecution, pool_used) == 88, "JIT pool used offset");
 _Static_assert(offsetof(BioExecution, pool_capacity) == 92, "JIT pool capacity offset");
 _Static_assert(offsetof(BioExecution, print) == 96, "JIT print capability offset");
 _Static_assert(offsetof(BioExecution, print_user) == 104, "JIT print user offset");
+_Static_assert(offsetof(BioExecution, frame_used) == 112, "JIT frame used offset");
+_Static_assert(offsetof(BioExecution, depth) == 116, "JIT call depth offset");
+_Static_assert(offsetof(BioExecution, frame_cells) == 120, "JIT frame capacity offset");
 
 struct BioProgram {
     volatile LONG references;
@@ -183,6 +194,7 @@ struct BioProgram {
     uint8_t *literal_pool;
     size_t literal_pool_used;
     unsigned uses_strings;   /* Any string opcode or literal in the program. */
+    unsigned has_recursion;  /* A call cycle exists: frame pool is runtime-checked. */
     unsigned char *code;
     size_t allocation_size;
     RUNTIME_FUNCTION *unwind_table;

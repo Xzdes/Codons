@@ -85,7 +85,7 @@ class CliTests(unittest.TestCase):
             (program("LOAD r0 0\n", "PARAM p r0\nGET r0 p\nRET r0 _\n"), "requires a variable"),
             (program("LOAD r0 0\n", "PARAM p r0\nSET p r0\nRET r0 _\n"), "requires a variable"),
             (program("LOAD r0 0\n", "PARAM p\nRET r0 _\n"), "exactly 3 fields"),
-            (program("LOAD r0 0\n", "PARAM p r0\nCALL f p,r0\nRET r0 _\n"), "recursive call cycle"),
+            # 0.14: recursion is legal; a dead self-caller compiles and never runs.
             (program("LOAD r0 0\n", "PARAM p r0\n" + "VAR v 0\n"), "must end with RET"),
         ]
         for operands in ("a", "a,", "a,_", "a,r0,", "a,b,r0", "_,r0"):
@@ -173,7 +173,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("*.tmp")))
 
     def test_help_and_version(self):
-        self.assertIn("Codons 0.13.0", self.call("--version").stdout)
+        self.assertIn("Codons 0.14.0", self.call("--version").stdout)
         self.assertIn("codons new", self.call().stdout)
         self.assertIn("--json", self.call("--help").stdout)
 
@@ -336,6 +336,37 @@ class CliTests(unittest.TestCase):
         plain = self.source("GENE main i32\nLOAD r0 1\nRET r0 _\nEND _ _\n", "plain.dna")
         data = json.loads(self.call("run", plain, "--json").stdout)
         self.assertEqual(data["printed"], "")
+
+    def test_recursion_runtime_limits(self):
+        fact = self.source(
+            "GENE fact i32/1\nLOAD r1 1\nJZ r0 base\nMOV r2 r0\nSUB r0 r1\nCALL fact r0\n"
+            "MUL r2 r0\nMOV r0 r2\nRET r0 _\nLABEL base _\nLOAD r0 1\nRET r0 _\nEND _ _\n"
+            "GENE main i32/1\nCALL fact r0\nRET r0 _\nEND _ _\n")
+        for command in ("run", "interpret"):
+            self.assertEqual(self.call(command, fact, "5").stdout.strip(), "120")
+        self.assertEqual(self.call("verify", fact, "5").stdout.strip(), "120")
+        data = json.loads(self.call("check", fact, "--json").stdout)
+        self.assertTrue(data["stats"]["dynamic_steps"])
+        # Dead code may recurse: the cycle in pruned gene f never executes.
+        dead = self.source("GENE main i32\nLOAD r0 0\nRET r0 _\nEND _ _\n"
+                           "GENE f i32/1\nPARAM p r0\nCALL f p,r0\nRET r0 _\nEND _ _\n", "dead.dna")
+        self.assertEqual(self.call("run", dead).stdout.strip(), "0")
+        # Unbounded recursion dies identically in both engines, with file and line.
+        bomb = self.source("GENE main i32\nCALL main _\nRET r0 _\nEND _ _\n", "bomb.dna")
+        messages = []
+        for command in ("run", "interpret"):
+            data = json.loads(self.call(command, bomb, "--json", code=1).stdout)
+            self.assertIn("call depth limit reached (256 active genes)", data["error"]["message"])
+            self.assertIn(f"{bomb}:2:", data["error"]["message"])
+            messages.append(data["error"]["message"])
+        self.assertEqual(*messages)
+        # Large per-frame arrays exhaust the 1 MiB frame pool before the depth limit.
+        frames = self.source("GENE rec i32/1\nARRAY buf 4096\nLOAD r1 1\nSUB r0 r1\nCALL rec r0\nRET r0 _\nEND _ _\n"
+                             "GENE main i32/1\nCALL rec r0\nRET r0 _\nEND _ _\n", "frames.dna")
+        for command in ("run", "interpret"):
+            data = json.loads(self.call(command, frames, "1000000", "--json", code=1).stdout)
+            self.assertIn("call frame memory exhausted", data["error"]["message"])
+            self.assertIn(f"{frames}:5:", data["error"]["message"])
 
     def test_print_faults_and_repair(self):
         source = self.source("GENE main i32\nLOAD r1 7\nPRINT r1 _\nRET r1 _\nEND _ _\n")

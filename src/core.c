@@ -214,6 +214,13 @@ static int execution_ok(const BioProgram *p, const BioExecution *execution, BioE
         message = "PRINT requires a host print capability"; break;
     case BIO_FAULT_PRINT_FAILED:
         message = "the host print callback failed"; break;
+    case BIO_FAULT_DEPTH:
+        snprintf(detail, sizeof(detail), "call depth limit reached (%u active genes)", BIO_MAX_DEPTH);
+        message = detail; break;
+    case BIO_FAULT_FRAME:
+        snprintf(detail, sizeof(detail), "call frame memory exhausted: need %ld more cells, %u left this run",
+                 (long)execution->bad_index, execution->bound);
+        message = detail; break;
     case BIO_FAULT_QUARANTINE:
         message = "quarantined repaired codon reached; inspect the repair report"; break;
     default: message = "unknown execution error"; break;
@@ -378,6 +385,7 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
             unsigned argc = n->arg2 >> 16, i;
             uint32_t passed_args[4] = {0, 0, 0, 0};
             uint32_t *passed = NULL;
+            uint32_t need = p->genes[n->arg1].local_cells;
             for (i = 0; i < argc; ++i) passed_args[i] = r[(n->arg2 >> (3 * i)) & 7u];
             if (n->call_array) {
                 const BioLocal *local = &g->locals[n->call_array - 1u];
@@ -388,9 +396,19 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
                 }
                 passed = local->is_parameter ? array : memory + local->offset;
             }
+            /* Recursion is bounded here: depth and frame cells are runtime limits. */
+            if (execution->depth >= BIO_MAX_DEPTH)
+                return interpreter_fault(execution, n, BIO_FAULT_DEPTH);
+            if (need > execution->frame_cells - execution->frame_used) {
+                execution->bad_index = (int32_t)need;
+                execution->bound = execution->frame_cells - execution->frame_used;
+                return interpreter_fault(execution, n, BIO_FAULT_FRAME);
+            }
+            execution->frame_used += need; ++execution->depth;
             r[0] = interpret_gene(p, n->arg1, passed_args, execution,
                                   g->local_cells ? memory + g->local_cells : memory,
                                   passed, n->call_array ? passed_args[0] : 0);
+            execution->frame_used -= need; --execution->depth;
             if (execution->failed_node != UINT32_MAX) return 0;
             break;
         }
@@ -501,8 +519,12 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
         return 0;
     }
     execution.remaining = BIO_EXECUTION_LIMIT; execution.failed_node = UINT32_MAX;
-    if (p->genes[p->main_gene].memory_cells) {
-        memory = malloc((size_t)p->genes[p->main_gene].memory_cells * sizeof(*memory));
+    execution.depth = 1; /* main occupies the first frame */
+    execution.frame_cells = p->genes[p->main_gene].memory_cells;
+    if (p->has_recursion) execution.frame_cells = BIO_MEMORY_CELLS;
+    execution.frame_used = p->genes[p->main_gene].local_cells;
+    if (execution.frame_cells) {
+        memory = malloc((size_t)execution.frame_cells * sizeof(*memory));
         if (!memory) { bio_error(e, "out of memory allocating local storage"); return 0; }
     }
     if (io) {

@@ -356,7 +356,7 @@ static void emit_transfer(Emitter *b, const BioGene *g, const CodonNode *n) {
     b->cached = -1;
 }
 
-static void emit_gene(Emitter *b, BioGene *g) {
+static void emit_gene(Emitter *b, const BioProgram *p, BioGene *g) {
     CodonNode *n;
     g->code_offset = (uint32_t)b->length;
     b->cached = -1;
@@ -557,6 +557,27 @@ static void emit_gene(Emitter *b, BioGene *g) {
                 array_base(b, local);
                 byte(b, 0x4d); byte(b, 0x89); byte(b, 0xca); /* r10=array */
             }
+            {
+                /* Recursion is bounded at run time, after the array size check:
+                   depth < BIO_MAX_DEPTH and the callee's cells fit the pool. */
+                uint32_t need = p->genes[n->arg1].local_cells;
+                byte(b, 0x8b); byte(b, 0x43); byte(b, 116); /* mov eax,[rbx+116]: depth */
+                byte(b, 0x3d); word32(b, BIO_MAX_DEPTH); /* cmp eax,BIO_MAX_DEPTH */
+                require_condition(b, n, BIO_FAULT_DEPTH, 0x72); /* jb: room for one more */
+                byte(b, 0xc7); byte(b, 0x43); byte(b, 16); word32(b, need); /* bad_index = need */
+                byte(b, 0x8b); byte(b, 0x4b); byte(b, 120); /* mov ecx,[rbx+120]: capacity */
+                byte(b, 0x2b); byte(b, 0x4b); byte(b, 112); /* sub ecx,[rbx+112]: left */
+                byte(b, 0x89); byte(b, 0x4b); byte(b, 20); /* bound = cells left */
+                byte(b, 0x8b); byte(b, 0x43); byte(b, 112); /* mov eax,[rbx+112]: used */
+                byte(b, 0x05); word32(b, need); /* add eax,need */
+                byte(b, 0x3b); byte(b, 0x43); byte(b, 120); /* cmp eax,[rbx+120] */
+                require_condition(b, n, BIO_FAULT_FRAME, 0x76); /* jbe: fits */
+                if (need) {
+                    byte(b, 0x81); byte(b, 0x43); byte(b, 112); word32(b, need); /* add [rbx+112],need */
+                }
+                byte(b, 0xff); byte(b, 0x43); byte(b, 116); /* inc dword [rbx+116] */
+                b->cached = -1;
+            }
             /* Context and the callee's locals base are Win64 stack arguments 5-6,
                written into the outgoing slots at [rsp+32] and [rsp+40]. */
             byte(b, 0x48); byte(b, 0x89); byte(b, 0x5c); byte(b, 0x24); byte(b, 32); /* mov [rsp+32],rbx */
@@ -583,6 +604,14 @@ static void emit_gene(Emitter *b, BioGene *g) {
             byte(b, 0xe8);
             n->patch_offset = (uint32_t)b->length;
             word32(b, 0);
+            {
+                /* Unwind on both outcomes: the caller owns the frame accounting. */
+                uint32_t need = p->genes[n->arg1].local_cells;
+                if (need) {
+                    byte(b, 0x81); byte(b, 0x6b); byte(b, 112); word32(b, need); /* sub [rbx+112],need */
+                }
+                byte(b, 0xff); byte(b, 0x4b); byte(b, 116); /* dec dword [rbx+116] */
+            }
             propagate_failure(b);
             store_eax(b, 0);
             break;
@@ -618,7 +647,7 @@ int bio_jit(BioProgram *p, BioError *e) {
     if (!p->code) { bio_error(e, "VirtualAlloc failed (%lu)", GetLastError()); return 0; }
     b.data = p->code; b.capacity = p->allocation_size;
     for (i = 0; i < p->gene_count; ++i)
-        if (p->genes[i].live) emit_gene(&b, &p->genes[i]);
+        if (p->genes[i].live) emit_gene(&b, p, &p->genes[i]);
     if (b.failed) { bio_error(e, "internal error: JIT output exceeds reserved buffer"); return 0; }
     p->stats.code_bytes = b.length;
     p->stats.entry_offset = p->genes[p->main_gene].code_offset;

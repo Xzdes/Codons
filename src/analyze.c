@@ -211,16 +211,13 @@ static int validate_flow(BioProgram *p, BioGene *g, CodonNode **queue, BioError 
     return 1;
 }
 
-/* The call graph is still a DAG. Loops are local jumps, not recursion. */
-static int check_calls(BioProgram *p, unsigned index, unsigned nesting, BioError *e) {
+/* Recursion is allowed: cycles make steps dynamic and depth/cells are bounded
+   at run time (BIO_MAX_DEPTH active genes, BIO_MEMORY_CELLS of frame storage).
+   The static sums below remain exact for acyclic edges; cycle edges skip them. */
+static int check_calls(BioProgram *p, unsigned index, BioError *e) {
     BioGene *g = &p->genes[index];
     CodonNode *n;
-    if (g->visit == 1) {
-        bio_node_error(p, g->head, e, "apoptosis: recursive call cycle at %s", g->name); return 0;
-    }
-    if (nesting > BIO_MAX_DEPTH) {
-        bio_node_error(p, g->head, e, "apoptosis: call depth exceeds %u", BIO_MAX_DEPTH); return 0;
-    }
+    if (g->visit == 1) return 1; /* Back edge: the caller flags the cycle. */
     if (g->visit == 2) return 1;
     g->visit = 1; g->depth = 1;
     g->execution_steps = g->local_cells;
@@ -230,18 +227,20 @@ static int check_calls(BioProgram *p, unsigned index, unsigned nesting, BioError
             n->op_code != OP_ARRAY && n->op_code != OP_PARAM && g->execution_steps <= BIO_EXECUTION_LIMIT)
             ++g->execution_steps;
         if (n->op_code == OP_CALL) {
-            unsigned depth;
-            if (!check_calls(p, n->arg1, nesting + 1, e)) return 0;
-            depth = p->genes[n->arg1].depth + 1;
-            if (depth > BIO_MAX_DEPTH) {
-                bio_node_error(p, n, e, "apoptosis: call depth exceeds %u", BIO_MAX_DEPTH); return 0;
+            BioGene *callee = &p->genes[n->arg1];
+            if (callee->visit == 1) {
+                /* Cycle edge: runtime limits apply, static sums stop here. */
+                p->has_recursion = 1;
+                if (n->reachable) g->dynamic_steps = 1;
+                continue;
             }
-            if (depth > g->depth) g->depth = depth;
+            if (!check_calls(p, n->arg1, e)) return 0;
+            if (callee->depth + 1 > g->depth) g->depth = callee->depth + 1;
             if (n->reachable) {
-                uint32_t cells = g->local_cells + p->genes[n->arg1].memory_cells;
+                uint32_t cells = g->local_cells + callee->memory_cells;
                 if (cells > g->memory_cells) g->memory_cells = cells;
-                g->dynamic_steps |= p->genes[n->arg1].dynamic_steps;
-                g->execution_steps += p->genes[n->arg1].execution_steps;
+                g->dynamic_steps |= callee->dynamic_steps;
+                g->execution_steps += callee->execution_steps;
                 if (g->execution_steps > BIO_EXECUTION_LIMIT) g->execution_steps = BIO_EXECUTION_LIMIT + 1u;
             }
         }
@@ -276,9 +275,9 @@ int bio_analyze(BioProgram *p, BioError *e) {
         if (!flow) { free(queue); return 0; }
     }
     free(queue);
-    for (i = 0; i < p->gene_count; ++i) if (!check_calls(p, i, 1, e)) return 0;
+    for (i = 0; i < p->gene_count; ++i) if (!check_calls(p, i, e)) return 0;
     mark_live(p, p->main_gene);
-    if (p->genes[main_gene].memory_cells > BIO_MEMORY_CELLS) {
+    if (!p->has_recursion && p->genes[main_gene].memory_cells > BIO_MEMORY_CELLS) {
         bio_node_error(p, p->genes[main_gene].head, e,
                        "memory budget exceeded: active calls require more than %u i32 cells", BIO_MEMORY_CELLS);
         return 0;

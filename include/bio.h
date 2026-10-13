@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define BIO_VERSION "0.13.0"
+#define BIO_VERSION "0.14.0"
 #define BIO_EXECUTION_LIMIT 1000000u
 #define BIO_LIST_LIMIT 65536u
 
