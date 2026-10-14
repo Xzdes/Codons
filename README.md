@@ -53,6 +53,9 @@ Codons с минимальной грамматикой — **21/25** (84%; кл
 **Платформы.** Полная сборка с JIT — Windows x64. На Linux и macOS собирается
 интерпретаторный вариант без JIT: `cmake -DCODONS_NO_JIT=ON` — работают все
 команды, кроме `verify` и `emit` (они честно сообщают об отсутствии JIT).
+Каждый push гоняет CI на трёх системах: ubuntu-latest и macos-latest
+(интерпретатор) плюс windows-latest (полный JIT и тесты ядра) —
+см. [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 История изменений по версиям — в [CHANGELOG.md](CHANGELOG.md);
 история тестирования — в [TESTING.md](TESTING.md).

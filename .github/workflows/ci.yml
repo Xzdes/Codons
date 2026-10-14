@@ -6,6 +6,25 @@ on:
   pull_request:
 
 jobs:
+  portable:
+    name: ${{ matrix.os }} (interpreter-only, CODONS_NO_JIT)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCODONS_NO_JIT=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
   windows-x64:
     runs-on: windows-latest
     steps:
