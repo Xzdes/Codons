@@ -1,0 +1,6 @@
+GENE main i32/1
+MOV r1 r0
+SHR r1 1
+XOR r0 r1
+RET r0 _
+END _ _

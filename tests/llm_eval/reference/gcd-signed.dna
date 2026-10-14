@@ -1,0 +1,17 @@
+GENE main i32/2
+LOAD r2 0
+SUB r2 r0
+MAX r0 r2
+LOAD r2 0
+SUB r2 r1
+MAX r1 r2
+LABEL loop _
+JZ r1 done
+MOV r2 r0
+MOD r2 r1
+MOV r0 r1
+MOV r1 r2
+JMP loop _
+LABEL done _
+RET r0 _
+END _ _

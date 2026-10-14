@@ -1,0 +1,16 @@
+GENE main i32/2
+ARRAY out 2
+MOV r2 r0
+DIV r2 r1
+MOV r3 r0
+MOD r3 r1
+LOAD r4 0
+ASET out r4,r2
+LOAD r4 1
+ASET out r4,r3
+LOAD r5 2
+WRITE out r5
+MOV r6 r2
+ADD r6 r3
+RET r6 _
+END _ _
