@@ -84,7 +84,7 @@ static void print_line_text(const char *message) {
     length = (size_t)(colon - message);
     if (!length || length >= sizeof(path)) return;
     memcpy(path, message, length); path[length] = '\0';
-    f = bio_fopen(path, L"rb");
+    f = bio_fopen(path, "rb");
     if (!f) return;
     while (line_no && fgets(line_buf, sizeof(line_buf), f)) --line_no;
     fclose(f);
@@ -96,20 +96,7 @@ static void print_line_text(const char *message) {
     while (length && (start[length - 1] == '\n' || start[length - 1] == '\r'))
         start[--length] = '\0';
     /* A damaged line is not valid UTF-8; never break the JSON with raw bytes. */
-    {
-        const unsigned char *s = (const unsigned char *)start;
-        int valid = 1;
-        while (*s && valid) {
-            if (*s < 0x80) { ++s; continue; }
-            if ((*s & 0xe0u) == 0xc0u && (s[1] & 0xc0u) == 0x80u && s[1]) s += 2;
-            else if ((*s & 0xf0u) == 0xe0u && (s[1] & 0xc0u) == 0x80u && s[1] &&
-                     (s[2] & 0xc0u) == 0x80u && s[2]) s += 3;
-            else if ((*s & 0xf8u) == 0xf0u && (s[1] & 0xc0u) == 0x80u && s[1] &&
-                     (s[2] & 0xc0u) == 0x80u && s[2] && (s[3] & 0xc0u) == 0x80u && s[3]) s += 4;
-            else valid = 0;
-        }
-        if (!valid) return;
-    }
+    if (!bio_utf8_valid(start)) return;
     fputs(",\"line_text\":", stdout); cli_json_string(start);
 }
 
@@ -241,6 +228,7 @@ static int create_source(const char *path, BioError *e) {
         "# Run with: codons run <this-file.dna> 10 20\n"
         "# Inputs are r0 and r1. The result is 30.\n"
         "GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n";
+#ifdef _WIN32
     wchar_t wide[BIO_PATH_SIZE];
     HANDLE file;
     DWORD written = 0;
@@ -260,14 +248,30 @@ static int create_source(const char *path, BioError *e) {
     if (!CloseHandle(file)) ok = 0;
     if (!ok) bio_error(e, "could not finish writing %s", path);
     return ok;
+#else
+    /* "x" = exclusive create: never overwrites an existing file. */
+    FILE *file = fopen(path, "wx");
+    int ok;
+    if (!file) {
+        if (errno == EEXIST) bio_error(e, "file already exists; choose a new path: %s", path);
+        else bio_error(e, "cannot create %s", path);
+        return 0;
+    }
+    ok = fwrite(source, 1, sizeof(source) - 1, file) == sizeof(source) - 1;
+    if (fclose(file) != 0) ok = 0;
+    if (!ok) bio_error(e, "could not finish writing %s", path);
+    return ok;
+#endif
 }
 
+#ifndef BIO_NO_JIT
 /* One backend outcome in a verify report. */
 static void verify_outcome_json(int index, int ok, int32_t result, const BioError *error) {
     printf(",\"%s\":", index ? "interpret" : "run");
     if (ok) printf("{\"ok\":true,\"result\":%" PRId32 "}", result);
     else { fputs("{\"ok\":false,\"error\":", stdout); cli_json_string(error->message); putchar('}'); }
 }
+#endif /* !BIO_NO_JIT */
 
 /* Inline JSON form of an output list: no temporary file needed by the caller. */
 static void json_i32_list(const int32_t *values, size_t count) {
@@ -277,6 +281,7 @@ static void json_i32_list(const int32_t *values, size_t count) {
     putchar(']');
 }
 
+#ifndef BIO_NO_JIT
 /* Run the JIT and the reference interpreter on identical input and require
    identical observable behavior: result, output list, or the same fault. */
 static int cli_verify(BioProgram *p, const Options *o, BioError *e) {
@@ -379,6 +384,7 @@ done:
     free(printed[0].data); free(printed[1].data);
     return code;
 }
+#endif /* !BIO_NO_JIT */
 
 static int live(BioProgram *p, int repair, BioError *e) {
     BioRuntime *runtime = bio_runtime_create(p, e);
@@ -463,13 +469,13 @@ static int cli_test_init(const BioProgram *p, const Options *o, BioError *e) {
     strcat(header, "expected");
     if (channels & 2u) strcat(header, ",expected_output");
     if (o->output) {
-        FILE *out = bio_fopen(o->output, L"rb");
+        FILE *out = bio_fopen(o->output, "rb");
         if (out) {
             fclose(out);
             bio_error(e, "refusing to overwrite existing file: %s", o->output);
             return failure(o->json, "file", e->message, 1);
         }
-        out = bio_fopen(o->output, L"wb");
+        out = bio_fopen(o->output, "wb");
         if (!out) { bio_error(e, "cannot write %s", o->output); return failure(o->json, "file", e->message, 1); }
         fprintf(out, "%s\n", header);
         if (fclose(out) != 0) { bio_error(e, "failed writing %s", o->output); return failure(o->json, "file", e->message, 1); }
@@ -494,7 +500,14 @@ static int cli(int argc, char **argv) {
     if (argc == 1 || (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")))) {
         usage(); return 0;
     }
-    if (argc == 2 && !strcmp(argv[1], "--version")) { puts("Codons " BIO_VERSION); return 0; }
+    if (argc == 2 && !strcmp(argv[1], "--version")) {
+#ifdef BIO_NO_JIT
+        puts("Codons " BIO_VERSION " (interpreter-only)");
+#else
+        puts("Codons " BIO_VERSION);
+#endif
+        return 0;
+    }
     if (!options(argc, argv, &o, &e)) return failure(o.json, "arguments", e.message, 2);
     if (!strcmp(o.command, "new")) {
         if (!create_source(o.path, &e)) return failure(o.json, "file", e.message, 1);
@@ -558,7 +571,14 @@ static int cli(int argc, char **argv) {
             } else printf("%" PRId32 "\n", result);
             free(input); free(output); free(printed.data);
         }
-    } else if (!strcmp(o.command, "verify")) code = cli_verify(p, &o, &e);
+    } else if (!strcmp(o.command, "verify")) {
+#ifdef BIO_NO_JIT
+        code = failure(o.json, "arguments",
+                       "verify needs the JIT backend; this build is interpreter-only (-DCODONS_NO_JIT)", 2);
+#else
+        code = cli_verify(p, &o, &e);
+#endif
+    }
     else if (!strcmp(o.command, "check")) {
         if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); repair_report(p, 1); puts("}"); }
         else stats(s, 0);
@@ -585,7 +605,7 @@ static int cli(int argc, char **argv) {
             out_path = NULL;
         }
         if (out_path) {
-            out = bio_fopen(out_path, L"rb");
+            out = bio_fopen(out_path, "rb");
             if (out) {
                 fclose(out); out = NULL;
                 bio_error(&e, "refusing to overwrite existing file: %s", out_path);
@@ -593,7 +613,7 @@ static int cli(int argc, char **argv) {
             }
         }
         if (out_path && !code) {
-            out = bio_fopen(out_path, L"wb");
+            out = bio_fopen(out_path, "wb");
             if (!out) {
                 bio_error(&e, "cannot write %s", out_path);
                 code = failure(o.json, "file", e.message, 1);
@@ -626,6 +646,7 @@ static int cli(int argc, char **argv) {
     return code;
 }
 
+#ifdef _WIN32
 int wmain(int argc, wchar_t **wide_argv) {
     char **argv = calloc((size_t)argc + 1, sizeof(*argv));
     int i, code = 1;
@@ -649,3 +670,6 @@ cleanup:
     if (old_input) SetConsoleCP(old_input);
     return code;
 }
+#else
+int main(int argc, char **argv) { return cli(argc, argv); }
+#endif

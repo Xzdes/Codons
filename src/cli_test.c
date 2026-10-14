@@ -230,6 +230,7 @@ typedef struct {
 
 /* Resolve list paths against the CSV directory, independently of source imports and cwd. */
 static int fixture_path(const char *name, const char *csv_path, char *out, BioError *error) {
+#ifdef _WIN32
     wchar_t wide[BIO_PATH_SIZE], full[BIO_PATH_SIZE];
     char parent[BIO_PATH_SIZE], combined[BIO_PATH_SIZE];
     const char *slash;
@@ -253,6 +254,19 @@ static int fixture_path(const char *name, const char *csv_path, char *out, BioEr
     if (!length || length >= BIO_PATH_SIZE ||
         !WideCharToMultiByte(CP_UTF8, 0, full, -1, out, BIO_PATH_SIZE, NULL, NULL)) goto bad;
     return 1;
+#else
+    char combined[BIO_PATH_SIZE];
+    if (name[0] != '/') {
+        const char *slash = strrchr(csv_path, '/');
+        size_t prefix = slash ? (size_t)(slash - csv_path + 1) : 0;
+        if (prefix + strlen(name) >= sizeof(combined)) goto bad;
+        memcpy(combined, csv_path, prefix);
+        strcpy(combined + prefix, name);
+        name = combined;
+    }
+    if (!bio_canon_path(name, out, BIO_PATH_SIZE)) goto bad;
+    return 1;
+#endif
 bad:
     bio_error(error, "cannot resolve list path relative to CSV (UTF-8 path limit: %u bytes): %s",
               BIO_PATH_SIZE - 1u, name);
@@ -332,7 +346,7 @@ int cli_test(const BioProgram *program, const char *cases_path, int json) {
     FILE *file;
     size_t count = 0, i, passed = 0, mismatches = 0, errors = 0;
     int loaded, file_mode = 0;
-    file = bio_fopen(cases_path, L"rb");
+    file = bio_fopen(cases_path, "rb");
     if (!file) {
         csv_error(&csv, "open", 0, "cannot open CSV file"); return report_csv_error(cases_path, &csv, json);
     }

@@ -15,6 +15,12 @@ EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 WORK = Path.cwd() / "work"
 WORK.mkdir(exist_ok=True)
 
+# Interpreter-only binaries (-DCODONS_NO_JIT) report the suffix and lack verify/emit.
+NO_JIT = "(interpreter-only)" in subprocess.run(
+    [str(EXE), "--version"], capture_output=True, text=True).stdout
+BACKENDS = ("run", "interpret") if NO_JIT else ("run", "interpret", "verify")
+VERIFY = "run" if NO_JIT else "verify"
+
 
 def i32(value):
     return (value + 2**31) % 2**32 - 2**31
@@ -222,7 +228,7 @@ class CliTests(unittest.TestCase):
         for command in ("run", "interpret"):
             data = json.loads(self.call(command, source, 7, "--json").stdout)
             self.assertEqual(data["result"], -21)
-            self.assertEqual(data["stats"]["code_bytes"] == 0, command == "interpret")
+            self.assertEqual(data["stats"]["code_bytes"] == 0, command == "interpret" or NO_JIT)
 
     def test_compile_error_is_json(self):
         source = self.source("GENE main i32\nRET r0 _\nEND _ _\n", 'ошибка.dna')
@@ -265,7 +271,7 @@ class CliTests(unittest.TestCase):
                              "SLOAD r4 \"hello world\"\nSEQ r5 r3,r4\nSLEN r6 r3\nADD r6 r5\n"
                              "LOAD r7 10\nSGET r0 r3,r7\nADD r6 r0\nRET r6 _\nEND _ _\n")
         # 11 (length) + 1 (equal) + 100 ('d') = 112
-        for command in ("run", "interpret", "verify"):
+        for command in BACKENDS:
             with self.subTest(command=command):
                 data = json.loads(self.call(command, source, "--json").stdout)
                 self.assertTrue(data["ok"])
@@ -281,7 +287,7 @@ class CliTests(unittest.TestCase):
         self.assertIn('SLOAD r1 "a\\n\\t\\\\\\"\\x01# b"', dumped)
         normalized = self.source(dumped, "normalized.dna")
         self.assertEqual(self.call("dump", normalized).stdout, dumped)
-        for command in ("run", "interpret", "verify"):
+        for command in BACKENDS:
             self.assertEqual(int(self.call(command, normalized).stdout), 14 + ord("n"))
 
     def test_strings_faults_match_across_engines(self):
@@ -314,9 +320,10 @@ class CliTests(unittest.TestCase):
                     self.assertIn(message, data["error"]["message"])
                     messages.append(data["error"]["message"])
                 self.assertEqual(*messages)
-                verify = self.call("verify", source, code=1)
-                self.assertIn("verified: JIT and interpreter agree on the failure", verify.stderr)
-                self.assertIn(message, verify.stderr)
+                if not NO_JIT:
+                    verify = self.call("verify", source, code=1)
+                    self.assertIn("verified: JIT and interpreter agree on the failure", verify.stderr)
+                    self.assertIn(message, verify.stderr)
 
     def test_print_streams_capture_and_verify(self):
         source = self.source("GENE main i32\nSLOAD r1 \"hi\"\nPRINT r1 _\nSLOAD r2 \" there\\n\"\nPRINT r2 _\n"
@@ -324,14 +331,15 @@ class CliTests(unittest.TestCase):
         for command in ("run", "interpret"):
             proc = self.call(command, source)
             self.assertEqual(proc.stdout.replace("\r\n", "\n"), "hi there\n2\n")
-        for command in ("run", "interpret", "verify"):
+        for command in BACKENDS:
             data = json.loads(self.call(command, source, "--json").stdout)
             self.assertTrue(data["ok"])
             self.assertEqual(data["printed"], "hi there\n")
             self.assertEqual(data["result"], 2)
-        # verify prints the agreed bytes once in text mode.
-        proc = self.call("verify", source)
-        self.assertEqual(proc.stdout.replace("\r\n", "\n"), "hi there\n2\n")
+        if not NO_JIT:
+            # verify prints the agreed bytes once in text mode.
+            proc = self.call("verify", source)
+            self.assertEqual(proc.stdout.replace("\r\n", "\n"), "hi there\n2\n")
         # No PRINT, no output: the JSON field is present and empty.
         plain = self.source("GENE main i32\nLOAD r0 1\nRET r0 _\nEND _ _\n", "plain.dna")
         data = json.loads(self.call("run", plain, "--json").stdout)
@@ -344,7 +352,7 @@ class CliTests(unittest.TestCase):
             "GENE main i32/1\nCALL fact r0\nRET r0 _\nEND _ _\n")
         for command in ("run", "interpret"):
             self.assertEqual(self.call(command, fact, "5").stdout.strip(), "120")
-        self.assertEqual(self.call("verify", fact, "5").stdout.strip(), "120")
+        self.assertEqual(self.call(VERIFY, fact, "5").stdout.strip(), "120")
         data = json.loads(self.call("check", fact, "--json").stdout)
         self.assertTrue(data["stats"]["dynamic_steps"])
         # Dead code may recurse: the cycle in pruned gene f never executes.
@@ -375,7 +383,7 @@ class CliTests(unittest.TestCase):
                            "wide.dna")
         for command in ("run", "interpret"):
             self.assertEqual(self.call(command, wrap).stdout.strip(), "1")
-        self.assertEqual(self.call("verify", wrap).stdout.strip(), "1")
+        self.assertEqual(self.call(VERIFY, wrap).stdout.strip(), "1")
         # Wide faults carry file and line and match between the engines.
         for body, needle in (
             ("WLOAD w0 1\nWLOAD w1 0\nWDIV w0 w1", "division by zero"),
@@ -403,7 +411,7 @@ class CliTests(unittest.TestCase):
                            "wedge.dna")
         dumped = self.root / "wedge-dump.dna"
         dumped.write_text(self.call("dump", edge).stdout.replace("\r\n", "\n"), encoding="utf-8")
-        self.assertEqual(self.call("verify", str(dumped)).stdout.strip(), "-1")
+        self.assertEqual(self.call(VERIFY, str(dumped)).stdout.strip(), "-1")
         # WNOT with a dropped '_' is repairable.
         broken = self.source("GENE main i32\nWLOAD w0 0\nWNOT w0\nNARROW r0 w0\nRET r0 _\nEND _ _\n",
                              "wbroken.dna")
@@ -418,7 +426,7 @@ class CliTests(unittest.TestCase):
                            "RET r15 _\nEND _ _\n", "high.dna")
         for command in ("run", "interpret"):
             self.assertEqual(self.call(command, high).stdout.strip(), "42")
-        self.assertEqual(self.call("verify", high).stdout.strip(), "42")
+        self.assertEqual(self.call(VERIFY, high).stdout.strip(), "42")
         call = self.source("GENE main i32\nLOAD r12 30\nLOAD r13 12\nCALL add2 r12,r13\n"
                            "RET r0 _\nEND _ _\nGENE add2 i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n",
                            "rcall.dna")
@@ -427,7 +435,7 @@ class CliTests(unittest.TestCase):
         # Multi-digit registers survive the dump round trip.
         dumped = self.root / "rcall-dump.dna"
         dumped.write_text(self.call("dump", call).stdout.replace("\r\n", "\n"), encoding="utf-8")
-        self.assertEqual(self.call("verify", str(dumped)).stdout.strip(), "42")
+        self.assertEqual(self.call(VERIFY, str(dumped)).stdout.strip(), "42")
         # Out of range and uninitialized registers fail at compile time.
         over = self.source("GENE main i32\nLOAD r256 1\nRET r256 _\nEND _ _\n", "over.dna")
         self.assertIn("first operand must be a register r0..r255",
@@ -443,14 +451,14 @@ class CliTests(unittest.TestCase):
                             "point.dna")
         for command in ("run", "interpret"):
             self.assertEqual(self.call(command, point).stdout.strip(), "42")
-        self.assertEqual(self.call("verify", point).stdout.strip(), "42")
+        self.assertEqual(self.call(VERIFY, point).stdout.strip(), "42")
         # The dump normalizes STRUCT into VAR lines that reparse unchanged.
         dumped = self.root / "point-dump.dna"
         text = self.call("dump", point).stdout.replace("\r\n", "\n")
         dumped.write_text(text, encoding="utf-8")
         self.assertIn("VAR p.x 0", text)
         self.assertIn("VAR p.y 0", text)
-        self.assertEqual(self.call("verify", str(dumped)).stdout.strip(), "42")
+        self.assertEqual(self.call(VERIFY, str(dumped)).stdout.strip(), "42")
         # The bare struct name is not a local; fields are unique.
         bare = self.source("GENE main i32\nSTRUCT p x\nGET r0 p\nRET r0 _\nEND _ _\n", "bare.dna")
         self.assertIn("undefined local p in gene main", self.call("check", bare, code=1).stderr)
@@ -464,8 +472,9 @@ class CliTests(unittest.TestCase):
         src = self.source("GENE main i32/1\nADD r0 10\nSHL r0 2\nMIN r0 100\nMOD r0 7\nRET r0 _\nEND _ _\n",
                           "lit.dna")
         self.assertEqual(self.call("run", src, "5").stdout.strip(), "4")  # ((5+10)<<2 min 100) % 7
-        data = json.loads(self.call("verify", src, "5", "--json").stdout)
-        self.assertTrue(data["verified"])
+        data = json.loads(self.call(VERIFY, src, "5", "--json").stdout)
+        if not NO_JIT:
+            self.assertTrue(data["verified"])
         self.assertEqual(data["result"], 4)
         # Literal faults are compile errors and carry the hint plus line_text.
         bad = self.source("GENE main i32\nLOAD r0 1\nDIV r0 0\nRET r0 _\nEND _ _\n", "lit-bad.dna")
@@ -602,12 +611,14 @@ class CliTests(unittest.TestCase):
         self.assertIn("incompatible signature", proc.stderr)
         self.assertIn("expects 2 arguments", proc.stderr)
 
+    @unittest.skipIf(NO_JIT, "verify needs the JIT backend")
     def test_verify_agrees(self):
         source = self.source("GENE main i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n")
         proc = self.call("verify", source, 10, 20)
         self.assertEqual(proc.stdout.strip(), "30")
         self.assertIn("verified: JIT and interpreter agree", proc.stderr)
 
+    @unittest.skipIf(NO_JIT, "verify needs the JIT backend")
     def test_verify_identical_failure(self):
         source = self.source("GENE main i32\nARRAY a 2\nLOAD r0 5\nAGET r1 a,r0\nRET r1 _\nEND _ _\n")
         proc = self.call("verify", source, code=1)
@@ -615,6 +626,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("array index 5 out of bounds", proc.stderr)
         self.assertNotIn("DIVERGENCE", proc.stderr)
 
+    @unittest.skipIf(NO_JIT, "verify needs the JIT backend")
     def test_verify_json(self):
         source = self.source("GENE main i32/1\nMUL r0 r0\nRET r0 _\nEND _ _\n")
         data = json.loads(self.call("verify", source, 7, "--json").stdout)
@@ -622,6 +634,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(data["verified"])
         self.assertEqual(data["result"], 49)
 
+    @unittest.skipIf(NO_JIT, "verify needs the JIT backend")
     def test_verify_lists(self):
         source = self.source("GENE main i32\nARRAY items 8\nREAD items r0\nWRITE items r0\nRET r0 _\nEND _ _\n")
         list_in = self.source("3\n-1\n4\n", "in.txt")
@@ -633,7 +646,7 @@ class CliTests(unittest.TestCase):
 
     def test_four_arguments_and_inline_output_list(self):
         source = self.source("GENE main i32/4\nADD r0 r1\nADD r0 r2\nADD r0 r3\nRET r0 _\nEND _ _\n")
-        for command in ("run", "interpret", "verify"):
+        for command in BACKENDS:
             with self.subTest(command=command):
                 self.assertEqual(self.call(command, source, 1, 2, 3, 4).stdout.strip(), "10")
         self.call("run", source, 1, 2, 3, 4, 5, code=2)  # five inputs are rejected
@@ -644,7 +657,7 @@ class CliTests(unittest.TestCase):
     def test_json_output_list_without_file(self):
         source = self.source("GENE main i32/1\nARRAY out 3\nLOAD r1 0\nASET out r1,r0\nLOAD r1 1\nASET out r1,r0\n"
                              "LOAD r1 2\nASET out r1,r0\nLOAD r1 3\nWRITE out r1\nRET r1 _\nEND _ _\n")
-        for command in ("run", "interpret", "verify"):
+        for command in BACKENDS:
             with self.subTest(command=command):
                 data = json.loads(self.call(command, source, 7, "--json").stdout)
                 self.assertTrue(data["ok"])
@@ -669,6 +682,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("Gate rejected the update; previous version is still active.", proc.stderr)
         self.assertIn("expected: reload <file.dna> [--gate <cases.csv>]", proc.stderr)
 
+    @unittest.skipIf(NO_JIT, "emit exports JIT machine code")
     def test_emit_utf8_path(self):
         source = self.source("GENE main i32\nLOAD r0 5\nRET r0 _\nEND _ _\n")
         output = self.root / "машинный код.bin"

@@ -3,6 +3,9 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 void bio_error(BioError *e, const char *format, ...) {
     va_list ap;
@@ -72,6 +75,22 @@ CodonNode *bio_node_new(BioProgram *p, BioError *e) {
     return n;
 }
 
+#ifdef BIO_NO_JIT
+void bio_program_retain(BioProgram *p) { atomic_fetch_add(&p->references, 1); }
+
+void bio_program_release(BioProgram *p) {
+    if (!p || atomic_fetch_sub(&p->references, 1) != 1) return;
+    free(p->literals);
+    free(p->literal_pool);
+    free(p->wide_literals);
+    while (p->arena) {
+        ArenaBlock *next = p->arena->next;
+        free(p->arena);
+        p->arena = next;
+    }
+    free(p);
+}
+#else
 void bio_program_retain(BioProgram *p) { InterlockedIncrement(&p->references); }
 
 void bio_program_release(BioProgram *p) {
@@ -89,16 +108,71 @@ void bio_program_release(BioProgram *p) {
     }
     free(p);
 }
+#endif
 
+#ifdef _WIN32
 int bio_wide_path(const char *path, wchar_t *out, size_t capacity) {
     return path && capacity <= INT_MAX &&
         MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, out, (int)capacity) > 0;
 }
 
-FILE *bio_fopen(const char *path, const wchar_t *mode) {
-    wchar_t wide[BIO_PATH_SIZE];
+FILE *bio_fopen(const char *path, const char *mode) {
+    wchar_t wide[BIO_PATH_SIZE], wide_mode[8];
+    size_t i;
     if (!bio_wide_path(path, wide, BIO_PATH_SIZE)) return NULL;
-    return _wfopen(wide, mode);
+    for (i = 0; mode[i] && i + 1 < sizeof(wide_mode) / sizeof(*wide_mode); ++i)
+        wide_mode[i] = (wchar_t)(unsigned char)mode[i];
+    wide_mode[i] = L'\0';
+    return _wfopen(wide, wide_mode);
+}
+#else
+FILE *bio_fopen(const char *path, const char *mode) { return fopen(path, mode); }
+
+int bio_canon_path(const char *in, char *out, size_t capacity) {
+    char work[BIO_PATH_SIZE];
+    char *segments[BIO_PATH_SIZE / 2];
+    size_t count = 0, length, i;
+    char *cursor;
+    if (!in || !*in) return 0;
+    if (in[0] != '/') {
+        if (!getcwd(work, sizeof(work)) || strlen(work) + 1 + strlen(in) >= sizeof(work)) return 0;
+        strcat(work, "/"); strcat(work, in);
+    } else {
+        if (strlen(in) >= sizeof(work)) return 0;
+        strcpy(work, in);
+    }
+    cursor = work;
+    while (*cursor == '/') ++cursor;
+    for (cursor = strtok(cursor, "/"); cursor; cursor = strtok(NULL, "/")) {
+        if (!strcmp(cursor, ".")) continue;
+        if (!strcmp(cursor, "..")) { if (count) --count; continue; }
+        segments[count++] = cursor;
+    }
+    length = 0;
+    out[length++] = '/';
+    for (i = 0; i < count; ++i) {
+        size_t piece = strlen(segments[i]);
+        if (length + piece + 1 >= capacity) return 0;
+        memcpy(out + length, segments[i], piece); length += piece;
+        if (i + 1 < count) out[length++] = '/';
+    }
+    out[length] = '\0';
+    return 1;
+}
+#endif
+
+int bio_utf8_valid(const char *text) {
+    const unsigned char *s = (const unsigned char *)text;
+    while (*s) {
+        if (*s < 0x80) { ++s; continue; }
+        if ((*s & 0xe0u) == 0xc0u && (s[1] & 0xc0u) == 0x80u && s[1]) s += 2;
+        else if ((*s & 0xf0u) == 0xe0u && (s[1] & 0xc0u) == 0x80u && s[1] &&
+                 (s[2] & 0xc0u) == 0x80u && s[2]) s += 3;
+        else if ((*s & 0xf8u) == 0xf0u && (s[1] & 0xc0u) == 0x80u && s[1] &&
+                 (s[2] & 0xc0u) == 0x80u && s[2] && (s[3] & 0xc0u) == 0x80u && s[3]) s += 4;
+        else return 0;
+    }
+    return 1;
 }
 
 BioProgram *bio_load(const char *path, int repair, BioError *e) {
@@ -117,8 +191,13 @@ BioProgram *bio_load(const char *path, int repair, BioError *e) {
 
 BioProgram *bio_compile(const char *path, int repair, BioError *e) {
     BioProgram *p = bio_load(path, repair, e);
+#ifdef BIO_NO_JIT
+    /* Interpreter-only build: no native code is generated, run == interpret. */
+    return p;
+#else
     if (p && !bio_jit(p, e)) { bio_program_release(p); return NULL; }
     return p;
+#endif
 }
 
 BioStats bio_program_stats(const BioProgram *p) { return p->stats; }
@@ -592,7 +671,9 @@ static uint32_t interpret_gene(const BioProgram *p, unsigned gene, const uint32_
 
 static int execute(const BioProgram *p, const int32_t *args, size_t argc,
                    BioIO *io, int32_t *result, BioError *e, int native) {
+#ifndef BIO_NO_JIT
     typedef int32_t (*Entry)(int32_t, int32_t, int32_t, int32_t, BioExecution *, uint32_t *);
+#endif
     int32_t value;
     uint32_t *memory = NULL;
     uint8_t *pool = NULL;
@@ -600,7 +681,9 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
     BioExecution execution = {0};
     int ok;
     if (!validate_arguments(p, args, argc, result, e)) return 0;
+#ifndef BIO_NO_JIT
     if (native && !p->code) { bio_error(e, "program has no native code; use bio_compile"); return 0; }
+#endif
     if (io && (io->input_count > BIO_LIST_LIMIT || io->output_capacity > BIO_LIST_LIMIT ||
                (!io->input && io->input_count) || (!io->output && io->output_capacity))) {
         bio_error(e, "invalid BioIO: lists need valid pointers and counts/capacities in 0..%u", BIO_LIST_LIMIT);
@@ -639,12 +722,18 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
         execution.string_pool = pool; execution.pool_capacity = BIO_STRING_BYTES;
     }
     if (native) {
+#ifndef BIO_NO_JIT
         Entry fn;
         unsigned char *address = p->code + p->genes[p->main_gene].code_offset;
         _Static_assert(sizeof(fn) == sizeof(address), "Windows x64 function pointer size");
         memcpy(&fn, &address, sizeof(fn));
         value = fn(argc > 0 ? args[0] : 0, argc > 1 ? args[1] : 0,
                    argc > 2 ? args[2] : 0, argc > 3 ? args[3] : 0, &execution, memory);
+#else
+        bio_error(e, "internal: native execution in an interpreter-only build");
+        free(execution.output); free(memory); free(strings); free(pool);
+        return 0;
+#endif
     } else {
         uint32_t entry_args[4] = {0, 0, 0, 0};
         size_t i;
@@ -668,7 +757,11 @@ static int execute(const BioProgram *p, const int32_t *args, size_t argc,
 
 int bio_program_run_io(const BioProgram *p, const int32_t *args, size_t argc,
                        BioIO *io, int32_t *result, BioError *e) {
+#ifdef BIO_NO_JIT
+    return execute(p, args, argc, io, result, e, 0);
+#else
     return execute(p, args, argc, io, result, e, 1);
+#endif
 }
 
 int bio_program_interpret_io(const BioProgram *p, const int32_t *args, size_t argc,
@@ -772,13 +865,19 @@ void bio_program_dump(const BioProgram *p, FILE *out) {
 }
 
 int bio_program_write_code(const BioProgram *p, const char *path, BioError *e) {
+#ifdef BIO_NO_JIT
+    (void)p; (void)path;
+    bio_error(e, "emit requires the JIT backend; this is an interpreter-only build");
+    return 0;
+#else
     FILE *f;
     int ok;
     if (!p || !p->code) { bio_error(e, "program has no native code"); return 0; }
-    f = bio_fopen(path, L"wb");
+    f = bio_fopen(path, "wb");
     if (!f) { bio_error(e, "cannot write %s", path); return 0; }
     ok = fwrite(p->code, 1, p->stats.code_bytes, f) == p->stats.code_bytes;
     if (fclose(f) != 0) ok = 0;
     if (!ok) bio_error(e, "failed writing %s", path);
     return ok;
+#endif
 }

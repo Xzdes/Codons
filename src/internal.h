@@ -2,10 +2,15 @@
 #define BIO_INTERNAL_H
 
 #include "bio.h"
+#ifdef _WIN32
 #include <windows.h>
-
-#if !defined(_M_X64) && !defined(__x86_64__)
-#error Codons JIT requires the Windows x86-64 architecture
+#endif
+#ifdef BIO_NO_JIT
+#include <stdatomic.h>
+#else
+#if !defined(_WIN32) || (!defined(_M_X64) && !defined(__x86_64__))
+#error The Codons JIT requires Windows x86-64; configure with -DCODONS_NO_JIT=ON for the portable interpreter
+#endif
 #endif
 
 #define BIO_MAX_GENES 256u
@@ -189,7 +194,11 @@ _Static_assert(offsetof(BioExecution, depth) == 116, "JIT call depth offset");
 _Static_assert(offsetof(BioExecution, frame_cells) == 120, "JIT frame capacity offset");
 
 struct BioProgram {
+#ifdef BIO_NO_JIT
+    _Atomic long references;
+#else
     volatile LONG references;
+#endif
     ArenaBlock *arena;
     BioGene genes[BIO_MAX_GENES];
     BioFile files[BIO_MAX_FILES];
@@ -211,10 +220,12 @@ struct BioProgram {
     uint32_t wide_literal_count;
     unsigned uses_strings;   /* Any string opcode or literal in the program. */
     unsigned has_recursion;  /* A call cycle exists: frame pool is runtime-checked. */
+#ifndef BIO_NO_JIT
     unsigned char *code;
     size_t allocation_size;
     RUNTIME_FUNCTION *unwind_table;
     int unwind_registered;
+#endif
 };
 
 void bio_error(BioError *error, const char *format, ...);
@@ -228,9 +239,20 @@ CodonNode *bio_node_new(BioProgram *p, BioError *e);
 void bio_program_retain(BioProgram *p);
 int bio_parse(BioProgram *p, const char *path, int repair, BioError *e);
 int bio_analyze(BioProgram *p, BioError *e);
+#ifndef BIO_NO_JIT
 int bio_jit(BioProgram *p, BioError *e);
+#endif
 int bio_find_gene(const BioProgram *p, const char *name);
+#ifdef _WIN32
 int bio_wide_path(const char *path, wchar_t *out, size_t capacity);
-FILE *bio_fopen(const char *path, const wchar_t *mode);
+#endif
+/* Opens a UTF-8 path with a C mode string ("rb", "wb"); Unicode-safe on Windows. */
+FILE *bio_fopen(const char *path, const char *mode);
+int bio_utf8_valid(const char *text);
+#ifndef _WIN32
+/* Portable path canonicalization: joins a relative path to the cwd and folds
+   . and .. textually. On Windows the CLI uses GetFullPathNameW instead. */
+int bio_canon_path(const char *in, char *out, size_t capacity);
+#endif
 
 #endif

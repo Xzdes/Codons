@@ -116,9 +116,14 @@ static const struct { const char *name; BioOp op; } wide_binary[] = {
 };
 
 static int same_path(const char *a, const char *b) {
+#ifdef _WIN32
     wchar_t left[BIO_PATH_SIZE], right[BIO_PATH_SIZE];
     return bio_wide_path(a, left, BIO_PATH_SIZE) && bio_wide_path(b, right, BIO_PATH_SIZE) &&
         CompareStringOrdinal(left, -1, right, -1, TRUE) == CSTR_EQUAL;
+#else
+    /* Paths reaching this point were canonicalized by bio_canon_path. */
+    return strcmp(a, b) == 0;
+#endif
 }
 
 static int symbol(BioProgram *p, const char *name) {
@@ -186,6 +191,7 @@ static int add_literal(BioProgram *p, const char *field, uint32_t *index, BioErr
 /* Imports resolve against the importing file, never the process working directory. */
 static int resolve_path(const char *name, const char *parent, char *out, BioError *e) {
     char combined[BIO_PATH_SIZE];
+#ifdef _WIN32
     wchar_t input[BIO_PATH_SIZE], resolved[BIO_PATH_SIZE];
     DWORD length;
     int absolute = name[0] == '/' || name[0] == '\\' || (strlen(name) > 1 && name[1] == ':');
@@ -208,6 +214,22 @@ static int resolve_path(const char *name, const char *parent, char *out, BioErro
         bio_error(e, "cannot resolve source path: %s", name); return 0;
     }
     return 1;
+#else
+    if (parent && name[0] != '/') {
+        const char *slash = strrchr(parent, '/');
+        size_t prefix = slash ? (size_t)(slash - parent + 1) : 0;
+        if (prefix + strlen(name) >= sizeof(combined)) {
+            bio_error(e, "import path too long"); return 0;
+        }
+        memcpy(combined, parent, prefix);
+        strcpy(combined + prefix, name);
+        name = combined;
+    }
+    if (!bio_utf8_valid(name) || !bio_canon_path(name, out, BIO_PATH_SIZE)) {
+        bio_error(e, "cannot resolve source path: %s", name); return 0;
+    }
+    return 1;
+#endif
 }
 
 /* Counts even whitespace/comments toward the input budget, rejects embedded NUL. */
@@ -263,7 +285,7 @@ static int parse_file(BioProgram *p, const char *name, const char *parent,
     if (p->file_count == BIO_MAX_FILES) {
         bio_error(e, "apoptosis: file budget exceeded (%u)", BIO_MAX_FILES); return 0;
     }
-    f = bio_fopen(path, L"rb");
+    f = bio_fopen(path, "rb");
     if (!f) { bio_error(e, "cannot open source: %s", path); return 0; }
     index = p->file_count++;
     strcpy(p->files[index].path, path);

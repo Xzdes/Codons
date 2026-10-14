@@ -2,7 +2,14 @@
 #include "cli.h"
 #include <ctype.h>
 #include <inttypes.h>
+#ifdef _WIN32
 #include <io.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
@@ -51,22 +58,35 @@ void cli_json_bytes(const unsigned char *bytes, size_t length) {
 }
 
 int cli_read_list(const char *path, int32_t **values, size_t *count, BioError *e) {
-    FILE *file = bio_fopen(path, L"rb");
+    FILE *file = bio_fopen(path, "rb");
     int32_t *data = NULL;
     size_t used = 0, bytes = 0;
     unsigned line_number = 0;
-    LARGE_INTEGER size;
-    HANDLE handle;
     int ok = 0;
     if (!file) { bio_error(e, "cannot open input list: %s", path); return 0; }
 #define LIST_FAIL(message) do { bio_error(e, "%s:%u: %s", path, line_number, message); goto done; } while (0)
-    handle = (HANDLE)_get_osfhandle(_fileno(file));
-    if (GetFileType(handle) != FILE_TYPE_DISK || !GetFileSizeEx(handle, &size)) {
-        bio_error(e, "input must be a regular disk file: %s", path); goto done;
+#ifdef _WIN32
+    {
+        LARGE_INTEGER size;
+        HANDLE handle = (HANDLE)_get_osfhandle(_fileno(file));
+        if (GetFileType(handle) != FILE_TYPE_DISK || !GetFileSizeEx(handle, &size)) {
+            bio_error(e, "input must be a regular disk file: %s", path); goto done;
+        }
+        if (size.QuadPart > LIST_FILE_LIMIT) {
+            bio_error(e, "%s: input list exceeds the 1 MiB file limit", path); goto done;
+        }
     }
-    if (size.QuadPart > LIST_FILE_LIMIT) {
-        bio_error(e, "%s: input list exceeds the 1 MiB file limit", path); goto done;
+#else
+    {
+        struct stat st;
+        if (fstat(fileno(file), &st) || !S_ISREG(st.st_mode)) {
+            bio_error(e, "input must be a regular disk file: %s", path); goto done;
+        }
+        if (st.st_size > (off_t)LIST_FILE_LIMIT) {
+            bio_error(e, "%s: input list exceeds the 1 MiB file limit", path); goto done;
+        }
     }
+#endif
     data = malloc(BIO_LIST_LIMIT * sizeof(*data));
     if (!data) { bio_error(e, "out of memory reading input list"); goto done; }
     for (;;) {
@@ -77,15 +97,19 @@ int cli_read_list(const char *path, int32_t **values, size_t *count, BioError *e
         while ((c = fgetc(file)) != EOF && c != '\n') {
             if (++bytes > LIST_FILE_LIMIT) LIST_FAIL("input list exceeds the 1 MiB file limit");
             if (!c) LIST_FAIL("input list must be UTF-8 without NUL bytes");
-            if (length + 1 == sizeof(line)) LIST_FAIL("input line exceeds 511 bytes");
-            line[length++] = (char)c;
-        }
-        if (c == '\n' && ++bytes > LIST_FILE_LIMIT) LIST_FAIL("input list exceeds the 1 MiB file limit");
-        if (ferror(file)) LIST_FAIL("cannot read input list");
-        if (c == EOF && !length) break;
-        line[length] = '\0';
+        if (length + 1 == sizeof(line)) LIST_FAIL("input line exceeds 511 bytes");
+        line[length++] = (char)c;
+    }
+    if (c == '\n' && ++bytes > LIST_FILE_LIMIT) LIST_FAIL("input list exceeds the 1 MiB file limit");
+    if (ferror(file)) LIST_FAIL("cannot read input list");
+    if (c == EOF && !length) break;
+    line[length] = '\0';
+#ifdef _WIN32
         if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, line, -1, NULL, 0))
             LIST_FAIL("input list must be valid UTF-8");
+#else
+        if (!bio_utf8_valid(line)) LIST_FAIL("input list must be valid UTF-8");
+#endif
         start = line;
         if (line_number == 1 && length >= 3 && (unsigned char)line[0] == 0xef &&
             (unsigned char)line[1] == 0xbb && (unsigned char)line[2] == 0xbf) start += 3;
@@ -107,6 +131,19 @@ done:
 #undef LIST_FAIL
 }
 
+static char *format_list(const int32_t *values, size_t count, size_t *used, BioError *e) {
+    char *text;
+    size_t i, n = 0;
+    if (count > BIO_LIST_LIMIT) { bio_error(e, "output list exceeds %u numbers", BIO_LIST_LIMIT); return NULL; }
+    text = malloc(count * 12u + 1u); /* -2147483648 plus LF, and one final NUL. */
+    if (!text) { bio_error(e, "out of memory formatting output list"); return NULL; }
+    for (i = 0; i < count; ++i)
+        n += (size_t)snprintf(text + n, count * 12u + 1u - n, "%" PRId32 "\n", values[i]);
+    *used = n;
+    return text;
+}
+
+#ifdef _WIN32
 int cli_write_list(const char *path, const int32_t *values, size_t count, BioError *e) {
     wchar_t wide[BIO_PATH_SIZE], full[BIO_PATH_SIZE], temporary[BIO_PATH_SIZE + 80];
     HANDLE file = INVALID_HANDLE_VALUE;
@@ -128,11 +165,8 @@ int cli_write_list(const char *path, const int32_t *values, size_t count, BioErr
     if (GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES) {
         bio_error(e, "output already exists; choose a new path: %s", path); return 0;
     }
-    if (count > BIO_LIST_LIMIT) { bio_error(e, "output list exceeds %u numbers", BIO_LIST_LIMIT); return 0; }
-    text = malloc(count * 12u + 1u); /* -2147483648 plus LF, and one final NUL. */
-    if (!text) { bio_error(e, "out of memory formatting output list"); return 0; }
-    for (i = 0; i < count; ++i)
-        used += (size_t)snprintf(text + used, count * 12u + 1u - used, "%" PRId32 "\n", values[i]);
+    text = format_list(values, count, &used, e);
+    if (!text) return 0;
     for (attempt = 0; attempt < 64; ++attempt) {
         swprintf(temporary, sizeof(temporary) / sizeof(*temporary), L"%ls.codons-%lu-%lu.tmp", full,
                  GetCurrentProcessId(), (unsigned long)(DWORD)InterlockedIncrement(&serial));
@@ -162,3 +196,42 @@ int cli_write_list(const char *path, const int32_t *values, size_t count, BioErr
     }
     return 1;
 }
+#else
+int cli_write_list(const char *path, const int32_t *values, size_t count, BioError *e) {
+    char temporary[BIO_PATH_SIZE + 80];
+    char *text;
+    size_t used = 0;
+    unsigned attempt;
+    static volatile long serial;
+    int fd = -1, saved = 0;
+    struct stat st;
+    if (!bio_utf8_valid(path) || strlen(path) >= BIO_PATH_SIZE) {
+        bio_error(e, "output requires a normal UTF-8 file path: %s", path); return 0;
+    }
+    if (!lstat(path, &st)) {
+        bio_error(e, "output already exists; choose a new path: %s", path); return 0;
+    }
+    text = format_list(values, count, &used, e);
+    if (!text) return 0;
+    for (attempt = 0; attempt < 64; ++attempt) {
+        snprintf(temporary, sizeof(temporary), "%s.codons-%ld-%ld.tmp", path,
+                 (long)getpid(), ++serial);
+        fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (fd >= 0) break;
+        if (errno != EEXIST) break;
+    }
+    if (fd < 0) { free(text); bio_error(e, "cannot prepare output %s", path); return 0; }
+    if (write(fd, text, used) != (ssize_t)used || fsync(fd)) saved = errno ? errno : EIO;
+    if (close(fd) && !saved) saved = errno;
+    free(text);
+    /* link() publishes atomically and FAILS when the destination exists. */
+    if (!saved && link(temporary, path)) saved = errno;
+    if (unlink(temporary) && !saved) saved = errno;
+    if (saved) {
+        if (saved == EEXIST) bio_error(e, "output already exists; choose a new path: %s", path);
+        else bio_error(e, "cannot save output %s (error %d)", path, saved);
+        return 0;
+    }
+    return 1;
+}
+#endif
