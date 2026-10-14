@@ -127,15 +127,19 @@ LABEL else _
 LABEL done _
 ```
 
-### countdown loop (accumulator initialized before the loop)
+### countdown loop (accumulator initialized before the loop, zero-trip guard)
 ```
 LOAD r1 0          # acc
+JZ r0 done         # n == 0 -> skip the loop entirely
 LABEL loop _
 ADD r1 r0          # acc += n
 SUB r0 1           # literal operands are fine
 JNZ r0 loop
+LABEL done _
 RET r1 _
 ```
+Without the `JZ` guard a do-while shape runs once even for n = 0 and the
+counter underflows to -1: an infinite loop.
 
 ### clamp x to [lo, hi]
 ```
@@ -150,12 +154,14 @@ ARRAY a 4
 LOAD r1 0          # index
 LOAD r2 0          # sum
 LABEL loop _
+MOV r4 r1
+LT r4 4            # r4 = (i < 4); comparisons OVERWRITE their first operand,
+JZ r4 done         # so always compare a COPY of the index, never the index
 AGET r3 a,r1
 ADD r2 r3
 ADD r1 1
-LOAD r4 4
-LT r1 r4           # r1 = (i < 4)
-JNZ r1 loop
+JMP loop _
+LABEL done _
 RET r2 _
 ```
 
@@ -210,6 +216,21 @@ arg1,arg2,expected
 Header forms: `expected` | `arg1,expected` | `arg1,arg2,expected` (arity of main).
 Add `input` before `expected` (a list file) and `expected_output` after it for
 list programs. List paths are relative to the CSV.
+
+## Semantic pitfalls (these compile fine but compute garbage)
+
+- **Comparisons overwrite their first operand.** `EQ r1 r2`, `LT r1 4`,
+  `MIN`, `MAX` all write `r1`. To keep a value, compare a copy:
+  `MOV r3 r1` then `LT r3 4`. Killing a loop counter or an input argument
+  this way is the top silent bug.
+- **A bottom-of-loop `JNZ r1 loop` must see the counter itself,** not a
+  comparison flag left in the counter's register.
+- **Guard zero-trip loops.** A body that reads or decrements the counter
+  before checking it runs once even for n = 0; `SUB r0 1` on 0 gives -1 and
+  `JNZ` loops forever. Put `JZ r0 done` before (or right after) the label.
+- **CALL clobbers r0.** Save it before the call if you still need it.
+- **MOD sign follows the dividend:** `-7 MOD 3` is `-1`.
+- **NARROW faults** when the i64 does not fit; compare with WLT first.
 
 ## Pitfalls (exact error → fix)
 
