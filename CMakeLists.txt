@@ -62,7 +62,7 @@ if(Python3_Interpreter_FOUND)
 endif()
 
 install(TARGETS codons RUNTIME DESTINATION .)
-install(FILES README.md START.txt LLM.md DESTINATION .)
+install(FILES README.md START.txt LLM.md CHANGELOG.md TESTING.md DESTINATION .)
 install(DIRECTORY examples docs DESTINATION .)
 set(CPACK_GENERATOR ZIP)
 set(CPACK_PACKAGE_FILE_NAME "Codons-${PROJECT_VERSION}-windows-x64")
