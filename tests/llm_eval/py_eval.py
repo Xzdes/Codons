@@ -77,10 +77,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidates", required=True, type=Path)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--only", help="comma-separated task ids to run")
     args = parser.parse_args()
     tasks_file = Path(__file__).with_name("tasks.jsonl")
     tasks = [json.loads(line) for line in
              tasks_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if args.only:
+        wanted = set(args.only.split(","))
+        tasks = [t for t in tasks if t["id"] in wanted]
     report = {"lang": "python", "tasks": [],
               "summary": {"total": len(tasks), "pass": 0, "by_class": {}}}
     for task in tasks:
