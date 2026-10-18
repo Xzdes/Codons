@@ -26,6 +26,13 @@ def i32(value):
     return (value + 2**31) % 2**32 - 2**31
 
 
+def minimal_path():
+    """A PATH with no development toolchain, for 'no toolchain needed' tests."""
+    if os.name == "nt":
+        return str(Path(os.environ["SystemRoot"]) / "System32")
+    return "/usr/bin:/bin"
+
+
 def arithmetic_reference(op, a, b=0):
     if op in ("DIV", "MOD"):
         if b == 0:
@@ -254,6 +261,7 @@ class CliTests(unittest.TestCase):
             data = json.loads(self.call(command, "x", "--json", code=2).stdout)
             self.assertFalse(data["ok"])
 
+    @unittest.skipUnless(os.name == "nt", "case-insensitive import dedup assumes a Windows filesystem")
     def test_unicode_imports_deduplicate_case(self):
         self.source("GENE sum i32/2\nADD r0 r1\nRET r0 _\nEND _ _\n", "Каталог/модуль.dna")
         source = self.source("IMPORT модуль.dna _\nIMPORT МОДУЛЬ.dna _\nGENE main i32/2\nCALL sum r0,r1\nRET r0 _\nEND _ _\n", "Каталог/main.dna")
@@ -773,7 +781,7 @@ class CliTests(unittest.TestCase):
 
     def test_run_without_toolchain_on_path(self):
         source = self.source("GENE main i32\nLOAD r0 42\nRET r0 _\nEND _ _\n")
-        env = dict(os.environ, PATH=str(Path(os.environ["SystemRoot"]) / "System32"))
+        env = dict(os.environ, PATH=minimal_path())
         self.assertEqual(self.call("run", source, env=env).stdout.strip(), "42")
 
     def test_csv_shipped_examples_and_all_arities(self):
@@ -1085,8 +1093,10 @@ class CliTests(unittest.TestCase):
                 self.assertIn("already exists", data["error"]["message"])
                 self.assertEqual(output.read_bytes(), before)
             self.call(command, source, "--input", path, "--output", self.root / "absent" / "out.txt", code=1)
-            self.call(command, source, "--input", path, "--output", str(existing) + ":stream", code=1)
-            self.assertEqual(existing.read_text(), "do not change")
+            if os.name == "nt":
+                # An alternate data stream is not a new file and must never modify one.
+                self.call(command, source, "--input", path, "--output", str(existing) + ":stream", code=1)
+                self.assertEqual(existing.read_text(), "do not change")
         without = self.source("GENE main i32\nLOAD r0 42\nRET r0 _\nEND _ _\n", "no-write.dna")
         output = self.root / "output.txt"
         self.assertIn("did not execute WRITE", self.call("run", without, "--output", output, code=1).stderr)
@@ -1342,7 +1352,7 @@ class CliTests(unittest.TestCase):
                 self.assertIn(message, error["message"])
                 self.assertNotIn("execution budget", error["message"])
         # A device must not become a test input; the shared list reader rejects it.
-        cases.write_text("input,expected,expected_output\nNUL,0,good.txt\n", encoding="utf-8")
+        cases.write_text("input,expected,expected_output\n%s,0,good.txt\n" % os.devnull, encoding="utf-8")
         data = json.loads(self.call("test", source, cases, "--json", code=1).stdout)
         self.assertEqual(data["cases"][0]["error"]["stage"], "file")
         self.assertIn("regular disk file", data["cases"][0]["error"]["message"])
@@ -1380,7 +1390,7 @@ class CliTests(unittest.TestCase):
             self.source("".join(f"{v}\n" for v in expected), f"lists/out-{i}.txt")
             rows.append(f"{threshold},lists/in-{i}.txt,{len(expected)},lists/out-{i}.txt")
         cases = self.source("\n".join(rows), "cases.csv")
-        env = dict(os.environ, PATH=str(Path(os.environ["SystemRoot"]) / "System32"))
+        env = dict(os.environ, PATH=minimal_path())
         data = json.loads(self.call("test", EXAMPLES / "list_pipeline.dna", cases, "--json", env=env).stdout)
         self.assertEqual(data["summary"]["passed"], 50)
         self.assertTrue(all(case["output"]["matched"] for case in data["cases"]))
@@ -1529,7 +1539,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(data["error"]["stage"], "compile")
         data = json.loads(self.call("test", source, cases, "--repair", "--json").stdout)
         self.assertTrue(data["ok"])
-        env = dict(os.environ, PATH=str(Path(os.environ["SystemRoot"]) / "System32"))
+        env = dict(os.environ, PATH=minimal_path())
         self.call("test", EXAMPLES / "price.dna", EXAMPLES / "price.csv", env=env)
 
 

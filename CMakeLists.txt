@@ -21,6 +21,9 @@ if(CODONS_NO_JIT)
   target_compile_definitions(bio PUBLIC BIO_NO_JIT)
 endif()
 if(NOT WIN32)
+  # Strict -std=c11 hides pthread_rwlock_t and the POSIX file APIs behind
+  # feature-test macros; _DEFAULT_SOURCE restores them (no-op on macOS).
+  add_compile_definitions(_DEFAULT_SOURCE)
   # pthread_rwlock in src/runtime.c
   find_package(Threads REQUIRED)
   target_link_libraries(bio PUBLIC Threads::Threads)
