@@ -260,13 +260,19 @@ int bio_jit_wasm(const BioProgram *p, const char *path, BioError *e) {
     if (!generate_program_c(p, cfile, e)) return 0;
     clang = getenv("CODONS_CLANG");
     if (!clang || !*clang) clang = "clang";
-    /* The whole command is wrapped in an extra quote pair: cmd /c otherwise
-       strips the first and last quote on the line and mangles the quoted
-       paths (POSIX sh simply concatenates the empty quotes, so both work). */
+#ifdef _WIN32
+    /* cmd /c strips the first and last quote on the line, mangling quoted
+       paths; wrapping the whole command in an extra quote pair prevents it. */
     if (snprintf(cmd, sizeof(cmd),
                  "\"\"%s\" --target=wasm32-unknown-unknown "
                  "-nostdlib -Wl,--no-entry -Wl,--export=run -O0 -o \"%s\" \"%s\"\"",
                  clang, path, cfile) >= (int)sizeof(cmd)) {
+#else
+    if (snprintf(cmd, sizeof(cmd),
+                 "\"%s\" --target=wasm32-unknown-unknown "
+                 "-nostdlib -Wl,--no-entry -Wl,--export=run -O0 -o \"%s\" \"%s\"",
+                 clang, path, cfile) >= (int)sizeof(cmd)) {
+#endif
         bio_error(e, "command too long"); return 0;
     }
     if (system(cmd) != 0) {

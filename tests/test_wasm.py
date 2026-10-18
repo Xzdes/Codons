@@ -94,6 +94,17 @@ def fails_wasm(codons, dna, args):
     return proc.returncode != 0
 
 
+def wasm_toolchain_ok():
+    """The found clang must actually support the wasm32 target (Apple clang may not)."""
+    probe_c = WORK / "probe_wasm.c"
+    probe_c.write_text("int run(int x) { return x; }\n", encoding="utf-8")
+    proc = subprocess.run([CLANG, "--target=wasm32-unknown-unknown", "-nostdlib",
+                           "-Wl,--no-entry", "-Wl,--export=run", "-O0",
+                           "-o", str(WORK / "probe.wasm"), str(probe_c)],
+                          capture_output=True)
+    return proc.returncode == 0
+
+
 def main():
     codons = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "build" / "codons.exe"
     if not NODE:
@@ -101,6 +112,9 @@ def main():
         return 0
     if not CLANG:
         print("SKIP wasm backend: clang not found (set CODONS_CLANG or add clang to PATH)")
+        return 0
+    if not wasm_toolchain_ok():
+        print("SKIP wasm backend: clang cannot target wasm32-unknown-unknown")
         return 0
     failures = 0
     for case in CASES:
