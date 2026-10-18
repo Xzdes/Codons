@@ -247,7 +247,11 @@ static int read_line(BioProgram *p, FILE *f, char *line, BioError *e) {
     }
     if (ferror(f)) { bio_error(e, "source read failed"); return -1; }
     line[n] = '\0';
+#ifdef _WIN32
     if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, line, -1, NULL, 0)) {
+#else
+    if (!bio_utf8_valid(line)) {
+#endif
         bio_error(e, "source must be valid UTF-8"); return -1;
     }
     return c == EOF && n == 0 ? 0 : 1;

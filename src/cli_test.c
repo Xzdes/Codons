@@ -50,7 +50,11 @@ static int read_line(FILE *file, char *line, size_t *bytes, CsvError *e) {
     if (ferror(file)) { csv_error(e, "read", 0, "cannot read CSV file"); return -1; }
     if (ch == EOF && !length) return 0;
     line[length] = '\0';
+#ifdef _WIN32
     if (length && !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, line, (int)length, NULL, 0)) {
+#else
+    if (length && !bio_utf8_valid(line)) {
+#endif
         csv_error(e, "encoding", 0, "CSV must contain valid UTF-8"); return -1;
     }
     if (length && line[length - 1] == '\r') line[length - 1] = '\0';
