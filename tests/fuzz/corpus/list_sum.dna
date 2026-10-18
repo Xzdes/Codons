@@ -1,0 +1,18 @@
+# Sum a file of numbers. Example: run list_sum.dna --input numbers.txt
+GENE main i32
+ARRAY values 4096
+VAR total 0
+READ values r0
+LOAD r1 1
+LABEL loop _
+JZ r0 done
+SUB r0 r1
+AGET r2 values,r0
+GET r3 total
+ADD r3 r2
+SET total r3
+JMP loop _
+LABEL done _
+GET r0 total
+RET r0 _
+END _ _

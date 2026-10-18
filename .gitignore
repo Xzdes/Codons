@@ -1,5 +1,6 @@
 build/
 build-*/
+build_*/
 work/
 __pycache__/
 *.obj

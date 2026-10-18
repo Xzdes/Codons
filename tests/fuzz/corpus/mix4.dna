@@ -1,0 +1,8 @@
+# Clamp x to [lo, hi] and add a bias. Four i32 inputs (0.11).
+# codons run examples/mix4.dna 15 0 10 100 -> 110
+GENE main i32/4
+MAX r0 r1
+MIN r0 r2
+ADD r0 r3
+RET r0 _
+END _ _

@@ -1,0 +1,68 @@
+# Reusable functions. r0 is the length; PARAM borrows that prefix in place.
+# filter keeps values >= r1 and returns the number kept, preserving order.
+GENE filter i32/2
+PARAM items r0
+LOAD r2 0
+LOAD r3 0
+LOAD r4 1
+LABEL loop _
+MOV r6 r2
+LT r6 r0
+JZ r6 done
+AGET r5 items,r2
+MOV r6 r5
+LT r6 r1
+JNZ r6 next
+ASET items r3,r5
+ADD r3 r4
+LABEL next _
+ADD r2 r4
+JMP loop _
+LABEL done _
+RET r3 _
+END _ _
+
+# Insertion sort, suitable for small lists. Returns the unchanged length.
+GENE sort i32/1
+PARAM items r0
+LOAD r1 1
+LOAD r7 1
+LABEL outer _
+MOV r6 r1
+LT r6 r0
+JZ r6 done
+AGET r2 items,r1
+MOV r3 r1
+LABEL shift _
+JZ r3 place
+MOV r4 r3
+SUB r4 r7
+AGET r5 items,r4
+MOV r6 r2
+LT r6 r5
+JZ r6 place
+ASET items r3,r5
+MOV r3 r4
+JMP shift _
+LABEL place _
+ASET items r3,r2
+ADD r1 r7
+JMP outer _
+LABEL done _
+RET r0 _
+END _ _
+
+# Sum wraps like ADD. Empty input returns zero.
+GENE sum i32/1
+PARAM items r0
+LOAD r1 0
+LOAD r2 1
+LABEL loop _
+JZ r0 done
+SUB r0 r2
+AGET r3 items,r0
+ADD r1 r3
+JMP loop _
+LABEL done _
+RET r1 _
+END _ _

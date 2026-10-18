@@ -1,0 +1,5 @@
+# Inputs: quantity and unit price in the same integer units (for example cents).
+GENE main i32/2
+MUL r0 r1
+RET r0 _
+END _ _

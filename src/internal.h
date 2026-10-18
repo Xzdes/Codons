@@ -242,6 +242,9 @@ int bio_analyze(BioProgram *p, BioError *e);
 #ifndef BIO_NO_JIT
 int bio_jit(BioProgram *p, BioError *e);
 #endif
+/* The wasm backend generates C and calls clang; it needs no native JIT and
+   is available in portable (-DCODONS_NO_JIT=ON) builds too. */
+int bio_jit_wasm(const BioProgram *p, const char *path, BioError *e);
 int bio_find_gene(const BioProgram *p, const char *name);
 #ifdef _WIN32
 int bio_wide_path(const char *path, wchar_t *out, size_t capacity);

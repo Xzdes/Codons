@@ -1,0 +1,7 @@
+# Inputs: value and a nonnegative ceiling. Clamp the value to [0, ceiling].
+GENE main i32/2
+LOAD r2 0
+MAX r0 r2
+MIN r0 r1
+RET r0 _
+END _ _

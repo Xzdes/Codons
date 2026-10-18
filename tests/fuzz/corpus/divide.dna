@@ -1,0 +1,5 @@
+# Signed division, rounded toward zero: -7 / 3 -> -2.
+GENE main i32/2
+DIV r0 r1
+RET r0 _
+END _ _

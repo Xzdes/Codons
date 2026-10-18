@@ -1,0 +1,6 @@
+IMPORT math.dna _
+GENE main i32
+LOAD r1 20
+CALL add r1
+RET r0 _
+END _ _

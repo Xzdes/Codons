@@ -12,10 +12,10 @@ endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
-add_library(bio STATIC src/core.c src/parser.c src/analyze.c src/runtime.c ${BIO_JIT_SOURCE})
+add_library(bio STATIC src/core.c src/parser.c src/analyze.c src/runtime.c ${BIO_JIT_SOURCE} src/jit_wasm.c)
 target_include_directories(bio PUBLIC include PRIVATE src)
 if(WIN32)
-  target_compile_definitions(bio PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0601)
+  target_compile_definitions(bio PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0601 _CRT_SECURE_NO_WARNINGS)
 endif()
 if(CODONS_NO_JIT)
   target_compile_definitions(bio PUBLIC BIO_NO_JIT)
@@ -41,7 +41,6 @@ endif()
 foreach(target bio codons)
   if(MSVC)
     target_compile_options(${target} PRIVATE /W4)
-    target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
   else()
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
   endif()
@@ -56,6 +55,36 @@ if(NOT CODONS_NO_JIT)
   set_tests_properties(bio_tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 60)
 endif()
 
+# parser_fuzz: libFuzzer harness for the PARSER + ANALYZER only (no JIT).
+# Built as an OBJECT library so -Werror keeps it warning-clean on every build;
+# it has no main and is driven either by clang's libFuzzer or by
+# tests/fuzz/coverage_fuzzer.py. See tests/fuzz/parser_fuzz.c.
+add_library(parser_fuzz_obj OBJECT tests/fuzz/parser_fuzz.c)
+target_include_directories(parser_fuzz_obj PRIVATE include)
+if(MSVC)
+  target_compile_options(parser_fuzz_obj PRIVATE /W4 /WX)
+else()
+  target_compile_options(parser_fuzz_obj PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+
+# CODONS_FUZZ=ON (Linux/CI clang): the real libFuzzer executable + `fuzz` target.
+option(CODONS_FUZZ "Build the libFuzzer parser/analyzer harness (Linux/CI Clang)" OFF)
+if(CODONS_FUZZ)
+  if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "CODONS_FUZZ requires Clang (-fsanitize=fuzzer)")
+  endif()
+  add_executable(fuzz_parser
+    tests/fuzz/parser_fuzz.c
+    src/parser.c src/analyze.c src/core.c src/runtime.c)
+  target_include_directories(fuzz_parser PRIVATE include)
+  target_compile_options(fuzz_parser PRIVATE
+    -g -O1 -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+  target_link_options(fuzz_parser PRIVATE -fsanitize=fuzzer,address,undefined)
+  add_custom_target(fuzz
+    COMMAND fuzz_parser ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/corpus -max_total_time=60
+    DEPENDS fuzz_parser)
+endif()
+
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
   add_test(NAME cli_tests COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli.py" "$<TARGET_FILE:codons>")
@@ -64,6 +93,11 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(fuzz_diff PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 240)
   add_test(NAME llm_eval_selftest COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/llm_eval/llm_eval.py" "$<TARGET_FILE:codons>" --candidates "${CMAKE_CURRENT_SOURCE_DIR}/tests/llm_eval/reference")
   set_tests_properties(llm_eval_selftest PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 120)
+  add_test(NAME fuzz_coverage_selfcheck COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/coverage_fuzzer.py" --help)
+  add_test(NAME wasm_backend COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_wasm.py" "$<TARGET_FILE:codons>")
+  set_tests_properties(wasm_backend PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 120)
+  add_test(NAME reference_oracle COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/reference/driver.py" --codons "$<TARGET_FILE:codons>")
+  set_tests_properties(reference_oracle PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 120)
 endif()
 
 install(TARGETS codons RUNTIME DESTINATION .)

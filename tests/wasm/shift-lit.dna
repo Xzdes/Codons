@@ -1,0 +1,12 @@
+# Literal shift operands (0.17): SHL/SHR/SAR with a constant second field.
+# main(x) = (x<<3) + sar(x<<3, 1) + shr(x<<3, 1)
+GENE main i32/1
+SHL r0 3
+MOV r1 r0
+SAR r1 1
+MOV r2 r0
+SHR r2 1
+ADD r0 r1
+ADD r0 r2
+RET r0 _
+END _ _

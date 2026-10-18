@@ -1,0 +1,17 @@
+# Sum 1..n using a named accumulator. Negative n returns zero.
+GENE main i32/1
+VAR total 0
+LOAD r1 0
+MAX r0 r1
+LOAD r2 1
+LABEL loop _
+JZ r0 done
+GET r3 total
+ADD r3 r0
+SET total r3
+SUB r0 r2
+JMP loop _
+LABEL done _
+GET r0 total
+RET r0 _
+END _ _

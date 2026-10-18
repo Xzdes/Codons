@@ -1,0 +1,24 @@
+# Keep numbers >= the scalar threshold. Filtering preserves input order.
+GENE main i32/1
+ARRAY values 4096
+READ values r1
+LOAD r2 0
+LOAD r3 0
+LOAD r4 1
+LABEL loop _
+MOV r6 r2
+LT r6 r1
+JZ r6 done
+AGET r5 values,r2
+MOV r6 r5
+LT r6 r0
+JNZ r6 next
+ASET values r3,r5
+ADD r3 r4
+LABEL next _
+ADD r2 r4
+JMP loop _
+LABEL done _
+WRITE values r3
+RET r3 _
+END _ _

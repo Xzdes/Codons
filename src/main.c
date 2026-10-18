@@ -36,6 +36,7 @@ static void usage(void) {
          "  fix <file.dna> [out.dna]       Repair and write the normalized program\n"
          "  live <file.dna>                Run and reload in one process\n"
          "  emit <file.dna> <code.bin>     Export raw machine code (not an .exe)\n"
+         "  emit-wasm <file.dna> <out.wasm>  Export a WebAssembly module (portable backend)\n"
          "\nOptions after the file: --repair, --json\n"
          "  --repair restores safe '_' fields and quarantines ambiguous codons\n"
          "  --json is available for new, run, test, check, interpret, verify, fix and emit\n"
@@ -125,26 +126,27 @@ int cli_parse_i32(const char *s, int32_t *out) {
 }
 
 static int options(int argc, char **argv, Options *o, BioError *e) {
-    int i, is_emit, is_test, is_fix;
+    int i, is_emit, is_emit_wasm, is_test, is_fix;
     for (i = 1; i < argc; ++i) if (!strcmp(argv[i], "--json")) o->json = 1;
     if (argc < 3) { bio_error(e, "expected a command and file; use --help"); return 0; }
     o->command = argv[1]; o->path = argv[2];
     is_emit = !strcmp(o->command, "emit");
+    is_emit_wasm = !strcmp(o->command, "emit-wasm");
     is_test = !strcmp(o->command, "test");
     is_fix = !strcmp(o->command, "fix");
     if (strcmp(o->command, "new") && strcmp(o->command, "run") && strcmp(o->command, "check") &&
         strcmp(o->command, "interpret") && strcmp(o->command, "verify") && strcmp(o->command, "dump") &&
-        strcmp(o->command, "live") && !is_emit && !is_test && !is_fix) {
+        strcmp(o->command, "live") && !is_emit && !is_emit_wasm && !is_test && !is_fix) {
         bio_error(e, "unknown command '%s'; use --help", o->command); return 0;
     }
     for (i = 3; i < argc; ++i) if (!strcmp(argv[i], "--init")) o->init = 1;
     if (o->init && !is_test) { bio_error(e, "--init is supported only for test"); return 0; }
     if (is_fix) o->repair = 1; /* fix implies repair */
-    if (is_emit && (argc < 4 || !strncmp(argv[3], "--", 2))) {
+    if ((is_emit || is_emit_wasm) && (argc < 4 || !strncmp(argv[3], "--", 2))) {
         bio_error(e, "emit requires an output file"); return 0;
     }
-    if (is_emit) o->output = argv[3];
-    for (i = is_emit ? 4 : 3; i < argc; ++i) {
+    if (is_emit || is_emit_wasm) o->output = argv[3];
+    for (i = (is_emit || is_emit_wasm) ? 4 : 3; i < argc; ++i) {
         if (!strcmp(argv[i], "--repair")) o->repair = 1;
         else if (!strcmp(argv[i], "--init")) o->init = 1; /* validity checked above */
         else if (!strcmp(argv[i], "--json")) o->json = 1;
@@ -641,6 +643,11 @@ static int cli(int argc, char **argv) {
         if (!bio_program_write_code(p, o.output, &e)) code = failure(o.json, "file", e.message, 1);
         else if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); repair_report(p, 1); puts("}"); }
         else printf("Wrote %zu bytes; main offset=%u. Raw x64 code, not a standalone .exe.\n", s.code_bytes, s.entry_offset);
+    }
+    else if (!strcmp(o.command, "emit-wasm")) {
+        if (!bio_jit_wasm(p, o.output, &e)) code = failure(o.json, "file", e.message, 1);
+        else if (o.json) { fputs("{\"ok\":true,", stdout); stats(s, 1); repair_report(p, 1); puts("}"); }
+        else printf("Wrote %s. WebAssembly module (portable backend).\n", o.output);
     }
     bio_program_release(p);
     return code;

@@ -1,0 +1,11 @@
+# Truncating signed division and remainder, mixed with a literal multiply.
+# main(a, b) = 10*(a/b) + a%b   (both DIV and MOD truncate toward zero)
+GENE main i32/2
+MOV r2 r0
+DIV r2 r1
+MOV r3 r0
+MOD r3 r1
+MUL r2 10
+ADD r2 r3
+RET r2 _
+END _ _

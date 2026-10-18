@@ -1,0 +1,11 @@
+# A plasmid: parameters arrive in r0 and r1.
+GENE add i32/2
+ADD r0 r1
+RET r0 _
+END _ _
+
+# Valid but unreachable: no machine code is generated for this gene.
+GENE unused i32
+LOAD r0 999
+RET r0 _
+END _ _
